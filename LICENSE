@@ -1,0 +1,38 @@
+MIT License
+
+Copyright (c) 2026 SnipeTrenchBot contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CONDITIONS OF ANY KIND, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+================================================================================
+TRADING DISCLAIMER
+================================================================================
+This software is provided for EDUCATIONAL AND RESEARCH PURPOSES ONLY.
+It executes real financial transactions on public blockchains when configured
+to do so. Cryptocurrency trading carries substantial risk of loss.
+
+The authors and contributors of this software are NOT responsible for any
+financial losses incurred through its use. By using this software, you accept
+full responsibility for any outcomes, including but not limited to:
+  - Total loss of funds used to fund the trading wallet
+  - Losses due to smart contract bugs, market volatility, slippage
+  - Losses due to private key compromise if not stored securely
+  - Losses due to bugs in this software
+
+USE AT YOUR OWN RISK. NEVER TRADE WITH MONEY YOU CANNOT AFFORD TO LOSE.
+See RISK.md for a detailed discussion of risks specific to this bot.

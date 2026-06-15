@@ -1,0 +1,509 @@
+// src/db.js
+// =============================================================================
+// SQLite persistence layer. Seven tables:
+//   - watched_wallets : the dev wallets the user has added via Telegram
+//   - positions       : open + closed positions (one row per token bought)
+//   - signals         : append-only log of every signal detected and acted on
+//   - safety_log      : every safety event (cap hit, daily loss, pause, etc.)
+//   - settings        : mutable runtime settings (DB-backed, overrides .env)
+//   - subscribers     : every Telegram user who /start'd (multi-user broadcast)
+//   - bot_meta        : generic key-value for owner capture, schema version
+//   - wallet          : the bot's own trading key (encrypted, single row)
+//
+// Uses better-sqlite3 (synchronous, fast, single-file). All queries return
+// plain JS objects/arrays — no ORM.
+// =============================================================================
+
+import Database from 'better-sqlite3';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const DB_PATH = path.join(__dirname, '..', 'data', 'snipetrench.db');
+
+let db = null;
+
+export function getDb() {
+  if (db) return db;
+  db = new Database(DB_PATH);
+  db.pragma('journal_mode = WAL');
+  db.pragma('synchronous = NORMAL');
+  initSchema(db);
+  return db;
+}
+
+function initSchema(d) {
+  // Watchlist schema note: rows are owned by a chat_id (the Telegram user
+  // who added them). v0.6.1 dropped the old global table — see the
+  // migration block below. Auto-migrate: drop old table (warn) so the
+  // bot can't accidentally leak wallets across users in multi-user mode.
+  const cols = d.prepare(`PRAGMA table_info(watched_wallets)`).all();
+  const hasChatId = cols.some((c) => c.name === 'chat_id');
+  if (cols.length > 0 && !hasChatId) {
+    // Old single-owner schema. Snapshot the rows (we may want them) and
+    // drop the table. We can't auto-assign ownership — that's the whole
+    // point of the migration — so a human re-adds the wallets they still
+    // need. Keep the snapshot in a side table for forensic recovery.
+    console.warn(
+      '[db] watched_wallets is on the old global schema. ' +
+      'Backing up rows to `watched_wallets_legacy_global` and recreating with chat_id. ' +
+      'Re-add your wallet(s) via /addwallet in Telegram.'
+    );
+    d.exec(`
+      DROP TABLE IF EXISTS watched_wallets_legacy_global;
+      CREATE TABLE watched_wallets_legacy_global AS SELECT * FROM watched_wallets;
+      DROP TABLE watched_wallets;
+    `);
+  }
+  d.exec(`
+    CREATE TABLE IF NOT EXISTS watched_wallets (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      chat_id      INTEGER NOT NULL,
+      address      TEXT    NOT NULL,
+      label        TEXT,
+      added_at     INTEGER NOT NULL,
+      last_checked INTEGER NOT NULL DEFAULT 0,
+      copy_count   INTEGER NOT NULL DEFAULT 0,
+      last_copy_at INTEGER NOT NULL DEFAULT 0,
+      UNIQUE(chat_id, address)
+    );
+    CREATE INDEX IF NOT EXISTS idx_watched_wallets_chat ON watched_wallets(chat_id);
+    CREATE INDEX IF NOT EXISTS idx_watched_wallets_address ON watched_wallets(address);
+  `);
+
+  // v0.6.2: rename min_mc_sol / max_mc_sol → min_mc_usd / max_mc_usd.
+  // MC bounds now live in USD (TradeWiz parity: "MC (USD)"). One-time,
+  // idempotent — re-running is a no-op because the old key no longer exists.
+  const mcOldMin = d.prepare(`SELECT key FROM settings WHERE key = 'min_mc_sol'`).get();
+  const mcOldMax = d.prepare(`SELECT key FROM settings WHERE key = 'max_mc_sol'`).get();
+  if (mcOldMin || mcOldMax) {
+    console.log('[db] migrating settings: min/max_mc_sol → min/max_mc_usd');
+    if (mcOldMin) d.prepare(`UPDATE settings SET key = 'min_mc_usd' WHERE key = 'min_mc_sol'`).run();
+    if (mcOldMax) d.prepare(`UPDATE settings SET key = 'max_mc_usd' WHERE key = 'max_mc_sol'`).run();
+  }
+
+  d.exec(`
+    CREATE TABLE IF NOT EXISTS positions (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      mint         TEXT NOT NULL,
+      dev_wallet   TEXT NOT NULL,
+      entry_sig    TEXT,
+      entry_time   INTEGER NOT NULL,
+      entry_sol    REAL NOT NULL,
+      entry_tokens REAL,
+      exit_sig     TEXT,
+      exit_time    INTEGER,
+      exit_sol     REAL,
+      pnl_sol      REAL,
+      status       TEXT NOT NULL CHECK (status IN ('OPEN', 'CLOSED', 'FAILED')),
+      fail_reason  TEXT,
+      created_at   INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_positions_mint ON positions(mint);
+    CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
+    CREATE INDEX IF NOT EXISTS idx_positions_dev ON positions(dev_wallet);
+
+    CREATE TABLE IF NOT EXISTS signals (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      timestamp  INTEGER NOT NULL,
+      type       TEXT NOT NULL,    -- 'TOKEN_CREATED' | 'DEV_SELL' | 'BUY' | 'SELL'
+      wallet     TEXT,
+      mint       TEXT,
+      data_json  TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_signals_type ON signals(type);
+    CREATE INDEX IF NOT EXISTS idx_signals_mint ON signals(mint);
+    CREATE INDEX IF NOT EXISTS idx_signals_time ON signals(timestamp);
+
+    CREATE TABLE IF NOT EXISTS safety_log (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      timestamp  INTEGER NOT NULL,
+      type       TEXT NOT NULL,    -- 'DRY_RUN' | 'CAP_HIT' | 'DAILY_LOSS' | 'PAUSE' | 'ERROR'
+      details    TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_safety_type ON safety_log(type);
+
+    -- v0.2.0: bot-level metadata (owner chat_id captured on first /start)
+    CREATE TABLE IF NOT EXISTS bot_meta (
+      key        TEXT PRIMARY KEY,
+      value      TEXT,
+      updated_at INTEGER NOT NULL
+    );
+
+    -- v0.2.0: runtime-mutable settings (DB-backed, override .env)
+    CREATE TABLE IF NOT EXISTS settings (
+      key        TEXT PRIMARY KEY,
+      value      TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+
+    -- Multi-user support: anyone who /start'd becomes a subscriber.
+    -- The notifier broadcasts to all subscribers. No owner restriction.
+    CREATE TABLE IF NOT EXISTS subscribers (
+      chat_id    INTEGER PRIMARY KEY,
+      username   TEXT,
+      first_name TEXT,
+      first_seen INTEGER NOT NULL,
+      last_seen  INTEGER NOT NULL
+    );
+
+    -- v0.3.0: bot's own trading wallet, encrypted at rest. Single row
+    -- (CHECK id=1) so a new set() atomically replaces the old one. The
+    -- plaintext private key never appears in this table; only ciphertext
+    -- + IV + auth tag. Decryption happens in-memory only via walletManager.
+    CREATE TABLE IF NOT EXISTS wallet (
+      id              INTEGER PRIMARY KEY CHECK (id = 1),
+      ciphertext      BLOB NOT NULL,
+      iv              BLOB NOT NULL,
+      tag             BLOB NOT NULL,
+      last4           TEXT NOT NULL,
+      address         TEXT NOT NULL,
+      created_at      INTEGER NOT NULL,
+      updated_at      INTEGER NOT NULL,
+      set_by_chat_id  INTEGER,
+      set_by_username TEXT
+    );
+  `);
+}
+
+// =============================================================================
+// watched_wallets (v0.6.1: per-user, owned by chat_id)
+// =============================================================================
+// copy_count: number of times the bot has copied this wallet's trade.
+// last_copy_at: ms epoch of the last successful copy (used for "X minutes ago"
+//               displays in /wallets and notifier messages).
+//
+// All public methods are scoped to a chat_id so the watchlist stays private
+// in multi-user mode. The Helius monitor uses `listAll()` to get the union
+// of unique addresses to poll — that's the only place ownership is
+// deliberately ignored.
+// =============================================================================
+export const walletsDb = {
+  /** Add (or no-op) a wallet for the given user. */
+  add({ chatId, address, label = null }) {
+    if (chatId == null) throw new Error('walletsDb.add: chatId is required');
+    const now = Date.now();
+    return getDb()
+      .prepare(
+        `INSERT OR IGNORE INTO watched_wallets (chat_id, address, label, added_at) VALUES (?, ?, ?, ?)`
+      )
+      .run(chatId, address, label, now);
+  },
+  /** Remove a wallet, but only if it belongs to this user. Returns # rows deleted. */
+  remove({ chatId, address }) {
+    if (chatId == null) throw new Error('walletsDb.remove: chatId is required');
+    return getDb()
+      .prepare(`DELETE FROM watched_wallets WHERE chat_id = ? AND address = ?`)
+      .run(chatId, address).changes;
+  },
+  /** List this user's wallets. */
+  list(chatId) {
+    if (chatId == null) throw new Error('walletsDb.list: chatId is required');
+    return getDb()
+      .prepare(`SELECT * FROM watched_wallets WHERE chat_id = ? ORDER BY added_at DESC`)
+      .all(chatId);
+  },
+  /** Union of all unique addresses across all users — for the Helius monitor. */
+  listAll() {
+    return getDb()
+      .prepare(`SELECT DISTINCT address FROM watched_wallets`)
+      .all()
+      .map((r) => r.address);
+  },
+  /** Fetch the first row matching `address` (any owner). Returns the owning chatId. */
+  get(address) {
+    return getDb()
+      .prepare(`SELECT * FROM watched_wallets WHERE address = ? LIMIT 1`)
+      .get(address);
+  },
+  touchAll() {
+    return getDb()
+      .prepare(`UPDATE watched_wallets SET last_checked = ?`)
+      .run(Date.now()).changes;
+  },
+  touchOne(address) {
+    return getDb()
+      .prepare(`UPDATE watched_wallets SET last_checked = ? WHERE address = ?`)
+      .run(Date.now(), address).changes;
+  },
+  /** Per-user count. */
+  count(chatId) {
+    if (chatId == null) throw new Error('walletsDb.count: chatId is required');
+    return getDb()
+      .prepare(`SELECT COUNT(*) as c FROM watched_wallets WHERE chat_id = ?`)
+      .get(chatId).c;
+  },
+  // --- v0.6.0: copy-trade stats ---
+  // Atomic increment + stamp. Single UPDATE so two concurrent trades can't
+  // race. Returns the new count (or 0 if the wallet was removed mid-trade).
+  markCopied(address) {
+    const now = Date.now();
+    return getDb()
+      .prepare(
+        `UPDATE watched_wallets
+         SET copy_count = copy_count + 1, last_copy_at = ?
+         WHERE address = ?`
+      )
+      .run(now, address).changes;
+  },
+  incrementCopyCount(address) {
+    return getDb()
+      .prepare(`UPDATE watched_wallets SET copy_count = copy_count + 1 WHERE address = ?`)
+      .run(address).changes;
+  },
+  setLastCopyAt(address, ts = Date.now()) {
+    return getDb()
+      .prepare(`UPDATE watched_wallets SET last_copy_at = ? WHERE address = ?`)
+      .run(ts, address).changes;
+  },
+  // Returns { copy_count, last_copy_at } for one wallet, or null if not found.
+  getStats(address) {
+    const row = getDb()
+      .prepare(`SELECT copy_count, last_copy_at FROM watched_wallets WHERE address = ? LIMIT 1`)
+      .get(address);
+    if (!row) return null;
+    return { copy_count: row.copy_count, last_copy_at: row.last_copy_at };
+  },
+  // Per-user aggregate. Without chatId, sums across all users.
+  totalCopies(chatId = null) {
+    const row = chatId == null
+      ? getDb().prepare(`SELECT COALESCE(SUM(copy_count), 0) AS total FROM watched_wallets`).get()
+      : getDb()
+          .prepare(`SELECT COALESCE(SUM(copy_count), 0) AS total FROM watched_wallets WHERE chat_id = ?`)
+          .get(chatId);
+    return row.total || 0;
+  },
+};
+
+// =============================================================================
+// positions
+// =============================================================================
+export const positionsDb = {
+  open({ mint, devWallet, entrySig, entrySol, entryTokens = null }) {
+    const now = Date.now();
+    return getDb()
+      .prepare(`
+        INSERT INTO positions (mint, dev_wallet, entry_sig, entry_time, entry_sol, entry_tokens, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'OPEN', ?)
+      `)
+      .run(mint, devWallet, entrySig, now, entrySol, entryTokens, now);
+  },
+  close(id, { exitSig, exitSol, pnlSol }) {
+    return getDb()
+      .prepare(`
+        UPDATE positions
+        SET exit_sig = ?, exit_time = ?, exit_sol = ?, pnl_sol = ?, status = 'CLOSED'
+        WHERE id = ?
+      `)
+      .run(exitSig, Date.now(), exitSol, pnlSol, id);
+  },
+  fail(id, reason) {
+    return getDb()
+      .prepare(`UPDATE positions SET status = 'FAILED', fail_reason = ?, exit_time = ? WHERE id = ?`)
+      .run(reason, Date.now(), id);
+  },
+  byId(id) {
+    return getDb().prepare(`SELECT * FROM positions WHERE id = ?`).get(id);
+  },
+  openForMint(mint) {
+    return getDb().prepare(`SELECT * FROM positions WHERE mint = ? AND status = 'OPEN'`).all(mint);
+  },
+  openForDev(devWallet) {
+    return getDb()
+      .prepare(`SELECT * FROM positions WHERE dev_wallet = ? AND status = 'OPEN'`)
+      .all(devWallet);
+  },
+  openAll() {
+    return getDb().prepare(`SELECT * FROM positions WHERE status = 'OPEN' ORDER BY entry_time DESC`).all();
+  },
+  recent(limit = 20) {
+    return getDb()
+      .prepare(`SELECT * FROM positions ORDER BY created_at DESC LIMIT ?`)
+      .all(limit);
+  },
+  realizedPnlSince(sinceMs) {
+    const row = getDb()
+      .prepare(`
+        SELECT COALESCE(SUM(pnl_sol), 0) as total,
+               COUNT(*) as n
+        FROM positions
+        WHERE status = 'CLOSED' AND exit_time >= ?
+      `)
+      .get(sinceMs);
+    return { total: row.total, count: row.n };
+  },
+  spentSince(sinceMs) {
+    const row = getDb()
+      .prepare(`
+        SELECT COALESCE(SUM(entry_sol), 0) as total,
+               COUNT(*) as n
+        FROM positions
+        WHERE created_at >= ?
+      `)
+      .get(sinceMs);
+    return row.total || 0;
+  },
+};
+
+// =============================================================================
+// signals (append-only audit log)
+// =============================================================================
+export const signalsDb = {
+  log({ type, wallet = null, mint = null, data = null }) {
+    return getDb()
+      .prepare(`
+        INSERT INTO signals (timestamp, type, wallet, mint, data_json)
+        VALUES (?, ?, ?, ?, ?)
+      `)
+      .run(Date.now(), type, wallet, mint, data ? JSON.stringify(data) : null);
+  },
+  recent(limit = 50, typeFilter = null) {
+    if (typeFilter) {
+      return getDb()
+        .prepare(`SELECT * FROM signals WHERE type = ? ORDER BY id DESC LIMIT ?`)
+        .all(typeFilter, limit);
+    }
+    return getDb().prepare(`SELECT * FROM signals ORDER BY id DESC LIMIT ?`).all(limit);
+  },
+};
+
+// =============================================================================
+// safety_log
+// =============================================================================
+export const safetyDb = {
+  log({ type, details = null }) {
+    return getDb()
+      .prepare(`INSERT INTO safety_log (timestamp, type, details) VALUES (?, ?, ?)`)
+      .run(Date.now(), type, details);
+  },
+  recent(limit = 50) {
+    return getDb().prepare(`SELECT * FROM safety_log ORDER BY id DESC LIMIT ?`).all(limit);
+  },
+};
+
+// =============================================================================
+// subscribers (multi-user)
+// =============================================================================
+export const subscribersDb = {
+  add({ chatId, username = null, firstName = null }) {
+    if (chatId == null) return null;
+    const now = Date.now();
+    return getDb()
+      .prepare(`
+        INSERT INTO subscribers (chat_id, username, first_name, first_seen, last_seen)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(chat_id) DO UPDATE SET
+          username = excluded.username,
+          first_name = excluded.first_name,
+          last_seen = excluded.last_seen
+      `)
+      .run(chatId, username, firstName, now, now);
+  },
+  remove(chatId) {
+    return getDb().prepare(`DELETE FROM subscribers WHERE chat_id = ?`).run(chatId).changes;
+  },
+  list() {
+    return getDb().prepare(`SELECT * FROM subscribers ORDER BY last_seen DESC`).all();
+  },
+  count() {
+    return getDb().prepare(`SELECT COUNT(*) as c FROM subscribers`).get().c;
+  },
+};
+
+// =============================================================================
+// bot_meta (generic key-value store for runtime state)
+// =============================================================================
+export const metaDb = {
+  get(key) {
+    const row = getDb().prepare(`SELECT value FROM bot_meta WHERE key = ?`).get(key);
+    return row?.value ?? null;
+  },
+  set(key, value) {
+    return getDb()
+      .prepare(`
+        INSERT INTO bot_meta (key, value, updated_at) VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+      `)
+      .run(key, String(value), Date.now());
+  },
+  delete(key) {
+    return getDb().prepare(`DELETE FROM bot_meta WHERE key = ?`).run(key).changes;
+  },
+  all() {
+    return getDb().prepare(`SELECT * FROM bot_meta ORDER BY key`).all();
+  },
+};
+
+// =============================================================================
+// settings (DB-backed key/value, JSON-encoded values)
+// =============================================================================
+export const settingsDb = {
+  get(key) {
+    const row = getDb()
+      .prepare(`SELECT value, updated_at FROM settings WHERE key = ?`)
+      .get(key);
+    if (!row) return null;
+    try {
+      return { value: JSON.parse(row.value), updated_at: row.updated_at };
+    } catch {
+      return { value: row.value, updated_at: row.updated_at };
+    }
+  },
+  set(key, value) {
+    const encoded = JSON.stringify(value);
+    return getDb()
+      .prepare(`
+        INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+      `)
+      .run(key, encoded, Date.now());
+  },
+  delete(key) {
+    return getDb().prepare(`DELETE FROM settings WHERE key = ?`).run(key).changes;
+  },
+  all() {
+    const rows = getDb().prepare(`SELECT * FROM settings ORDER BY key`).all();
+    const result = {};
+    for (const row of rows) {
+      try {
+        result[row.key] = { value: JSON.parse(row.value), updated_at: row.updated_at };
+      } catch {
+        result[row.key] = { value: row.value, updated_at: row.updated_at };
+      }
+    }
+    return result;
+  },
+  count() {
+    return getDb().prepare(`SELECT COUNT(*) as c FROM settings`).get().c;
+  },
+};
+
+// =============================================================================
+// wallet (encrypted bot trading key, single row id=1)
+// =============================================================================
+// Thin read-only accessors. All write paths go through walletManager.js so
+// the encryption/decryption logic stays in one place. These helpers exist
+// for status displays and tests that need to inspect ciphertext metadata
+// without triggering a decryption.
+// =============================================================================
+export const walletDb = {
+  exists() {
+    return !!getDb().prepare(`SELECT 1 FROM wallet WHERE id = 1`).get();
+  },
+  meta() {
+    const row = getDb()
+      .prepare(
+        `SELECT last4, address, created_at, updated_at, set_by_chat_id, set_by_username
+         FROM wallet WHERE id = 1`
+      )
+      .get();
+    if (!row) return null;
+    return row;
+  },
+  raw() {
+    // Returns the encrypted blob. NEVER log this — it IS the secret at rest.
+    return getDb()
+      .prepare(`SELECT ciphertext, iv, tag, last4, address FROM wallet WHERE id = 1`)
+      .get();
+  },
+};
