@@ -147,12 +147,14 @@ function initSchema(d) {
       last_seen  INTEGER NOT NULL
     );
 
-    -- v0.3.0: bot's own trading wallet, encrypted at rest. Single row
-    -- (CHECK id=1) so a new set() atomically replaces the old one. The
-    -- plaintext private key never appears in this table; only ciphertext
-    -- + IV + auth tag. Decryption happens in-memory only via walletManager.
+    -- v0.3.0 → v0.7.0 migration: bot's own trading wallet, encrypted at rest.
+    -- v0.7.0 changed from single global row (id=1) to per-user (chat_id PK) so
+    -- each Telegram subscriber can have their own trading wallet and other
+    -- subscribers can't see its address. Plaintext key never appears on disk;
+    -- only ciphertext + IV + auth tag. Decryption is per-chatId via
+    -- walletManager.
     CREATE TABLE IF NOT EXISTS wallet (
-      id              INTEGER PRIMARY KEY CHECK (id = 1),
+      chat_id         INTEGER PRIMARY KEY,
       ciphertext      BLOB NOT NULL,
       iv              BLOB NOT NULL,
       tag             BLOB NOT NULL,
@@ -160,10 +162,67 @@ function initSchema(d) {
       address         TEXT NOT NULL,
       created_at      INTEGER NOT NULL,
       updated_at      INTEGER NOT NULL,
-      set_by_chat_id  INTEGER,
       set_by_username TEXT
     );
   `);
+
+  // ---------------------------------------------------------------------------
+  // One-shot migration: if the legacy single-row wallet table is present,
+  // move the row to the new per-user schema (using set_by_chat_id as the new
+  // PK) and replace the table. Safe to run on every boot — it no-ops if the
+  // legacy columns no longer exist.
+  // ---------------------------------------------------------------------------
+  const walletCols = getDb().prepare(`PRAGMA table_info(wallet)`).all().map((c) => c.name);
+  if (walletCols.includes('id') && walletCols.includes('set_by_chat_id')) {
+    // OLD shape: id PK, set_by_chat_id. Read it before we drop.
+    const legacy = getDb()
+      .prepare(`SELECT * FROM wallet WHERE id = 1`)
+      .get();
+    // Replace the table with the new per-user schema. The CREATE TABLE IF
+    // NOT EXISTS at the top of initSchema() was a no-op because the old
+    // table already existed, so we need to drop & recreate here.
+    getDb().exec(`DROP TABLE IF EXISTS wallet;`);
+    getDb().exec(`
+      CREATE TABLE wallet (
+        chat_id         INTEGER PRIMARY KEY,
+        ciphertext      BLOB NOT NULL,
+        iv              BLOB NOT NULL,
+        tag             BLOB NOT NULL,
+        last4           TEXT NOT NULL,
+        address         TEXT NOT NULL,
+        created_at      INTEGER NOT NULL,
+        updated_at      INTEGER NOT NULL,
+        set_by_username TEXT
+      );
+    `);
+    if (legacy && legacy.set_by_chat_id != null) {
+      getDb()
+        .prepare(
+          `INSERT INTO wallet (chat_id, ciphertext, iv, tag, last4, address,
+                               created_at, updated_at, set_by_username)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          legacy.set_by_chat_id,
+          legacy.ciphertext,
+          legacy.iv,
+          legacy.tag,
+          legacy.last4,
+          legacy.address,
+          legacy.created_at,
+          legacy.updated_at,
+          legacy.set_by_username
+        );
+      console.log(
+        `[db] migrated legacy single-row wallet → chat_id=${legacy.set_by_chat_id} (address ...${legacy.last4})`
+      );
+    } else if (legacy) {
+      console.log(
+        '[db] legacy wallet row had no set_by_chat_id — wallet dropped. ' +
+          'Re-add it via /start → 🔑 Wallet.'
+      );
+    }
+  }
 }
 
 // =============================================================================

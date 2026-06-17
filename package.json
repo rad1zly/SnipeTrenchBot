@@ -1,6 +1,6 @@
 {
   "name": "snipetrench-bot",
-  "version": "0.7.0",
+  "version": "0.7.2",
   "description": "Telegram copy-trading bot for Solana. Watches Pump.fun dev wallets, executes Jupiter v6/Metis swaps when a watched wallet sells its own token, holds 1s, exits. TradeWiz-style settings menu, multi-user broadcast, setMyCommands autocomplete. Documentation-first, safety-first.",
   "type": "module",
   "main": "index.js",

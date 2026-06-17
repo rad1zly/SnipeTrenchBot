@@ -29,7 +29,8 @@ import { initExecutor, executeSignal, status as executorStatus } from './src/exe
 import { startTelegramBot, stopTelegramBot } from './src/telegramBot.js';
 import notifier from './src/notifier.js';
 import { getDb, walletsDb, subscribersDb } from './src/db.js';
-import { walletManager } from './src/walletManager.js';
+// v0.7.0: per-user trading wallets — walletManager is no longer used at
+// boot. Each subscriber sets their own via /start → 🔑 Wallet.
 
 // 1. Validation gate.
 if (!validation.valid) {
@@ -49,15 +50,12 @@ console.log(`Hold (ms):      ${config.HOLD_MS}`);
 console.log(`Max SOL/trade:  ${config.MAX_SOL_PER_TRADE}`);
 console.log(`Slippage bps:   ${config.SLIPPAGE_BPS}`);
 
-// Wallet status — log only the public address + last 4, never the key.
-{
-  const w = walletManager.getStatus();
-  if (w.set) {
-    console.log(`Trading wallet: ${w.address.slice(0, 4)}…${w.address.slice(-4)} (last 4: ${w.last4}, encrypted at rest)`);
-  } else {
-    console.log('Trading wallet: ⚠️  NOT SET — set via /start → 🔑 Wallet in Telegram');
-  }
-}
+// Wallet status: per-user in v0.7.0. We no longer log a single global
+// trading wallet — each subscriber has their own, and broadcasting any
+// address would leak it to other subscribers. Operators can run
+// `sqlite3 data/snipetrench.db 'SELECT chat_id, last4, address FROM wallet'`
+// to see all configured wallets (operational access, not broadcast).
+console.log('Trading wallet: per-user — set yours via /start → 🔑 Wallet');
 console.log('Warnings:');
 for (const w of validation.warnings) console.log('  ⚠ ' + w);
 
@@ -110,17 +108,18 @@ monitor.on('poll', (info) => {
 monitor.start();
 
 // 6. Send a startup notification (broadcast — system event).
+// v0.7.0: no longer broadcast a "Trading wallet" line. Each subscriber has
+// their own wallet and other subscribers must never see its address. The
+// bot-started message only announces the mode + subscriber count.
 setTimeout(() => {
-  const w = walletManager.getStatus();
   notifier
     .info(
       [
         '🟢 Bot started',
         `Mode: ${config.DRY_RUN ? 'DRY_RUN' : 'LIVE'}`,
         `Subscribers: ${subscribersDb.count()}`,
-        `Trading wallet: ${w.set ? `${w.address.slice(0, 4)}…${w.address.slice(0, -4)}` : '⚠️ not set'}`,
         `Jupiter: ${config.JUPITER_API_URL}`,
-        'Tip: /start → 💼 Wallets to add a wallet to YOUR private watchlist.',
+        'Tip: /start → 🔑 Wallet to set your own trading wallet, /start → 🎯 Copy Trade to tune filters.',
       ].join('\n')
     )
     .catch((e) => console.error('[index] startup notify failed:', e.message));

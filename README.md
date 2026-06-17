@@ -147,34 +147,42 @@ For **live trading** you also need:
 - `DRY_RUN=false`
 - A trading wallet, set via the bot's own UI (see "Trading wallet" below) — **no longer in `.env`**
 
-#### Trading wallet (encrypted at rest, set via Telegram)
+#### Trading wallet (per-user, encrypted at rest, set via Telegram)
 
-The bot's trading private key is **not** stored in `.env`. As of v0.3.0
-you set it directly in the bot:
+v0.7.0+ — the trading private key is **per Telegram subscriber**. Each
+user who runs `/start` → 🔑 Wallet can have their own keypair, scoped to
+their `chat_id` and never visible to other subscribers.
 
 1. Open Telegram, send `/start` to your bot
 2. Tap **🔑 Wallet**
-3. Tap **➕ Set Wallet**
-4. Send your private key (Base58 string or JSON array)
-5. The bot encrypts it with **AES-256-GCM** and stores the ciphertext in
-   the local SQLite database (`data/snipetrench.db`, table `wallet`,
-   single row)
-6. Your key message is **automatically deleted from the chat** immediately
-   after the bot receives it — Telegram bot API can delete user messages
-   in private chats
+3. Pick one of:
+   - **🆕 Generate** — bot creates a fresh Solana keypair for you, encrypts
+     and stores it. No need to paste anything. The address is shown; you
+     fund it with SOL when you're ready.
+   - **📥 Import** — paste an existing private key (Base58 or JSON array).
+     Bot encrypts it, stores it, **deletes your message immediately** from
+     the chat, and confirms with the derived public address.
+4. Encryption: **AES-256-GCM** with a key derived via scrypt(machine-id +
+   optional `WALLET_PEPPER`). Plaintext key never touches disk, never
+   appears in logs, never broadcast to anyone.
 
 The encryption key is derived from your host's `machine-id` plus an
-optional `WALLET_PEPPER` from `.env`. Without the pepper, the wallet is
+optional `WALLET_PEPPER` from `.env`. Without the pepper, each wallet is
 bound to the host it was set on (the DB is useless on another machine).
-With the pepper, the wallet is portable — useful when you move the bot
-to a new VPS. See `.env.example` for the full trade-off discussion.
+With the pepper, all wallets are portable to any host that has the
+same pepper — useful when you move the bot to a new VPS. See
+`.env.example` for the full trade-off discussion.
 
-**To remove the wallet:** `/start` → 🔑 Wallet → 🗑 Remove Wallet. The
-encrypted row is deleted and the bot can no longer sign transactions.
+**🔐 Export** your private key as a single auto-deleted message (60s TTL)
+for backup or migration. **🗑 Remove** wipes your encrypted row (with
+confirmation). **🔄 Replace** overwrites (with confirmation).
 
 **To display the wallet:** the bot shows the public address and last 4
-chars in the main menu and `/status`. The full key is never displayed
-or logged.
+chars in `/status` and the 🔑 Wallet screen. The full key is never
+displayed or logged. **Other subscribers cannot see your wallet at all**
+— each user has their own row in the `wallet` table, keyed by
+`chat_id`, and the per-user notifier (DEV SELL DETECTED, BUY_OK, TRADE
+CLOSED) is routed only to the wallet owner.
 
 #### Multi-user mode
 
@@ -182,22 +190,26 @@ When the bot starts, no `chat_id` is fixed in `.env`. Instead:
 
 1. **Any user** who sends `/start` is added to the `subscribers`
    SQLite table (`chat_id`, `username`, `first_name`, `last_seen`).
-2. **All notifications** (token created, sell detected, trade steps,
-   PnL) are broadcast to every subscriber in parallel.
+2. **System notifications** (bot started, errors, daily PnL summary) are
+   broadcast to every subscriber. Trade-event notifications (DEV SELL
+   DETECTED, BUY_OK, TRADE CLOSED) are routed **only to the wallet
+   owner** — the user whose `watched_wallets` row the dev wallet
+   belongs to.
 3. **Any subscriber** can run any command — `/addwallet`, `/pause`,
    `/status`, `/settings` (the inline-keyboard menu), `/wallet` to
-   set/replace/remove the trading key.
+   generate/import/remove their own trading key.
 4. `/stop` removes the sender from the subscriber list. `/start`
    again re-subscribes.
 5. The `/subscribers` command shows the full list (admin view).
 
 The bot is **DRY_RUN by default**, so even with multiple subscribers
 the only "real" thing that can go wrong is them seeing the same
-trade notifications — no funds are at risk until `DRY_RUN=false` and
-a wallet has been set via `/wallet`. In LIVE mode, anyone who can issue
-`/addwallet` can change the watchlist, and anyone can replace the
-trading key with `/wallet` → Replace. The implicit trust boundary
-is "anyone who knows the bot token". Keep it private.
+**system** notifications — no funds are at risk until `DRY_RUN=false`
+and each user has set their own wallet via `/start` → 🔑 Wallet. In LIVE
+mode, each user controls only their own wallet; trades for users
+without a wallet are denied with `TRADE_BLOCKED: no wallet set`.
+The implicit trust boundary is "anyone who knows the bot token".
+Keep it private.
 
 ### 3. Run in DRY_RUN mode (safe)
 

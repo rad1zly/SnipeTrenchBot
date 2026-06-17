@@ -86,6 +86,8 @@ function isSell(tx, wallet) {
     (t) => t.fromUserAccount === wallet && t.tokenAmount > 0
   );
   if (!sentToken) return null;
+  // v0.7.2: filter wSOL wraps/unwraps — not a real sell, just SOL wrapping.
+  if (sentToken.mint === config.WSOL_MINT) return null;
   const receivedSol = natives.find(
     (t) => t.toUserAccount === wallet && t.amount > 0
   );

@@ -1,17 +1,18 @@
 // src/walletManager.js
 // =============================================================================
-// Secure storage for the bot's trading wallet private key. Replaces the old
-// .env-based BOT_WALLET_PRIVATE_KEY flow: user sends the key via Telegram,
-// the bot encrypts it with AES-256-GCM, stores the ciphertext in SQLite, and
-// the key never appears in plaintext on disk or in logs.
+// Secure per-user trading wallet storage (v0.7.0+).
 //
-// Security model:
+// v0.7.0 changed from a single global row (id=1) to per-user (chat_id PK) so
+// each Telegram subscriber can hold their own trading wallet — its address
+// and key are scoped to that user and never broadcast to other subscribers.
+//
+// Security model (unchanged from v0.3.0):
 //   - Key encryption: AES-256-GCM with random 12-byte IV per write
 //   - Key derivation: scryptSync(machine-id || WALLET_PEPPER, salt, 32)
 //       → the wallet can only be decrypted on the same machine unless the
 //         user also configured WALLET_PEPPER in .env
-//   - Storage: ciphertext, IV, auth tag stored in `wallet` table (single row,
-//     id=1). Plaintext NEVER written to disk, never logged.
+//   - Storage: per-user row in `wallet` table (chat_id PK). Plaintext NEVER
+//     written to disk, never logged.
 //   - Display: only last 4 chars of the public address are ever shown
 //   - In-memory: the keypair is held in JS memory only while the executor
 //     is signing a transaction. (Future: zero the buffer after use.)
@@ -20,6 +21,8 @@
 //   - DB file stolen alone        → useless without machine-id + pepper
 //   - Logs intercepted             → regex scrub removes any leaked key
 //   - Telegram chat screenshot     → key message auto-deleted by bot
+//   - Cross-subscriber snooping    → each user has their own row, no shared
+//     wallet address visible to others
 // =============================================================================
 
 import crypto from 'node:crypto';
@@ -181,10 +184,12 @@ function decrypt({ ciphertext, iv, tag }) {
 // -----------------------------------------------------------------------------
 export const walletManager = {
   /**
-   * Encrypt and store a private key. Validates format first by attempting
-   * to derive a Keypair. Returns {address, last4}. Throws on bad input.
+   * Encrypt and store a private key for one user. Validates format first by
+   * attempting to derive a Keypair. Returns {address, last4}. Throws on bad
+   * input. Overwrites any existing wallet for the same chat_id.
    */
   set({ privateKey, chatId, username = null }) {
+    if (chatId == null) throw new Error('walletManager.set: chatId is required');
     const { bytes } = parsePrivateKey(privateKey);
     // Derive a Keypair to validate the secret. The keypair object goes out
     // of scope immediately — only the address/last4 are kept.
@@ -198,32 +203,72 @@ export const walletManager = {
     getDb()
       .prepare(
         `INSERT INTO wallet
-           (id, ciphertext, iv, tag, last4, address, created_at, updated_at, set_by_chat_id, set_by_username)
-         VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET
+           (chat_id, ciphertext, iv, tag, last4, address, created_at, updated_at, set_by_username)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(chat_id) DO UPDATE SET
            ciphertext       = excluded.ciphertext,
            iv               = excluded.iv,
            tag              = excluded.tag,
            last4            = excluded.last4,
            address          = excluded.address,
            updated_at       = excluded.updated_at,
-           set_by_chat_id   = excluded.set_by_chat_id,
            set_by_username  = excluded.set_by_username`
       )
-      .run(ciphertext, iv, tag, last4, address, now, now, chatId, username);
+      .run(chatId, ciphertext, iv, tag, last4, address, now, now, username);
 
     return { address, last4 };
   },
 
   /**
-   * Decrypt the stored key and return a Solana Keypair. Throws if no wallet
-   * is set or if decryption fails (e.g. moved to a different machine without
-   * WALLET_PEPPER).
+   * Generate a brand-new Solana keypair for one user, encrypt it, store it.
+   * Returns {address, last4}. Caller is responsible for showing the user the
+   * public address (and asking them to fund it).
    */
-  getKeypair() {
-    const row = getDb().prepare(`SELECT * FROM wallet WHERE id = 1`).get();
+  generate({ chatId, username = null }) {
+    if (chatId == null) throw new Error('walletManager.generate: chatId is required');
+    const kp = Keypair.generate();
+    const address = kp.publicKey.toBase58();
+    const last4 = address.slice(-4);
+    // Base58-encode the secret key for storage. The same parser handles both
+    // forms, so this round-trips with set().
+    const privateKey = bs58.encode(kp.secretKey);
+    // Zero the local kp ref. JS GC will reclaim; we don't keep a copy.
+    const { ciphertext, iv, tag } = encrypt(privateKey);
+    const now = Date.now();
+
+    getDb()
+      .prepare(
+        `INSERT INTO wallet
+           (chat_id, ciphertext, iv, tag, last4, address, created_at, updated_at, set_by_username)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(chat_id) DO UPDATE SET
+           ciphertext       = excluded.ciphertext,
+           iv               = excluded.iv,
+           tag              = excluded.tag,
+           last4            = excluded.last4,
+           address          = excluded.address,
+           updated_at       = excluded.updated_at,
+           set_by_username  = excluded.set_by_username`
+      )
+      .run(chatId, ciphertext, iv, tag, last4, address, now, now, username);
+
+    return { address, last4 };
+  },
+
+  /**
+   * Decrypt the stored key for a single user and return a Solana Keypair.
+   * Throws if that user has no wallet set or if decryption fails (e.g.
+   * moved to a different machine without WALLET_PEPPER).
+   */
+  getKeypair(chatId) {
+    if (chatId == null) throw new Error('walletManager.getKeypair: chatId is required');
+    const row = getDb()
+      .prepare(`SELECT * FROM wallet WHERE chat_id = ?`)
+      .get(chatId);
     if (!row) {
-      throw new Error('No trading wallet set. Use /start → 🔑 Wallet to add one.');
+      throw new Error(
+        'No trading wallet set for this account. Use /start → 🔑 Wallet to add one.'
+      );
     }
     let plaintext;
     try {
@@ -231,7 +276,7 @@ export const walletManager = {
     } catch (e) {
       throw new Error(
         'Failed to decrypt wallet. The encryption key has changed ' +
-        '(moved to a new machine without WALLET_PEPPER in .env?).'
+          '(moved to a new machine without WALLET_PEPPER in .env?).'
       );
     }
     const { bytes } = parsePrivateKey(plaintext);
@@ -241,8 +286,11 @@ export const walletManager = {
   /**
    * Quick boolean check (no decryption). Safe to call at boot.
    */
-  hasKey() {
-    const row = getDb().prepare(`SELECT 1 FROM wallet WHERE id = 1`).get();
+  hasKey(chatId) {
+    if (chatId == null) return false;
+    const row = getDb()
+      .prepare(`SELECT 1 FROM wallet WHERE chat_id = ?`)
+      .get(chatId);
     return !!row;
   },
 
@@ -250,13 +298,14 @@ export const walletManager = {
    * Status for display: {set, last4, address, createdAt, updatedAt, setBy}.
    * Never returns the private key. Safe to log.
    */
-  getStatus() {
+  getStatus(chatId) {
+    if (chatId == null) return { set: false };
     const row = getDb()
       .prepare(
         `SELECT last4, address, created_at, updated_at, set_by_username
-         FROM wallet WHERE id = 1`
+         FROM wallet WHERE chat_id = ?`
       )
-      .get();
+      .get(chatId);
     if (!row) return { set: false };
     return {
       set: true,
@@ -269,13 +318,45 @@ export const walletManager = {
   },
 
   /**
-   * Wipe the wallet from the database. Returns the number of rows deleted
-   * (0 or 1). Clears the in-memory key derivation cache so the next set()
-   * starts fresh.
+   * Wipe this user's wallet. Returns the number of rows deleted (0 or 1).
+   * Clears the in-memory key derivation cache so the next set() starts fresh.
    */
-  remove() {
+  remove(chatId) {
+    if (chatId == null) throw new Error('walletManager.remove: chatId is required');
     _derivedKey = null;
-    return getDb().prepare(`DELETE FROM wallet WHERE id = 1`).run().changes;
+    return getDb()
+      .prepare(`DELETE FROM wallet WHERE chat_id = ?`)
+      .run(chatId).changes;
+  },
+
+  /**
+   * Number of users with a trading wallet configured. For diagnostics only.
+   */
+  count() {
+    return getDb().prepare(`SELECT COUNT(*) as c FROM wallet`).get().c;
+  },
+
+  /**
+   * Decrypt the stored key for a single user and return the plaintext private
+   * key as a string. Use ONLY for user-initiated export — never log, never
+   * include in /status, never broadcast. The caller (Telegram export flow)
+   * must auto-delete the message after a short TTL.
+   */
+  getPrivateKey(chatId) {
+    if (chatId == null) throw new Error('walletManager.getPrivateKey: chatId is required');
+    const row = getDb()
+      .prepare(`SELECT * FROM wallet WHERE chat_id = ?`)
+      .get(chatId);
+    if (!row) {
+      throw new Error('No trading wallet set for this account.');
+    }
+    let plaintext;
+    try {
+      plaintext = decrypt({ ciphertext: row.ciphertext, iv: row.iv, tag: row.tag });
+    } catch (e) {
+      throw new Error('Failed to decrypt wallet. Encryption key has changed.');
+    }
+    return plaintext;
   },
 };
 

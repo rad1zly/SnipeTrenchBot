@@ -122,7 +122,7 @@ const config = {
   // ---------------------------------------------------------------------------
   // Jupiter
   // ---------------------------------------------------------------------------
-  JUPITER_API_URL: envString('JUPITER_API_URL', 'https://api.jup.ag/swap/v1'),
+  JUPITER_API_URL: envString('JUPITER_API_URL', 'https://quote-api.jup.ag/v6'),
   JUPITER_API_KEY: envString('JUPITER_API_KEY', ''),
   PRIORITY_FEE_MICROLAMPORTS: envInt('PRIORITY_FEE_MICROLAMPORTS', 0),
 

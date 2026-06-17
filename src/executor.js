@@ -23,37 +23,50 @@ import config from './config.js';
 import { guardTrade } from './safety.js';
 import { positionsDb, signalsDb, walletsDb } from './db.js';
 import { getBuyQuote, getSellQuote, buildSwapTransaction, effectiveJupiterUrl } from './jupiterMetis.js';
+import notifier from './notifier.js';
 import * as settings from './settings.js';
 import { passesFilters, activeFilters } from './filters.js';
 import { walletManager } from './walletManager.js';
 
 let connection = null;
-let botKeypair = null;
+// v0.7.0: per-user keypair cache. Keyed by chat_id. Loaded on first use,
+// evicted on error so the next attempt re-decrypts from DB. Plaintext never
+// leaves this Map; we don't share with the global module scope.
+const keypairByChatId = new Map();
 const tokenMintByDev = new Map(); // devWallet -> Map<mint, createdAt> most recent first
 
 export function initExecutor() {
   connection = new Connection(config.SOLANA_RPC_URL, 'confirmed');
-  if (!config.DRY_RUN) {
-    // LIVE mode: try to load the encrypted wallet. If the user hasn't set
-    // one via /wallet yet, log a clear warning and continue — the bot will
-    // fail at submitSwap time with a readable error. (We don't want to
-    // crash at boot just because the user hasn't configured the key.)
-    if (walletManager.hasKey()) {
-      try {
-        botKeypair = walletManager.getKeypair();
-        const s = walletManager.getStatus();
-        console.log(`[executor] LIVE mode — bot wallet: ...${s.last4} (set ${new Date(s.createdAt).toISOString().slice(0, 16).replace('T', ' ')}Z)`);
-      } catch (err) {
-        console.error(`[executor] LIVE mode — failed to load encrypted wallet: ${err.message}`);
-        console.error(`[executor] Set a new wallet via /start → 🔑 Wallet, or remove the wallet and re-add it.`);
-        botKeypair = null;
-      }
-    } else {
-      console.warn('[executor] LIVE mode — no wallet set. Use /start → 🔑 Wallet to set one. Bot will fail at first trade.');
-    }
-  } else {
+  if (config.DRY_RUN) {
     console.log('[executor] DRY_RUN mode — no transactions will be signed');
+  } else {
+    console.log('[executor] LIVE mode — keypairs loaded on demand per user (v0.7.0+)');
   }
+}
+
+/**
+ * Load (or fetch from cache) the Keypair for a single user. v0.7.0+ —
+ * each Telegram subscriber has their own trading wallet. Live mode would
+ * only need this when actually submitting a transaction; DRY_RUN skips it
+ * entirely. Throws if the user has no wallet set.
+ */
+function getKeypairFor(chatId) {
+  if (chatId == null) throw new Error('executor: missing chatId — cannot load keypair');
+  if (config.DRY_RUN) return null; // never used in DRY_RUN
+  const cached = keypairByChatId.get(chatId);
+  if (cached) return cached;
+  const kp = walletManager.getKeypair(chatId);
+  keypairByChatId.set(chatId, kp);
+  return kp;
+}
+
+/**
+ * Drop a user's keypair from the in-memory cache (e.g. on a "remove wallet"
+ * event from Telegram). Next trade attempt re-decrypts.
+ */
+export function evictKeypair(chatId) {
+  if (chatId == null) return;
+  keypairByChatId.delete(chatId);
 }
 
 export function recordTokenCreated({ dev, mint, timestamp }) {
@@ -101,12 +114,12 @@ function isWithinTradingHours() {
 // Returns the first successful result. If all retries fail, returns null
 // so the caller can fail the position with the last error.
 // =============================================================================
-async function submitSwapWithRetry({ quoteResponse, label, maxAttempts = 0 }) {
+async function submitSwapWithRetry({ quoteResponse, label, maxAttempts = 0, chatId }) {
   const attempts = Math.max(1, (maxAttempts || 0) + 1);
   let lastErr = null;
   for (let i = 0; i < attempts; i++) {
     try {
-      return await submitSwap({ quoteResponse, label });
+      return await submitSwap({ quoteResponse, label, chatId });
     } catch (err) {
       lastErr = err;
       const msg = String(err.message || err);
@@ -121,26 +134,29 @@ async function submitSwapWithRetry({ quoteResponse, label, maxAttempts = 0 }) {
   throw lastErr;
 }
 
-async function submitSwap({ quoteResponse, label }) {
+async function submitSwap({ quoteResponse, label, chatId }) {
   if (config.DRY_RUN) {
     logStep(`${label}:DRY_RUN`, { inputAmount: quoteResponse?.inAmount, outputAmount: quoteResponse?.outAmount });
     return { signature: 'DRY_RUN_' + Date.now(), simulated: true };
   }
-  if (!botKeypair) {
-    // No wallet set (or decryption failed) — fail loudly with a clear hint.
+  // v0.7.0: per-user keypair. chatId identifies the wallet owner.
+  const kp = getKeypairFor(chatId);
+  if (!kp) {
+    // No wallet set for this user — fail loudly with a clear hint.
     // The user can /start → 🔑 Wallet to set one without restarting the bot.
     throw new Error(
-      'No trading wallet loaded. Use /start → 🔑 Wallet in Telegram to set one. ' +
-      '(The wallet is encrypted at rest; you do NOT need to add BOT_WALLET_PRIVATE_KEY to .env.)'
+      `No trading wallet set for this account (chatId=${chatId}). ` +
+        'Use /start → 🔑 Wallet in Telegram to set one. ' +
+        '(The wallet is encrypted at rest; you do NOT need to add BOT_WALLET_PRIVATE_KEY to .env.)'
     );
   }
   const txB64 = await buildSwapTransaction({
     quoteResponse,
-    userPublicKey: botKeypair.publicKey.toBase58(),
+    userPublicKey: kp.publicKey.toBase58(),
   });
   if (!txB64) throw new Error(`buildSwapTransaction returned null for ${label}`);
   const tx = VersionedTransaction.deserialize(Buffer.from(txB64, 'base64'));
-  tx.sign([botKeypair]);
+  tx.sign([kp]);
   const signature = await connection.sendTransaction(tx, { maxRetries: 3, skipPreflight: true });
   // Wait for confirmation with a 30s budget.
   const latest = await connection.confirmTransaction(signature, 'confirmed');
@@ -162,6 +178,11 @@ export async function executeSignal(event) {
   if (event.type !== 'SELL_DETECTED') return;
 
   const { wallet: dev, mint, solReceived, signature: devSellSig } = event;
+  // v0.7.0: per-user keypair. chatId is set by the helius monitor from the
+  // watched_wallets row, identifying which Telegram subscriber added this
+  // dev wallet. The executor uses it to look up that user's trading wallet
+  // for the buy/sell leg, and to route notifier messages back to them only.
+  const chatId = event.chatId;
 
   // v0.7.0 (06-15): user override — any watched wallet sell = buy trigger.
   // Skip isRecentToken check; we don't care if it's our token, a recent
@@ -213,6 +234,7 @@ export async function executeSignal(event) {
   const buyQuote = await getBuyQuote({ solAmount, outputMint: mint, slippageBps });
   if (!buyQuote || buyQuote.error) {
     logStep('BUY_QUOTE_FAILED', { error: buyQuote?.error });
+    notifier.tradeFailed({ stage: 'BUY_QUOTE', mint, error: buyQuote?.error || 'no quote', chatId, solAmount }).catch(() => {});
     return;
   }
   const tokensExpected = Number(buyQuote.outAmount);
@@ -236,15 +258,20 @@ export async function executeSignal(event) {
 
   let buyResult;
   try {
-    buyResult = await submitSwapWithRetry({ quoteResponse: buyQuote, label: 'BUY', maxAttempts: autoRetry });
+    buyResult = await submitSwapWithRetry({ quoteResponse: buyQuote, label: 'BUY', maxAttempts: autoRetry, chatId });
   } catch (err) {
     positionsDb.fail(positionId, `buy: ${err.message}`);
     logStep('BUY_FAILED', { error: err.message });
+    notifier.tradeFailed({ stage: 'BUY', mint, error: err.message, chatId, solAmount }).catch(() => {});
     return;
   }
+  // v0.7.0: log the USER's trading wallet (not a global one).
+  const buyerWallet = config.DRY_RUN
+    ? 'DRY_RUN'
+    : (keypairByChatId.get(chatId)?.publicKey?.toBase58() ?? 'UNKNOWN');
   signalsDb.log({
     type: 'BUY',
-    wallet: botKeypair?.publicKey?.toBase58() || 'DRY_RUN',
+    wallet: buyerWallet,
     mint,
     data: { solSpent: solAmount, tokensExpected, tx: buyResult.signature, slippageBps },
   });
@@ -255,6 +282,18 @@ export async function executeSignal(event) {
   const newStats = walletsDb.getStats(dev);
   logStep('WALLET_STATS_BUMPED', { dev, updated, copyCount: newStats?.copy_count ?? 'n/a' });
   logStep('BUY_OK', { signature: buyResult.signature, simulated: buyResult.simulated });
+  notifier.tradeStep({
+    step: 'BUY_OK',
+    mint,
+    wallet: dev,
+    chatId, // v0.7.0: route to wallet owner
+    details: {
+      sig: buyResult.signature ? `${buyResult.signature.slice(0, 4)}…${buyResult.signature.slice(-4)}` : 'DRY_RUN',
+      simulated: buyResult.simulated ? 'yes' : 'no',
+      solSpent: solAmount.toFixed(6),
+      tokensExpected,
+    },
+  }).catch((e) => console.error('[executor] notifier BUY_OK failed:', e.message));
 
   // ----- HOLD -----
   await new Promise((r) => setTimeout(r, holdMs));
@@ -279,6 +318,7 @@ export async function executeSignal(event) {
   if (!sellQuote || sellQuote.error) {
     positionsDb.fail(positionId, `sell quote: ${sellQuote?.error || 'no quote'}`);
     logStep('SELL_QUOTE_FAILED', { error: sellQuote?.error });
+    notifier.tradeFailed({ stage: 'SELL_QUOTE', mint, error: sellQuote?.error || 'no quote', chatId, solAmount: solAmount }).catch(() => {});
     return;
   }
   const solExpected = Number(sellQuote.outAmount) / config.LAMPORTS_PER_SOL;
@@ -286,10 +326,11 @@ export async function executeSignal(event) {
 
   let sellResult;
   try {
-    sellResult = await submitSwapWithRetry({ quoteResponse: sellQuote, label: 'SELL', maxAttempts: autoRetry });
+    sellResult = await submitSwapWithRetry({ quoteResponse: sellQuote, label: 'SELL', maxAttempts: autoRetry, chatId });
   } catch (err) {
     positionsDb.fail(positionId, `sell: ${err.message}`);
     logStep('SELL_FAILED', { error: err.message });
+    notifier.tradeFailed({ stage: 'SELL', mint, error: err.message, chatId, solAmount }).catch(() => {});
     return;
   }
   const pnl = solExpected - solAmount;
@@ -300,18 +341,28 @@ export async function executeSignal(event) {
   });
   signalsDb.log({
     type: 'SELL',
-    wallet: botKeypair?.publicKey?.toBase58() || 'DRY_RUN',
+    wallet: buyerWallet,
     mint,
     data: { solReceived: solExpected, tx: sellResult.signature },
   });
   logStep('SELL_OK', { signature: sellResult.signature, pnl, simulated: sellResult.simulated });
+  notifier.tradeClosed({
+    mint,
+    wallet: dev,
+    chatId, // v0.7.0: route to wallet owner
+    entrySol: solAmount,
+    exitSol: solExpected,
+    pnl,
+    holdMs,
+  }).catch((e) => console.error('[executor] notifier SELL_OK failed:', e.message));
 }
 
 /**
- * Return executor status (for /status command).
+ * Return executor status (for /status command). Per-user in v0.7.0: shows the
+ * caller's own wallet, not a global one.
  */
-export function status() {
-  const w = walletManager.getStatus();
+export function status(chatId = null) {
+  const w = walletManager.getStatus(chatId);
   return {
     mode: config.DRY_RUN ? 'DRY_RUN' : 'LIVE',
     botWallet: w.set

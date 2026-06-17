@@ -14,6 +14,19 @@
 // =============================================================================
 
 import { subscribersDb, walletsDb } from './db.js';
+import { appendFileSync } from 'node:fs';
+
+const NOTIFIER_LOG = '/tmp/stb-notifier.log';
+
+function nlog(line) {
+  // Mirror to a real file so we can see notifier activity even when the
+  // bot's stdout is piped to an orphan socket. Cheap append per call.
+  try {
+    appendFileSync(NOTIFIER_LOG, line + '\n');
+  } catch (e) {
+    // Don't crash notifier on logging failure.
+  }
+}
 
 let bot = null; // telegraf instance (set later by telegramBot.js)
 
@@ -25,9 +38,16 @@ function getTargets() {
 async function send(text, opts = {}) {
   // Local console echo first — always.
   console.log(text);
-  if (!bot) return;
+  nlog(`[send] bot=${bot ? 'set' : 'NULL'} text=${text.slice(0, 80).replace(/\n/g, ' ')}`);
+  if (!bot) {
+    nlog(`[send] ABORT: bot is null — message NOT sent to Telegram`);
+    return;
+  }
   const targets = getTargets();
-  if (targets.length === 0) return;
+  if (targets.length === 0) {
+    nlog(`[send] ABORT: no subscribers in DB`);
+    return;
+  }
   // Send to all subscribers in parallel. Per-recipient errors are logged but
   // do not stop other deliveries.
   await Promise.all(
@@ -38,9 +58,11 @@ async function send(text, opts = {}) {
           disable_web_page_preview: true,
           ...opts,
         });
+        nlog(`[send] OK → ${chatId}`);
       } catch (err) {
         const msg = err?.response?.description || err?.message || String(err);
         console.error(`[notifier] send to ${chatId} failed: ${msg}`);
+        nlog(`[send] FAIL → ${chatId}: ${msg}`);
       }
     })
   );
@@ -49,16 +71,22 @@ async function send(text, opts = {}) {
 /** Send to a single chat_id. Falls back to console-only if bot not attached. */
 async function notifyOne(chatId, text, opts = {}) {
   console.log(`[notifier → ${chatId}] ${text}`);
-  if (!bot || chatId == null) return;
+  nlog(`[notifyOne] bot=${bot ? 'set' : 'NULL'} chatId=${chatId} text=${text.slice(0, 80).replace(/\n/g, ' ')}`);
+  if (!bot || chatId == null) {
+    nlog(`[notifyOne] ABORT: bot=${bot ? 'set' : 'NULL'} chatId=${chatId}`);
+    return;
+  }
   try {
     await bot.telegram.sendMessage(chatId, text, {
       parse_mode: 'HTML',
       disable_web_page_preview: true,
       ...opts,
     });
+    nlog(`[notifyOne] OK → ${chatId}`);
   } catch (err) {
     const msg = err?.response?.description || err?.message || String(err);
     console.error(`[notifier] send to ${chatId} failed: ${msg}`);
+    nlog(`[notifyOne] FAIL → ${chatId}: ${msg}`);
   }
 }
 
@@ -89,6 +117,13 @@ const notifier = {
   /** Wire the bot instance. Called by telegramBot.js after launch. */
   attachBot(telegrafInstance) {
     bot = telegrafInstance;
+    nlog(`[attachBot] bot attached. public methods: sendMessage=${typeof bot?.telegram?.sendMessage}`);
+  },
+
+  /** Manual test — used by /ping command. */
+  async ping(chatId) {
+    nlog(`[ping] manual ping requested for chatId=${chatId}`);
+    await notifyOne(chatId, `🏓 pong ${new Date().toISOString()}\nnotifier is alive and bot=${bot ? 'set' : 'NULL'}`);
   },
 
   /** Send a TOKEN_CREATED event to the wallet owner only. */
@@ -134,8 +169,11 @@ const notifier = {
   /** Trade execution step. Owner only. */
   async tradeStep(event) {
     const { step, mint, details, chatId } = event;
+    const isBuy = step === 'BUY' || step === 'BUY_OK';
+    const isSell = step === 'SELL' || step === 'SELL_OK';
+    const emoji = isBuy ? '🟢' : isSell ? '🔴' : '⚪';
     const text = [
-      `${step === 'BUY' ? '🟢' : step === 'SELL' ? '🔴' : '⚪'} <b>${step}</b>  ${ts()}`,
+      `${emoji} <b>${step}</b>  ${ts()}`,
       `Mint: <code>${mint}</code>`,
       ...Object.entries(details || {}).map(([k, v]) => `  ${k}: ${typeof v === 'number' ? v.toFixed(6) : v}`),
     ].join('\n');
@@ -171,6 +209,22 @@ const notifier = {
       `Amount: ${solAmount ?? '?'} SOL`,
       `Reason: ${reason}`,
     ].join('\n');
+    const target = chatId ?? ownerChatId(event);
+    if (target != null) await notifyOne(target, text);
+    else await send(text);
+  },
+
+  /** Trade failed during execution (quote error, RPC failure, etc). Owner only. */
+  async tradeFailed(event) {
+    const { stage, mint, error, chatId, solAmount } = event;
+    const text = [
+      `⚠️ <b>TRADE FAILED</b>  ${ts()}`,
+      `Stage:  ${stage || '?'}`,
+      `Mint:   <code>${mint || '?'}</code>`,
+      ...(solAmount != null ? [`Amount: ${solAmount} SOL`] : []),
+      `Error:  <code>${String(error || 'unknown').slice(0, 300)}</code>`,
+    ].join('\n');
+    nlog(`[tradeFailed] bot=${bot ? 'set' : 'NULL'} chatId=${chatId} stage=${stage} err=${String(error).slice(0, 100)}`);
     const target = chatId ?? ownerChatId(event);
     if (target != null) await notifyOne(target, text);
     else await send(text);

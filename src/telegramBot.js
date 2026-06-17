@@ -54,11 +54,11 @@ import { Telegraf, Markup } from 'telegraf';
 import config from './config.js';
 import { walletsDb, positionsDb, subscribersDb, settingsDb } from './db.js';
 import { pause, resume, isPaused, snapshot as safetySnapshot } from './safety.js';
-import { status as executorStatus } from './executor.js';
+import { status as executorStatus, evictKeypair } from './executor.js';
+import { walletManager } from './walletManager.js';
 import notifier from './notifier.js';
 import * as sm from './settingsMenu.js';
 import * as wm from './walletMenu.js';
-import { walletManager } from './walletManager.js';
 
 let bot = null;
 let onPause = null; // callback set by index.js so we can stop the monitor if needed
@@ -166,7 +166,7 @@ function bulkAddResultMessage(added, skipped) {
 function buildMainText(chatId) {
   const e = executorStatus();
   const s = safetySnapshot();
-  const w = walletManager.getStatus();
+  const w = walletManager.getStatus(chatId);
   // v0.6.1: per-user counts. Total copies & wallets are scoped to the
   // calling user; subscriber count stays global (system-level stat).
   const myWallets = chatId != null ? walletsDb.count(chatId) : 0;
@@ -254,7 +254,9 @@ async function renderScreen(ctx, text, keyboard) {
 
 function buildStatusText(chatId) {
   const s = safetySnapshot();
-  const e = executorStatus();
+  // v0.7.0: per-user wallet. Show only the caller's own wallet, never the
+  // shared/global one. executorStatus(chatId) reads from the per-user row.
+  const e = executorStatus(chatId);
   // v0.6.1: "Watched" is the calling user's wallet count.
   const myWallets = chatId != null ? walletsDb.count(chatId) : 0;
   return [
@@ -267,8 +269,10 @@ function buildStatusText(chatId) {
     `Open positions: ${s.openPositionCount}`,
     `Closed today:   ${s.closedTodayCount} (PnL ${s.pnlTodaySol.toFixed(4)} SOL)`,
     '',
-    '<b>Bot wallet</b>',
+    '<b>Your trading wallet</b>',
     `Address:        <code>${e.botWallet}</code>`,
+    '',
+    '<b>RPC / Jupiter</b>',
     `RPC:            ${e.rpc}`,
     `Jupiter:        ${e.jupiterUrl}`,
     '',
@@ -380,6 +384,13 @@ export function startTelegramBot({ onPause: pauseCb, onResume: resumeCb } = {}) 
     throw new Error('TELEGRAM_BOT_TOKEN is empty — cannot start bot');
   }
   bot = new Telegraf(config.TELEGRAM_BOT_TOKEN);
+  // CRITICAL: attach the bot to the notifier BEFORE attempting launch.
+  // bot.launch() opens a long-poll for incoming updates, but bot.telegram.sendMessage
+  // uses the Bot API directly and works fine without an active long-poll. If we
+  // wait for launch to succeed, the 409-retry loop on a stale long-poll slot
+  // leaves the notifier's bot reference null for the entire retry window (up to
+  // 13 min), and every trade notification is silently dropped during that time.
+  notifier.attachBot(bot);
   bot.use(subscribeMiddleware);
 
   // Pending "add wallet" state: chatId → { startedAt }
@@ -402,6 +413,11 @@ export function startTelegramBot({ onPause: pauseCb, onResume: resumeCb } = {}) 
     // subscribeMiddleware already added sender to subscribers table.
     // Show the main menu inline.
     ctx.replyWithHTML(buildMainText(ctx.chat.id), mainMenu(ctx.chat.id));
+  });
+
+  // ---- /ping (debug: verify notifier can reach this chat) ----
+  bot.command('ping', async (ctx) => {
+    await notifier.ping(ctx.chat.id);
   });
 
   // ---- /menu (shortcut: re-show the main menu) ----
@@ -483,13 +499,20 @@ export function startTelegramBot({ onPause: pauseCb, onResume: resumeCb } = {}) 
           onPause?.();
         }
         await renderScreen(ctx, buildMainText(ctx.chat.id), mainMenu(ctx.chat.id));
-      } else if (data === 'menu:wallet') {
-        // Bot's own trading wallet (encrypted). Set / Replace / Remove.
-        await wm.renderWalletMenu(ctx);
       } else if (data === 'cmd:set_wallet') {
-        // Enter pending-set mode. Next text message in this DM is consumed
+        // Enter pending-import mode. Next text message in this DM is consumed
         // as the private key (see handlePendingWalletText).
         await wm.promptSetWallet(ctx);
+      } else if (data === 'cmd:generate_wallet') {
+        // 🆕 Generate: create a fresh keypair for this user.
+        await wm.promptGenerateWallet(ctx);
+      } else if (data === 'cmd:do_generate_wallet') {
+        // User confirmed. Generate + encrypt + store.
+        await wm.doGenerateWallet(ctx);
+      } else if (data === 'cmd:export_wallet') {
+        // 🔐 Export: send this user's private key as a single auto-deleted
+        // message. NEVER broadcast, NEVER logged.
+        await wm.promptExportWallet(ctx);
       } else if (data === 'cmd:remove_wallet') {
         // Show confirm dialog (don't delete yet).
         await wm.confirmRemoveWallet(ctx);
@@ -633,17 +656,17 @@ export function startTelegramBot({ onPause: pauseCb, onResume: resumeCb } = {}) 
   // ---- /status ----
   bot.command('status', (ctx) => {
     const s = safetySnapshot();
-    const e = executorStatus();
+    const e = executorStatus(ctx.chat.id);
     const lines = [
       '<b>Status</b>',
       `Mode:           ${s.mode}`,
       `Manual pause:   ${s.manualPaused ? 'yes' : 'no'}`,
-      `Watched:        ${walletsDb.count()} wallet(s)`,
+      `Watched:        ${walletsDb.count(ctx.chat.id)} wallet(s)`,
       `Subscribers:    ${subscribersDb.count()}`,
       `Open positions: ${s.openPositionCount}`,
       `Closed today:   ${s.closedTodayCount} (PnL ${s.pnlTodaySol.toFixed(4)} SOL)`,
       '',
-      '<b>Bot wallet</b>',
+      '<b>Your trading wallet</b>',
       `Address:        <code>${e.botWallet}</code>`,
       `RPC:            ${e.rpc}`,
       `Jupiter:        ${e.jupiterUrl}`,

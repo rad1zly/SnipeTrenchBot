@@ -4,6 +4,119 @@ All notable changes to SnipeTrenchBot are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.7.3] - 2026-06-16
+
+### Added — Per-user trading wallet (privacy)
+
+The bot's trading wallet was previously stored as a single global row in
+the `wallet` table, and the startup broadcast included its address — which
+meant every other Telegram subscriber could see the bot operator's trading
+wallet. v0.7.3 makes the wallet per-user (one row per `chat_id`), scoped
+to the owning Telegram account, and never broadcast to anyone else.
+
+**New Telegram UI** (`/start` → 🔑 Wallet):
+- `🆕 Generate` — bot creates a fresh Solana keypair, encrypts, stores.
+  No need to paste anything.
+- `📥 Import` — paste your existing private key (Base58 or JSON array);
+  bot encrypts, stores, **deletes the message**, and confirms with the
+  derived public address.
+- `🔐 Export` — send your private key as a single auto-deleted message
+  (60s TTL). For backup / migration.
+- `🔄 Replace` — overwrite your existing wallet (with confirm step).
+- `🗑 Remove` — wipe your wallet (with confirm step).
+
+**Schema migration** (auto on first boot):
+- Old: `wallet(id INTEGER PRIMARY KEY CHECK id=1, set_by_chat_id, ...)`
+- New: `wallet(chat_id INTEGER PRIMARY KEY, ...)`
+- The legacy row is migrated to the user who set it (`set_by_chat_id`).
+  Other subscribers don't have a wallet until they /start → 🔑 Wallet.
+
+**Security improvements:**
+- Each user has their own row → cross-subscriber snooping impossible.
+- Startup broadcast no longer includes the trading wallet address.
+- `/status` shows only the caller's own wallet, never another's.
+- Trade-event notifier (DEV SELL DETECTED / BUY_OK / TRADE CLOSED) is
+  already routed by `event.chatId` (set by heliusMonitor from the
+  watched_wallets row) — no change there.
+
+**Files changed:**
+- `src/db.js` — new `wallet` schema + one-shot migration that preserves
+  the legacy key. Idempotent — runs once per old shape, then no-ops.
+- `src/walletManager.js` — all methods now per-`chatId` (set, getKeypair,
+  getStatus, hasKey, remove, count). New `generate({chatId, username})`
+  for the Generate flow. New `getPrivateKey(chatId)` for the Export
+  flow (returns decrypted key, caller must auto-delete the message).
+- `src/executor.js` — per-user keypair cache (`Map<chatId, Keypair>`).
+  `submitSwap` and `submitSwapWithRetry` accept `chatId`. `getKeypairFor`
+  helper, `evictKeypair` for cache invalidation. The `wallet` field in
+  `signals` log now records the USER's wallet, not a global one.
+- `src/telegramBot.js` — main menu adds `🔑 Wallet` button. `/status`
+  passes `chatId` to `executorStatus(chatId)`. New callback handlers
+  `cmd:generate_wallet`, `cmd:do_generate_wallet`, `cmd:export_wallet`.
+- `src/walletMenu.js` — full rewrite to per-user. All handlers take
+  `ctx.chat.id` and scope all `walletManager` calls to that user. The
+  user's own address is shown; other subscribers' addresses are
+  unreadable. Export key is a single auto-deleted message.
+- `index.js` — dropped the global `walletManager` import. Removed the
+  "Trading wallet: 9vJX..." line from the startup broadcast. Replaced
+  with a per-user tip pointing to 🔑 Wallet.
+
+**Operational impact:**
+- Existing user (pwnedx0) keeps their wallet — auto-migrated to
+  `chat_id=6170215817`.
+- The 2 other subscribers (rad1zly, gmdropzi) currently have no wallet
+  and no watched wallets, so no impact on them. If they later add
+  wallets, they must /start → 🔑 Wallet first or trades will be denied
+  with `TRADE_BLOCKED: no wallet set`.
+- This is a bot with 1 user actually using it. The other 2 subscribers
+  are passive.
+
+**Documentation:** README + RISK.md updates pending (this section).
+
+## [0.7.2] - 2026-06-16
+
+### Added — Telegram notifications for BUY_OK and SELL_OK
+
+Every successful trade now sends a Telegram message to the wallet owner
+so the user sees the result without tailing logs. `BUY_OK` fires right
+after the buy transaction confirms; `SELL_OK` (rendered as `TRADE CLOSED`
+with PnL) fires after the auto-sell closes the position. In DRY_RUN
+mode both messages are still sent (with `simulated: yes` in the details
+line) so users can see what would have happened.
+
+- `src/executor.js` `executeSignal()`: call `notifier.tradeStep({ step:
+  'BUY_OK', mint, wallet, details })` after `BUY_OK` logStep.
+- `src/executor.js` `executeSignal()`: call `notifier.tradeClosed({ mint,
+  wallet, entrySol, exitSol, pnl, holdMs })` after `SELL_OK` logStep.
+- `src/notifier.js` `tradeStep()`: extended emoji picker to recognize
+  `BUY_OK` → 🟢 and `SELL_OK` → 🔴 in addition to the existing
+  `BUY` / `SELL` labels.
+
+### Fixed — wSOL wraps/unwraps no longer trigger SELL_DETECTED
+
+The dev-sell heuristic looked at any SPL token sent by the watched
+wallet in the same tx as a native SOL receipt. That fired on plain
+wSOL wrap/unwrap operations (the wallet sends wSOL out and gets SOL
+back, or vice versa) — those aren't sells. Added a one-line guard in
+`isSell()` that bails when the sent token's mint is `WSOL_MINT`
+(`So11111111111111111111111111111111111111112`).
+
+- `src/heliusMonitor.js` `isSell()`: early-return null if
+  `sentToken.mint === config.WSOL_MINT`.
+
+### Changed — Jupiter endpoint default is v6 public aggregator
+
+`JUPITER_API_URL` default in both `.env` and `src/config.js` switched
+from `https://api.jup.ag/swap/v1` to `https://quote-api.jup.ag/v6` —
+the public aggregator used by Charon. `.env.example` already pointed
+at v6, so the runtime now matches the template. If you were relying
+on the old default, override the value in your `.env`.
+
+- `.env`: `JUPITER_API_URL=https://quote-api.jup.ag/v6`
+- `src/config.js`: `JUPITER_API_URL` default updated for consistency.
+- `src/jupiterMetis.js`: unchanged — module already supported all
+  three endpoint styles via the URL (v6, swap/v1, Metis).
+
 ## [0.7.1] - 2026-06-15
 
 ### Changed — market cap bounds are now in USD (TradeWiz parity)
