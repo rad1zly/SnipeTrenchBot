@@ -76,8 +76,14 @@ function isTokenCreated(tx, wallet) {
 
 /**
  * Decide if a tx is a SELL by `wallet`.
- * Heuristic: wallet sends an SPL token (tokenAmount > 0 fromUserAccount = wallet)
- * AND receives native SOL in the same tx.
+ * Heuristic: wallet sends an SPL token (tokenAmount > 0, fromUserAccount = wallet)
+ * AND either receives native SOL directly OR has negative net SOL balance change.
+ *
+ * v0.8.0: GMGN / Jupiter / Pump.fun aggregators often route SOL through
+ * intermediate vaults, so nativeTransfers.toUserAccount !== wallet even for
+ * a confirmed sell. We accept either:
+ *   1) native SOL transferred directly to wallet, OR
+ *   2) wallet's net nativeBalanceChange < 0 (proof of SOL outflow to anywhere)
  */
 function isSell(tx, wallet) {
   const transfers = tx.tokenTransfers || [];
@@ -88,13 +94,31 @@ function isSell(tx, wallet) {
   if (!sentToken) return null;
   // v0.7.2: filter wSOL wraps/unwraps — not a real sell, just SOL wrapping.
   if (sentToken.mint === config.WSOL_MINT) return null;
-  const receivedSol = natives.find(
+
+  // Try direct SOL receive first (most precise).
+  const directSol = natives.find(
     (t) => t.toUserAccount === wallet && t.amount > 0
   );
-  if (!receivedSol) return null;
+  if (directSol) {
+    return {
+      mint: sentToken.mint,
+      solReceived: directSol.amount / config.LAMPORTS_PER_SOL,
+      tokenSent: sentToken.tokenAmount,
+    };
+  }
+
+  // Fallback: GMGN/Jupiter-routed sells. Use accountData's nativeBalanceChange.
+  // If the wallet lost SOL (any negative amount), it's a sell. The "received"
+  // amount is the absolute loss minus any non-sell SOL outflows (priority
+  // fees, ATA rent) — but for now we log 0 if we can't determine the actual
+  // received amount, and let the executor quote the real output via Jupiter.
+  const acct = (tx.accountData || []).find(a => a.account === wallet);
+  const netSol = acct ? (acct.nativeBalanceChange || 0) : 0;
+  if (netSol >= 0) return null;  // no SOL loss → not a sell
+
   return {
     mint: sentToken.mint,
-    solReceived: receivedSol.amount / config.LAMPORTS_PER_SOL,
+    solReceived: 0,  // unknown; executor will quote via Jupiter
     tokenSent: sentToken.tokenAmount,
   };
 }
