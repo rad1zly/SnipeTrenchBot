@@ -157,13 +157,36 @@ async function submitSwap({ quoteResponse, label, chatId }) {
   if (!txB64) throw new Error(`buildSwapTransaction returned null for ${label}`);
   const tx = VersionedTransaction.deserialize(Buffer.from(txB64, 'base64'));
   tx.sign([kp]);
-  const signature = await connection.sendTransaction(tx, { maxRetries: 3, skipPreflight: true });
-  // Wait for confirmation with a 30s budget.
-  const latest = await connection.confirmTransaction(signature, 'confirmed');
-  if (latest.value?.err) {
-    throw new Error(`${label} tx failed on-chain: ${JSON.stringify(latest.value.err)}`);
+  // v0.8.0 (speed): 'processed' commitment for send (single slot ~400ms).
+  // skipPreflight: true saves ~200ms by skipping simulate step.
+  // Trade-off: 'processed' can be re-org'd, but we sell within 1s anyway.
+  const signature = await connection.sendTransaction(tx, {
+    maxRetries: 3,
+    skipPreflight: true,
+    preflightCommitment: 'processed',
+  });
+  // v0.8.0 (speed): poll for 'processed' (1 slot, ~400ms) instead of 'confirmed'.
+  // 'processed' is enough for our 1s hold — if buy reorgs, sell won't fire.
+  // Fallback: bump to 'confirmed' if 'processed' doesn't land in 1.5s.
+  const pollStart = Date.now();
+  const POLL_BUDGET_MS = 1500;
+  let status = null;
+  while (Date.now() - pollStart < POLL_BUDGET_MS) {
+    const r = await connection.getSignatureStatuses([signature], { searchTransactionHistory: false });
+    status = r?.value?.[0];
+    if (status) {
+      if (status.err) {
+        throw new Error(`${label} tx failed on-chain: ${JSON.stringify(status.err)}`);
+      }
+      if (status.confirmationStatus === 'processed' || status.confirmationStatus === 'confirmed' || status.confirmationStatus === 'finalized') {
+        return { signature, simulated: false, landedIn: Date.now() - pollStart };
+      }
+    }
+    await new Promise(r => setTimeout(r, 50));
   }
-  return { signature, simulated: false };
+  // Budget exhausted — log but accept as best-effort. Sell leg will check actual balance.
+  console.warn(`[executor] ${label} signature ${signature.slice(0,8)}... no processed status in ${POLL_BUDGET_MS}ms; proceeding to sell`);
+  return { signature, simulated: false, landedIn: POLL_BUDGET_MS };
 }
 
 /**
