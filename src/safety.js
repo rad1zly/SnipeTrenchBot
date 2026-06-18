@@ -15,7 +15,7 @@ import { positionsDb, safetyDb } from './db.js';
 import * as settings from './settings.js';
 
 // In-memory flags. Persisted to safety_log when changed.
-let manualPaused = false;
+let manualPaused = process.env.START_PAUSED === 'true';
 let lastResetDate = null; // YYYY-MM-DD string of the day we last reset daily stats
 
 /**

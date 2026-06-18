@@ -85,6 +85,12 @@ export async function getQuote({ inputMint, outputMint, amount, slippageBps = co
  */
 export async function buildSwapTransaction({ quoteResponse, userPublicKey }) {
   const b = base();
+  // v0.8.0 (audit): priority fee read from settings DB (buy_priority_fee_sol, in SOL).
+  // Fallback: env PRIORITY_FEE_MICROLAMPORTS is in micro-lamports -> convert to lamports.
+  // Setting wins over env (matches settings.get priority).
+  const _pfEnvLamports = Math.floor(Number(config.PRIORITY_FEE_MICROLAMPORTS || 0) / 1e3); // micro->lamports
+  const _pfSolLamports = Math.floor(Number(settings.get('buy_priority_fee_sol') || 0) * 1e9); // SOL->lamports
+  const prioritizationFeeLamports = _pfSolLamports > 0 ? _pfSolLamports : _pfEnvLamports;
   if (b.includes('/swap/v1')) {
     // New Swap API v1 — uses /swap to return a serialized transaction.
     const url = `${b}/swap`;
@@ -93,9 +99,7 @@ export async function buildSwapTransaction({ quoteResponse, userPublicKey }) {
       userPublicKey,
       wrapAndUnwrapSol: true,
       dynamicComputeUnitLimit: true,
-      prioritizationFeeLamports: config.PRIORITY_FEE_MICROLAMPORTS > 0
-        ? config.PRIORITY_FEE_MICROLAMPORTS
-        : 0,
+      prioritizationFeeLamports,
     };
     const res = await axios.post(url, body, { headers: HEADERS, timeout: 15_000 });
     return res.data?.swapTransaction || null;
@@ -108,6 +112,7 @@ export async function buildSwapTransaction({ quoteResponse, userPublicKey }) {
     wrapAndUnwrapSol: true,
     // v6 supports dynamicComputeUnitLimit too.
     dynamicComputeUnitLimit: true,
+    prioritizationFeeLamports,
   };
   const res = await axios.post(url, body, { headers: HEADERS, timeout: 15_000 });
   return res.data?.swapTransaction || null;
