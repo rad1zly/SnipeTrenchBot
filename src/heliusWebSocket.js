@@ -71,6 +71,10 @@ export class HeliusWebSocketMonitor extends EventEmitter {
       clearTimeout(this._reconnectTimer);
       this._reconnectTimer = null;
     }
+    if (this._refreshTimer) {
+      clearInterval(this._refreshTimer);
+      this._refreshTimer = null;
+    }
     if (this._ws) {
       try { this._ws.close(); } catch (e) { /* ignore */ }
       this._ws = null;
@@ -93,6 +97,11 @@ export class HeliusWebSocketMonitor extends EventEmitter {
       this.emit('status', 'connected');
       // Re-subscribe to all known wallets
       this._resubscribeAll().catch((err) => this.emit('error', err));
+      // v0.8.0: start periodic wallet-list refresh so users can add wallets
+      // via Telegram /start → 🔑 Wallet without restarting the bot.
+      if (!this._refreshTimer) {
+        this._refreshTimer = setInterval(() => this._refreshWalletList().catch(() => {}), 30_000);
+      }
     });
 
     ws.on('message', (data) => {
@@ -204,6 +213,21 @@ export class HeliusWebSocketMonitor extends EventEmitter {
       }
     } finally {
       this._pendingFetches.delete(signature);
+    }
+  }
+
+  /**
+   * Subscribe to any new wallets in the DB that we don't already track.
+   * Run periodically so users can add wallets without restart.
+   */
+  async _refreshWalletList() {
+    if (!this._ready) return;
+    const addresses = walletsDb.listAll();
+    for (const address of addresses) {
+      if (!this._subscriptions.has(address)) {
+        try { await this._subscribe(address); }
+        catch (err) { this.emit('error', new Error(`subscribe ${address} failed: ${err.message}`)); }
+      }
     }
   }
 
