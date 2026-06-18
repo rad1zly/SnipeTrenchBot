@@ -215,6 +215,29 @@ const CATALOG = [
       return n;
     },
   },
+  {
+    // v0.8.0: min sell ratio. If the dev wallet sold less than this fraction
+    // of their token holdings, the bot skips the copy-trade. Helps avoid
+    // copy-trading partial sells (where the dev still has skin in the game).
+    // Stored as a fraction in [0.1, 1.0] (e.g. 0.9 = 90%). Default 0.9
+    // matches the typical "dev fully exits" intent. Set to 0.1 to copy every
+    // sell, or 1.0 to require a 100% dump.
+    key: 'min_sell_ratio', type: 'number', category: 'filters',
+    label: 'Min Sell Ratio (0.1-1.0)',
+    default: 0.9,
+    min: 0.1,
+    max: 1.0,
+    parseUserInput: (t) => {
+      const s = t.trim().toLowerCase();
+      if (['none', 'unlimited', 'off', ''].includes(s)) return null;
+      // Accept both 0.9 and 90 (interpreted as 90%)
+      let n = parseFloat(t);
+      if (Number.isNaN(n)) return null;
+      if (n > 1) n = n / 100; // 90 → 0.9
+      if (n < 0.1 || n > 1.0) return null;
+      return n;
+    },
+  },
 
   // ── Token ──────────────────────────────────────────────────────────────
   {
@@ -440,6 +463,11 @@ export function formatValue(key) {
   }
   if (setting.type === 'number' && setting.key === 'hold_ms') {
     return `${v} ms (${(v / 1000).toFixed(1)}s)`;
+  }
+  if (setting.type === 'number' && setting.key === 'min_sell_ratio') {
+    // Sell ratio is a fraction in [0.1, 1.0]. Display as a percentage so the
+    // menu is readable ("90% min sell" rather than "0.9 min sell ratio").
+    return v == null ? 'Off' : `${(v * 100).toFixed(0)}%`;
   }
   if (setting.type === 'text' && (v == null || v === '')) {
     return '—';

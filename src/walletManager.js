@@ -28,7 +28,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
-import { Keypair } from '@solana/web3.js';
+import { Connection, Keypair, PublicKey } from '@solana/web3.js';
 import bs58 from 'bs58';
 import { getDb } from './db.js';
 import config from './config.js';
@@ -362,3 +362,141 @@ export const walletManager = {
 
 // Re-export the scrub helper at the module level too
 export { scrub as scrubKey };
+
+// =============================================================================
+// Balance fetching (v0.8.0 — added by feature: wallet balance + winrate)
+//
+// Pattern adopted from charon/src/liveExecutor.js (`liveWalletBalanceLamports`)
+// but generalised to take any address (the SnipeTrenchBot wallet is per-user,
+// so we need a free function rather than a singleton).
+//
+// We instantiate a `Connection` on demand using the Helius RPC URL from .env.
+// Better-sqlite3 keeps the bot single-threaded, so we don't pool connections
+// — each call constructs, uses, and discards.
+//
+// Cache: 30s TTL, in-memory Map keyed by address. Prevents /status from
+// hammering Helius when invoked rapidly. Cache is process-local; it dies
+// with the bot on restart.
+// =============================================================================
+const BALANCE_TTL_MS = 30_000;
+
+const _balanceCache = new Map(); // address -> { value, expiresAt }
+
+function getConnection() {
+  if (!config.SOLANA_RPC_URL) {
+    throw new Error('SOLANA_RPC_URL is empty — set it in .env (Helius RPC).');
+  }
+  return new Connection(config.SOLANA_RPC_URL, 'confirmed');
+}
+
+function withCache(key, ttlMs, loader) {
+  const now = Date.now();
+  const cached = _balanceCache.get(key);
+  if (cached && cached.expiresAt > now) {
+    return Promise.resolve({ ...cached.value, cached: true });
+  }
+  return loader().then((value) => {
+    _balanceCache.set(key, { value, expiresAt: now + ttlMs });
+    return { ...value, cached: false };
+  });
+}
+
+/**
+ * Invalidate the balance cache for one address (or all addresses if no arg).
+ * Use after a fill, a transfer, or a wallet change so the next /status is
+ * fresh.
+ */
+export function invalidateBalanceCache(address = null) {
+  if (address == null) _balanceCache.clear();
+  else _balanceCache.delete(address);
+}
+
+/**
+ * Fetch native SOL balance (in lamports + SOL) for a public address.
+ * Returns { lamports, sol, slot, cached, error? }.
+ */
+export async function fetchSolBalance(address) {
+  if (!address) return { lamports: 0, sol: 0, slot: null, cached: false, error: 'no address' };
+  return withCache(`sol:${address}`, BALANCE_TTL_MS, async () => {
+    try {
+      const conn = getConnection();
+      // getBalance returns lamports (1 SOL = 1_000_000_000 lamports).
+      // Use 'confirmed' commitment so the number reflects what's likely
+      // already on-chain and won't reorg in the next few seconds.
+      const lamports = await conn.getBalance(new PublicKey(address), 'confirmed');
+      return {
+        lamports,
+        sol: lamports / 1e9,
+        slot: null, // getBalance doesn't return slot in web3.js v1
+        error: null,
+      };
+    } catch (e) {
+      return { lamports: 0, sol: 0, slot: null, error: e.message || String(e) };
+    }
+  });
+}
+
+/**
+ * Fetch SPL token balances for a public address. Returns the top N tokens
+ * by raw amount (sorted desc), each with mint, amount (raw), decimals,
+ * uiAmount, and (when available) the on-chain token metadata name/symbol.
+ *
+ * Uses getParsedTokenAccountsByOwner — slightly heavier than getBalance,
+ * but returns the decimals + uiAmount in one call, which is exactly what
+ * we want for the /status display.
+ */
+export async function fetchTokenBalances(address, { limit = 10, minUi = 0 } = {}) {
+  if (!address) return { tokens: [], cached: false, error: 'no address' };
+  return withCache(`tokens:${address}:${limit}:${minUi}`, BALANCE_TTL_MS, async () => {
+    try {
+      const conn = getConnection();
+      const resp = await conn.getParsedTokenAccountsByOwner(
+        new PublicKey(address),
+        { programId: new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA') },
+        'confirmed',
+      );
+      const tokens = resp.value
+        .map((acc) => {
+          const info = acc.account.data.parsed.info;
+          const ta = info.tokenAmount;
+          return {
+            mint: info.mint,
+            amount: ta.amount,            // raw integer
+            decimals: ta.decimals,
+            uiAmount: ta.uiAmount,        // already adjusted for decimals
+            uiAmountString: ta.uiAmountString,
+          };
+        })
+        .filter((t) => (t.uiAmount || 0) > minUi)
+        .sort((a, b) => Number(b.amount) - Number(a.amount))
+        .slice(0, limit)
+        .map((t) => ({
+          ...t,
+          shortMint: `${t.mint.slice(0, 4)}\u2026${t.mint.slice(-4)}`,
+        }));
+      return { tokens, error: null };
+    } catch (e) {
+      return { tokens: [], error: e.message || String(e) };
+    }
+  });
+}
+
+/**
+ * Combined balance snapshot for /status. Returns:
+ *   { sol: { lamports, sol, cached, error },
+ *     tokens: { tokens: [...], cached, error },
+ *     fetchedAt }
+ * The caller is expected to handle the `error` fields gracefully (network
+ * blips should not break the bot).
+ */
+export async function fetchBalanceSnapshot(address, opts = {}) {
+  const [sol, tokens] = await Promise.all([
+    fetchSolBalance(address),
+    fetchTokenBalances(address, opts),
+  ]);
+  return {
+    sol,
+    tokens,
+    fetchedAt: Date.now(),
+  };
+}

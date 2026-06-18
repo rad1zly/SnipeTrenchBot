@@ -208,6 +208,7 @@ export async function executeSignal(event) {
     dev,
     createdAt,
     programIds: event.programIds || [],
+    soldAmount: event.tokenSent ?? null,   // v0.8.0: sell-ratio filter
   });
   if (!filterResult.passed) {
     logStep('SKIP_FILTER', { mint, reason: filterResult.reason });

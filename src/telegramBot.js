@@ -40,6 +40,8 @@ const BOT_COMMANDS = [
   { command: 'removewallet',description: 'Remove wallet — /removewallet <addr>' },
   { command: 'wallet',      description: 'Set / replace / remove the bot trading wallet' },
   { command: 'status',      description: 'Bot + executor + safety snapshot' },
+  { command: 'stats',       description: 'Win rate, PnL, best/worst trades' },
+  { command: 'balance',     description: 'Wallet SOL + SPL token balances' },
   { command: 'positions',   description: 'List open positions' },
   { command: 'recent',      description: 'Last N closed trades — /recent [n]' },
   { command: 'safety',      description: 'Show safety config' },
@@ -55,7 +57,7 @@ import config from './config.js';
 import { walletsDb, positionsDb, subscribersDb, settingsDb } from './db.js';
 import { pause, resume, isPaused, snapshot as safetySnapshot } from './safety.js';
 import { status as executorStatus, evictKeypair } from './executor.js';
-import { walletManager } from './walletManager.js';
+import { walletManager, fetchBalanceSnapshot } from './walletManager.js';
 import notifier from './notifier.js';
 import * as sm from './settingsMenu.js';
 import * as wm from './walletMenu.js';
@@ -209,6 +211,10 @@ function mainMenu(chatId) {
       Markup.button.callback('🔑 Wallet',    'menu:wallet'),
     ],
     [
+      Markup.button.callback('📈 Stats',     'cmd:stats'),
+      Markup.button.callback('💰 Balance',   'cmd:balance'),
+    ],
+    [
       Markup.button.callback('❓ Help',      'cmd:help'),
     ],
   ]);
@@ -253,12 +259,16 @@ async function renderScreen(ctx, text, keyboard) {
 // and the legacy /commands (so /status text matches the "📊 Status" button).
 
 function buildStatusText(chatId) {
-  const s = safetySnapshot();
-  // v0.7.0: per-user wallet. Show only the caller's own wallet, never the
-  // shared/global one. executorStatus(chatId) reads from the per-user row.
+  const s = safetySnapshot(chatId);
   const e = executorStatus(chatId);
-  // v0.6.1: "Watched" is the calling user's wallet count.
   const myWallets = chatId != null ? walletsDb.count(chatId) : 0;
+  const w = s.winStats;
+  const winrateStr = w.totalClosed === 0
+    ? '—'
+    : `${w.winRate.toFixed(1)}% (${w.wins}W/${w.losses}L${w.breakeven ? `/${w.breakeven}E` : ''})`;
+  const pnlStr = w.totalClosed === 0
+    ? '—'
+    : `${w.totalPnlSol >= 0 ? '+' : ''}${w.totalPnlSol.toFixed(4)} SOL`;
   return [
     '<b>📊 Status</b>',
     '',
@@ -276,11 +286,70 @@ function buildStatusText(chatId) {
     `RPC:            ${e.rpc}`,
     `Jupiter:        ${e.jupiterUrl}`,
     '',
+    '<b>Win/Loss (your watchlist)</b>',
+    `Trades closed:  ${w.totalClosed}`,
+    `Win rate:       ${winrateStr}`,
+    `Total PnL:      ${pnlStr}`,
+    '',
     '<b>Safety</b>',
     `Max SOL/trade:  ${s.maxSolPerTrade}`,
     `Slippage:       ${s.slippageBps} bps`,
     `Hold:           ${s.holdMs} ms`,
     `Daily loss cap: ${s.dailyLossCapSol} SOL`,
+    '',
+    '<i>Tip: /balance → wallet SOL &amp; SPL tokens · /stats → detailed W/L breakdown</i>',
+  ].join('\n');
+}
+
+// ---------------------------------------------------------------------
+// v0.8.0: /stats — detailed win/loss tracking (per-user + global)
+// ---------------------------------------------------------------------
+function fmtPct(x) {
+  if (x == null || !Number.isFinite(x)) return '—';
+  return `${x >= 0 ? '+' : ''}${x.toFixed(2)}%`;
+}
+function fmtSol(x) {
+  if (x == null || !Number.isFinite(x)) return '—';
+  return `${x >= 0 ? '+' : ''}${x.toFixed(4)} SOL`;
+}
+function fmtHold(ms) {
+  if (ms == null || !Number.isFinite(ms)) return '—';
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  return `${(ms / 1000).toFixed(2)}s`;
+}
+function shortMint(m) {
+  if (!m) return '?';
+  return `${m.slice(0, 4)}\u2026${m.slice(-4)}`;
+}
+
+function buildStatsText(chatId) {
+  const w = positionsDb.winStats(chatId);
+  const g = positionsDb.winStats(null);
+  const section = (label, s) => {
+    if (s.totalClosed === 0) {
+      return `\n<b>${label}</b>\n  no closed trades yet`;
+    }
+    return [
+      `\n<b>${label}</b>`,
+      `  closed:    ${s.totalClosed}  (${s.wins}W / ${s.losses}L${s.breakeven ? ` / ${s.breakeven}E` : ''})`,
+      `  win rate:  ${s.winRate != null ? s.winRate.toFixed(1) + '%' : '—'}`,
+      `  PnL:       ${fmtSol(s.totalPnlSol)}  (${fmtPct(s.totalPnlPercent)})`,
+      `  avg PnL:   ${fmtPct(s.avgPnlPercent)}`,
+      `  avg hold:  ${fmtHold(s.avgHoldMs)}`,
+      ...(s.best.length
+        ? ['  best:  ' + s.best.slice(0, 3).map((b) => `<code>${shortMint(b.mint)}</code> ${fmtSol(b.pnlSol)}`).join('  ')]
+        : []),
+      ...(s.worst.length
+        ? ['  worst: ' + s.worst.slice(0, 3).map((b) => `<code>${shortMint(b.mint)}</code> ${fmtSol(b.pnlSol)}`).join('  ')]
+        : []),
+    ].join('\n');
+  };
+  return [
+    '<b>📈 Stats</b>',
+    section('Your watchlist', w),
+    section('Global (all users)', g),
+    '',
+    '<i>Use /recent 10 to see the last 10 closed trades in detail.</i>',
   ].join('\n');
 }
 
@@ -467,6 +536,47 @@ export function startTelegramBot({ onPause: pauseCb, onResume: resumeCb } = {}) 
         await sm.handleSetCallback(ctx, action, key);
       } else if (data === 'cmd:status') {
         await renderScreen(ctx, buildStatusText(ctx.chat.id), commandBackMenu());
+      } else if (data === 'cmd:stats') {
+        await renderScreen(ctx, buildStatsText(ctx.chat.id), commandBackMenu());
+      } else if (data === 'cmd:balance') {
+        // /balance is async (RPC). Re-route through the command handler
+        // so the same loading-then-edit flow is used.
+        await ctx.answerCbQuery();
+        // Re-issue as a text command by simulating /balance via a fresh
+        // call. Cheaper to just inline: send a "loading" message and edit.
+        const wm0 = walletManager.getStatus(ctx.chat.id);
+        if (!wm0.set) {
+          await ctx.reply(
+            '🔑 <b>No trading wallet set</b>\n\nUse /start → 🔑 Wallet → 🆕 Generate or 📥 Import to add one first.',
+            { parse_mode: 'HTML' }
+          );
+          return;
+        }
+        const loading = await ctx.reply(`⏳ Fetching balances for <code>${wm0.address}</code>…`, { parse_mode: 'HTML' });
+        try {
+          const snap = await fetchBalanceSnapshot(wm0.address, { limit: 10 });
+          const sol = snap.sol;
+          const tokens = snap.tokens;
+          const lines = [
+            '<b>💰 Wallet balance</b>',
+            '',
+            `Address:  <code>${wm0.address}</code>`,
+            '',
+            '<b>SOL</b>',
+            `  Balance:  ${sol.sol.toFixed(6)} SOL  (${sol.lamports.toLocaleString()} lamports)`,
+            sol.error ? `  <i>RPC error: ${sol.error}</i>` : '',
+            sol.cached ? '  <i>(cached &lt; 30s ago)</i>' : '',
+            '',
+            '<b>Top SPL tokens</b>',
+          ];
+          if (tokens.error) lines.push(`  <i>RPC error: ${tokens.error}</i>`);
+          else if (tokens.tokens.length === 0) lines.push('  <i>none</i>');
+          else for (const t of tokens.tokens) lines.push(`  • <code>${t.shortMint}</code>  ${t.uiAmountString || String(t.uiAmount)}`);
+          lines.push('', `<i>Refreshed: ${new Date(snap.fetchedAt).toISOString().slice(11, 19)}Z</i>`);
+          await ctx.telegram.editMessageText(ctx.chat.id, loading.message_id, undefined, lines.filter(Boolean).join('\n'), { parse_mode: 'HTML' });
+        } catch (e) {
+          await ctx.telegram.editMessageText(ctx.chat.id, loading.message_id, undefined, `❌ Failed: ${e.message || e}`);
+        }
       } else if (data === 'cmd:wallets' || data === 'cmd:watchlist') {
         await renderScreen(ctx, buildWalletsText(ctx.chat.id), walletsMenu());
       } else if (data === 'cmd:wallet_add') {
@@ -655,29 +765,71 @@ export function startTelegramBot({ onPause: pauseCb, onResume: resumeCb } = {}) 
 
   // ---- /status ----
   bot.command('status', (ctx) => {
-    const s = safetySnapshot();
-    const e = executorStatus(ctx.chat.id);
-    const lines = [
-      '<b>Status</b>',
-      `Mode:           ${s.mode}`,
-      `Manual pause:   ${s.manualPaused ? 'yes' : 'no'}`,
-      `Watched:        ${walletsDb.count(ctx.chat.id)} wallet(s)`,
-      `Subscribers:    ${subscribersDb.count()}`,
-      `Open positions: ${s.openPositionCount}`,
-      `Closed today:   ${s.closedTodayCount} (PnL ${s.pnlTodaySol.toFixed(4)} SOL)`,
-      '',
-      '<b>Your trading wallet</b>',
-      `Address:        <code>${e.botWallet}</code>`,
-      `RPC:            ${e.rpc}`,
-      `Jupiter:        ${e.jupiterUrl}`,
-      '',
-      '<b>Safety</b>',
-      `Max SOL/trade:  ${s.maxSolPerTrade}`,
-      `Slippage:       ${s.slippageBps} bps`,
-      `Hold:           ${s.holdMs} ms`,
-      `Daily loss cap: ${s.dailyLossCapSol} SOL`,
-    ];
-    ctx.reply(lines.join('\n'), { parse_mode: 'HTML' });
+    ctx.reply(buildStatusText(ctx.chat.id), { parse_mode: 'HTML' });
+  });
+
+  // ---- /stats — v0.8.0: detailed win/loss tracking ----
+  bot.command('stats', (ctx) => {
+    ctx.reply(buildStatsText(ctx.chat.id), { parse_mode: 'HTML' });
+  });
+
+  // ---- /balance — v0.8.0: wallet SOL + SPL token balances ----
+  bot.command('balance', async (ctx) => {
+    const wm0 = walletManager.getStatus(ctx.chat.id);
+    if (!wm0.set) {
+      return ctx.reply(
+        '🔑 <b>No trading wallet set</b>\n\n' +
+        'Use /start → 🔑 Wallet → 🆕 Generate or 📥 Import to add one first.',
+        { parse_mode: 'HTML' }
+      );
+    }
+    // Send a "loading" reply that we will edit once the RPC returns.
+    const loading = await ctx.reply(
+      `⏳ Fetching balances for <code>${wm0.address}</code>…`,
+      { parse_mode: 'HTML' }
+    );
+    try {
+      const snap = await fetchBalanceSnapshot(wm0.address, { limit: 10 });
+      const sol = snap.sol;
+      const tokens = snap.tokens;
+      const lines = [
+        '<b>💰 Wallet balance</b>',
+        '',
+        `Address:  <code>${wm0.address}</code>`,
+        '',
+        '<b>SOL</b>',
+        `  Balance:  ${sol.sol.toFixed(6)} SOL  (${sol.lamports.toLocaleString()} lamports)`,
+        sol.error ? `  <i>RPC error: ${sol.error}</i>` : '',
+        sol.cached ? '  <i>(cached &lt; 30s ago)</i>' : '',
+        '',
+        '<b>Top SPL tokens</b>',
+      ];
+      if (tokens.error) {
+        lines.push(`  <i>RPC error: ${tokens.error}</i>`);
+      } else if (tokens.tokens.length === 0) {
+        lines.push('  <i>none</i>');
+      } else {
+        for (const t of tokens.tokens) {
+          const ui = t.uiAmountString || String(t.uiAmount);
+          lines.push(`  • <code>${t.shortMint}</code>  ${ui}`);
+        }
+      }
+      lines.push('', `<i>Refreshed: ${new Date(snap.fetchedAt).toISOString().slice(11, 19)}Z</i>`);
+      await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        loading.message_id,
+        undefined,
+        lines.filter(Boolean).join('\n'),
+        { parse_mode: 'HTML' }
+      );
+    } catch (e) {
+      await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        loading.message_id,
+        undefined,
+        `❌ Failed to fetch balance: ${e.message || e}`,
+      );
+    }
   });
 
   // ---- /positions ----
