@@ -25,6 +25,7 @@
 
 import config, { validation } from './src/config.js';
 import { HeliusMonitor } from './src/heliusMonitor.js';
+import { HeliusWebSocketMonitor } from './src/heliusWebSocket.js';
 import { initExecutor, executeSignal, status as executorStatus } from './src/executor.js';
 import { startTelegramBot, stopTelegramBot } from './src/telegramBot.js';
 import notifier from './src/notifier.js';
@@ -66,7 +67,15 @@ getDb();
 initExecutor();
 
 // 4. Start monitor and bot.
-const monitor = new HeliusMonitor();
+// v0.8.0: WSS by default (instant signal). Set MONITOR_MODE=polling to fall back to HTTP.
+const monitorMode = process.env.MONITOR_MODE || 'websocket';
+const monitor = monitorMode === 'websocket'
+  ? new HeliusWebSocketMonitor()
+  : new HeliusMonitor();
+console.log(`Monitor:        ${monitorMode}  (${monitorMode === 'websocket' ? 'logsSubscribe via WSS — sub-second signal latency' : 'HTTP polling every ' + config.POLL_INTERVAL_MS + 'ms'})`);
+
+// Surface WSS status for ops visibility
+monitor.on('status', (msg) => console.log(`[monitor] ${msg}`));
 const bot = startTelegramBot({
   onPause: () => console.log('[index] trading paused via Telegram'),
   onResume: () => console.log('[index] trading resumed via Telegram'),
