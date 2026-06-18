@@ -74,13 +74,10 @@ function initSchema(d) {
   // v0.6.2: rename min_mc_sol / max_mc_sol → min_mc_usd / max_mc_usd.
   // MC bounds now live in USD (TradeWiz parity: "MC (USD)"). One-time,
   // idempotent — re-running is a no-op because the old key no longer exists.
-  const mcOldMin = d.prepare(`SELECT key FROM settings WHERE key = 'min_mc_sol'`).get();
-  const mcOldMax = d.prepare(`SELECT key FROM settings WHERE key = 'max_mc_sol'`).get();
-  if (mcOldMin || mcOldMax) {
-    console.log('[db] migrating settings: min/max_mc_sol → min/max_mc_usd');
-    if (mcOldMin) d.prepare(`UPDATE settings SET key = 'min_mc_usd' WHERE key = 'min_mc_sol'`).run();
-    if (mcOldMax) d.prepare(`UPDATE settings SET key = 'max_mc_usd' WHERE key = 'max_mc_sol'`).run();
-  }
+  // PATCH v0.7.2-freshinstall: settings table is created further down in
+  // initSchema(), so SELECTing from it here crashes on first boot. Defer
+  // the migration block to after the CREATE TABLE settings statement.
+  // (The actual rename is run a few lines below.)
 
   d.exec(`
     CREATE TABLE IF NOT EXISTS positions (
@@ -95,6 +92,8 @@ function initSchema(d) {
       exit_time    INTEGER,
       exit_sol     REAL,
       pnl_sol      REAL,
+      pnl_percent  REAL,
+      hold_ms      INTEGER,
       status       TEXT NOT NULL CHECK (status IN ('OPEN', 'CLOSED', 'FAILED')),
       fail_reason  TEXT,
       created_at   INTEGER NOT NULL
@@ -165,6 +164,39 @@ function initSchema(d) {
       set_by_username TEXT
     );
   `);
+
+  // v0.8.0 (added by feature: win/loss tracking + wallet balance):
+  // idempotent column adds for older DBs that pre-date these fields.
+  // SQLite has no `ADD COLUMN IF NOT EXISTS`, so we check pragma first.
+  const posCols = d.prepare(`PRAGMA table_info(positions)`).all().map((c) => c.name);
+  if (!posCols.includes('pnl_percent')) {
+    d.exec(`ALTER TABLE positions ADD COLUMN pnl_percent REAL;`);
+  }
+  if (!posCols.includes('hold_ms')) {
+    d.exec(`ALTER TABLE positions ADD COLUMN hold_ms INTEGER;`);
+  }
+
+  // ---------------------------------------------------------------------------
+  // v0.6.2 migration: rename min_mc_sol / max_mc_sol → min_mc_usd / max_mc_usd.
+  // MC bounds now live in USD (TradeWiz parity: "MC (USD)"). One-time,
+  // idempotent — re-running is a no-op because the old key no longer exists.
+  //
+  // PATCH v0.7.2-freshinstall: this block USED TO live at the top of
+  // initSchema() (before the CREATE TABLE settings statement). On a fresh
+  // install, the SELECT crashed with "no such table: settings". Moved here
+  // and wrapped in try/catch so fresh installs and upgrades both work.
+  // ---------------------------------------------------------------------------
+  try {
+    const mcOldMin = d.prepare(`SELECT key FROM settings WHERE key = 'min_mc_sol'`).get();
+    const mcOldMax = d.prepare(`SELECT key FROM settings WHERE key = 'max_mc_sol'`).get();
+    if (mcOldMin || mcOldMax) {
+      console.log('[db] migrating settings: min/max_mc_sol → min/max_mc_usd');
+      if (mcOldMin) d.prepare(`UPDATE settings SET key = 'min_mc_usd' WHERE key = 'min_mc_sol'`).run();
+      if (mcOldMax) d.prepare(`UPDATE settings SET key = 'max_mc_usd' WHERE key = 'max_mc_sol'`).run();
+    }
+  } catch (e) {
+    // Fresh install — no legacy keys to migrate. Safe to ignore.
+  }
 
   // ---------------------------------------------------------------------------
   // One-shot migration: if the legacy single-row wallet table is present,
@@ -347,14 +379,17 @@ export const positionsDb = {
       `)
       .run(mint, devWallet, entrySig, now, entrySol, entryTokens, now);
   },
-  close(id, { exitSig, exitSol, pnlSol }) {
+  close(id, { exitSig, exitSol, pnlSol, pnlPercent = null, holdMs = null }) {
     return getDb()
       .prepare(`
         UPDATE positions
-        SET exit_sig = ?, exit_time = ?, exit_sol = ?, pnl_sol = ?, status = 'CLOSED'
+        SET exit_sig = ?, exit_time = ?, exit_sol = ?, pnl_sol = ?,
+            pnl_percent = COALESCE(?, pnl_percent),
+            hold_ms = COALESCE(?, hold_ms),
+            status = 'CLOSED'
         WHERE id = ?
       `)
-      .run(exitSig, Date.now(), exitSol, pnlSol, id);
+      .run(exitSig, Date.now(), exitSol, pnlSol, pnlPercent, holdMs, id);
   },
   fail(id, reason) {
     return getDb()
@@ -401,6 +436,89 @@ export const positionsDb = {
       `)
       .get(sinceMs);
     return row.total || 0;
+  },
+
+  // ---------------------------------------------------------------------
+  // v0.8.0: win/loss tracking (referenced from charon/src/learning/summary.js)
+  // ---------------------------------------------------------------------
+  // Aggregates over CLOSED positions only. pnl_sol > 0  → win, < 0 → loss.
+  // pnl_percent is computed when missing using pnl_sol / entry_sol.
+  //
+  //   winStats()        — global (all users, all watched wallets)
+  //   winStats(chatId)  — scoped to one user via the dev_wallet → watched_wallets
+  //                       join, so per-user addwallet isolation is preserved
+  //
+  // Returns:
+  //   {
+  //     totalClosed, wins, losses, breakeven,
+  //     winRate,                  // 0..100
+  //     totalPnlSol,
+  //     totalPnlPercent,
+  //     avgPnlPercent,
+  //     avgHoldMs,
+  //     best: [{ mint, pnlSol, pnlPercent, exitTime }],
+  //     worst: [{ mint, pnlSol, pnlPercent, exitTime }],
+  //   }
+  winStats(chatId = null) {
+    // Compute pnl_percent on the fly if the column is null (older rows).
+    // Use entry_sol > 0 guard to avoid div-by-zero.
+    const baseQuery = chatId == null
+      ? `SELECT id, mint, entry_sol, pnl_sol, pnl_percent, hold_ms, exit_time
+         FROM positions WHERE status = 'CLOSED' AND pnl_sol IS NOT NULL`
+      : `SELECT p.id, p.mint, p.entry_sol, p.pnl_sol, p.pnl_percent, p.hold_ms, p.exit_time
+         FROM positions p
+         JOIN watched_wallets w ON w.address = p.dev_wallet
+         WHERE p.status = 'CLOSED' AND p.pnl_sol IS NOT NULL AND w.chat_id = ?`;
+    const rows = chatId == null
+      ? getDb().prepare(baseQuery).all()
+      : getDb().prepare(baseQuery).all(chatId);
+
+    let wins = 0, losses = 0, breakeven = 0;
+    let totalPnlSol = 0, totalPnlPercent = 0, totalHoldMs = 0, holdN = 0;
+    for (const r of rows) {
+      const pnlSol = Number(r.pnl_sol || 0);
+      // Derive pnl_percent if not stored: (pnl / entry) * 100
+      const pnlPct = r.pnl_percent != null
+        ? Number(r.pnl_percent)
+        : (r.entry_sol > 0 ? (pnlSol / Number(r.entry_sol)) * 100 : 0);
+      totalPnlSol += pnlSol;
+      totalPnlPercent += pnlPct;
+      if (r.hold_ms != null) { totalHoldMs += Number(r.hold_ms); holdN += 1; }
+      if (pnlSol > 0) wins += 1;
+      else if (pnlSol < 0) losses += 1;
+      else breakeven += 1;
+    }
+    const totalClosed = rows.length;
+    const winRate = totalClosed ? (wins / totalClosed) * 100 : null;
+
+    const sorted = [...rows].sort((a, b) => Number(b.pnl_sol || 0) - Number(a.pnl_sol || 0));
+    const proj = (r) => {
+      const pnlSol = Number(r.pnl_sol || 0);
+      const pnlPct = r.pnl_percent != null
+        ? Number(r.pnl_percent)
+        : (r.entry_sol > 0 ? (pnlSol / Number(r.entry_sol)) * 100 : 0);
+      return {
+        id: r.id,
+        mint: r.mint,
+        pnlSol,
+        pnlPercent: pnlPct,
+        exitTime: r.exit_time,
+      };
+    };
+
+    return {
+      totalClosed,
+      wins,
+      losses,
+      breakeven,
+      winRate,                                       // 0..100, null if no trades
+      totalPnlSol,
+      totalPnlPercent,
+      avgPnlPercent: totalClosed ? totalPnlPercent / totalClosed : null,
+      avgHoldMs: holdN ? totalHoldMs / holdN : null,
+      best: sorted.slice(0, 5).map(proj),
+      worst: sorted.slice(-5).reverse().map(proj),
+    };
   },
 };
 

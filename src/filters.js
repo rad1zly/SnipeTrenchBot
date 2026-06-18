@@ -238,9 +238,88 @@ function checkPlatformExclude({ programIds = [] }) {
 }
 
 // =============================================================================
+// sell ratio check (v0.8.0 — adopted from "what % did the dev dump?")
+// =============================================================================
+// Triggered by a SELL_DETECTED event. We compute:
+//
+//   sellRatio = soldAmount / (soldAmount + devRemainingBalance)
+//
+// where devRemainingBalance is the dev's CURRENT (post-sell) balance for
+// that mint, fetched via getParsedTokenAccountsByOwner. The pre-sell balance
+// is reconstructed as post + sold (assuming the dev's ATA is the only
+// source of those tokens — true for pump.fun launches).
+//
+// If sellRatio < settings.get('min_sell_ratio'), the trade is skipped.
+// Default 0.9 means we only copy-trade when the dev dumps >= 90% of their
+// holdings. Lower it (e.g. 0.5) to copy partial sells; raise it (1.0) to
+// require a full exit.
+//
+// Note: this is a feature-rich copy-trade. The user wanted to ignore small
+// partial sells from a dev who is still holding. We could ALSO have the
+// opposite intent ("only copy small sells, not full dumps"), but the current
+// `min_sell_ratio` is the more common defensive filter.
+// =============================================================================
+async function checkSellRatio({ dev, mint, soldAmount }) {
+  if (!dev || !mint || !soldAmount || soldAmount <= 0) {
+    return { passed: true, reason: 'sell ratio skipped: missing dev/mint/soldAmount' };
+  }
+  const minRatio = settings.get('min_sell_ratio');
+  if (minRatio === null || minRatio === undefined) {
+    return { passed: true, reason: 'sell ratio filter off' };
+  }
+  return cached(`sellratio:${dev}:${mint}:${soldAmount}`, async () => {
+    try {
+      const accounts = await conn().getParsedTokenAccountsByOwner(
+        new PublicKey(dev),
+        { mint: new PublicKey(mint) },
+        'confirmed',
+      );
+      // Sum across all ATAs for this mint. Most pump.fun tokens use one
+      // ATA per mint, but be defensive.
+      let postBalance = 0;
+      for (const acc of accounts.value) {
+        const amt = acc.account?.data?.parsed?.info?.tokenAmount;
+        if (amt && amt.amount != null) postBalance += Number(amt.amount);
+      }
+      const preBalance = postBalance + Number(soldAmount);
+      if (preBalance <= 0) {
+        // Couldn't determine pre-balance. PASS rather than block — same
+        // "transient API hiccup must not break trades" philosophy as the
+        // other filters.
+        return { passed: true, reason: 'sell ratio: pre-balance unknown, passing' };
+      }
+      const ratio = Number(soldAmount) / preBalance;
+      const pctStr = `${(ratio * 100).toFixed(1)}%`;
+      const minPct = `${(minRatio * 100).toFixed(0)}%`;
+      if (ratio < minRatio) {
+        return {
+          passed: false,
+          reason: `dev sold ${pctStr} of holdings (${soldAmount.toLocaleString()} of ${preBalance.toLocaleString()}) < min ${minPct}`,
+          ratio,
+          preBalance,
+          postBalance,
+          soldAmount: Number(soldAmount),
+        };
+      }
+      return {
+        passed: true,
+        reason: `dev sold ${pctStr} of holdings (${soldAmount.toLocaleString()} of ${preBalance.toLocaleString()}) >= min ${minPct}`,
+        ratio,
+        preBalance,
+        postBalance,
+        soldAmount: Number(soldAmount),
+      };
+    } catch (err) {
+      // RPC failure → pass. Don't block trades on transient errors.
+      return { passed: true, reason: `sell ratio check failed: ${err.message}` };
+    }
+  });
+}
+
+// =============================================================================
 // master entry: returns { passed, reason }
 // =============================================================================
-export async function passesFilters({ mint, dev, createdAt, programIds = [] }) {
+export async function passesFilters({ mint, dev, createdAt, programIds = [], soldAmount = null }) {
   const checks = [];
   if (settings.get('unrenounced_only')) checks.push({ name: 'unrenounced', fn: () => checkUnrenounced(mint) });
   if (settings.get('unburned_only')) checks.push({ name: 'unburned', fn: () => checkUnburned(mint) });
@@ -252,6 +331,11 @@ export async function passesFilters({ mint, dev, createdAt, programIds = [] }) {
   }
   if (settings.get('exclude_internal') || settings.get('exclude_external')) {
     checks.push({ name: 'platform', fn: () => Promise.resolve(checkPlatformExclude({ programIds })) });
+  }
+  // v0.8.0: sell ratio. Only runs if min_sell_ratio is set AND we have a
+  // soldAmount (i.e. a SELL_DETECTED event; the monitor always provides one).
+  if (settings.get('min_sell_ratio') != null && soldAmount != null) {
+    checks.push({ name: 'sell_ratio', fn: () => checkSellRatio({ dev, mint, soldAmount }) });
   }
   for (const c of checks) {
     let r;
@@ -280,6 +364,7 @@ export function activeFilters() {
     max_token_age_min: settings.get('max_token_age_min'),
     exclude_internal: settings.get('exclude_internal'),
     exclude_external: settings.get('exclude_external'),
+    min_sell_ratio: settings.get('min_sell_ratio'),
   };
 }
 

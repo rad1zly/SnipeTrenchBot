@@ -15,7 +15,7 @@ import { positionsDb, safetyDb } from './db.js';
 import * as settings from './settings.js';
 
 // In-memory flags. Persisted to safety_log when changed.
-let manualPaused = false;
+let manualPaused = process.env.START_PAUSED === 'true';
 let lastResetDate = null; // YYYY-MM-DD string of the day we last reset daily stats
 
 /**
@@ -155,8 +155,12 @@ export function isPaused() {
 
 /**
  * Return a snapshot of current safety state. Used by /status Telegram command.
+ *
+ * v0.8.0: now includes `winStats` (per-user + global). Caller passes
+ * `chatId` when available so the win rate matches the user's own wallet
+ * watchlist; otherwise the global aggregate is returned.
  */
-export function snapshot() {
+export function snapshot(chatId = null) {
   maybeResetDaily();
   const since = startOfUtcToday();
   const { total: pnlToday, count: closedToday } = positionsDb.realizedPnlSince(since);
@@ -179,5 +183,10 @@ export function snapshot() {
     antiMev: settings.get('anti_mev'),
     startTime: settings.get('start_time'),
     endTime: settings.get('end_time'),
+    minSellRatio: settings.get('min_sell_ratio'),
+    // v0.8.0: per-user + global win/loss aggregates. Both are cheap
+    // (single indexed scan over CLOSED positions).
+    winStats: positionsDb.winStats(chatId),
+    winStatsGlobal: positionsDb.winStats(null),
   };
 }
