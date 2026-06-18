@@ -191,7 +191,7 @@ const CATALOG = [
   },
   {
     key: 'min_token_age_min', type: 'number', category: 'filters',
-    label: 'Min Token Age (min)',
+    label: 'Min Token Age (s)',  // v0.8.0: unit changed to seconds
     default: null,
     min: 0,        // no upper bound
     parseUserInput: (t) => {
@@ -204,7 +204,7 @@ const CATALOG = [
   },
   {
     key: 'max_token_age_min', type: 'number', category: 'filters',
-    label: 'Max Token Age (min)',
+    label: 'Max Token Age (s)',  // v0.8.0: unit changed to seconds
     default: null,
     min: 0,        // no upper bound
     parseUserInput: (t) => {
@@ -451,6 +451,13 @@ export function formatValue(key) {
          'sol_spending_limit', 'buy_priority_fee_sol', 'buy_tip_sol'].includes(key)) {
       return 'Not Limited';
     }
+  }
+  // v0.8.0: token age displayed in seconds (with m:ss for >=60s)
+  if (setting.type === 'number' && (key === 'min_token_age_min' || key === 'max_token_age_min')) {
+    if (v < 60) return `${v}s`;
+    const m = Math.floor(v / 60);
+    const s = v % 60;
+    return s > 0 ? `${m}m ${s}s` : `${m}m`;
   }
   if (setting.type === 'number' && setting.key === 'slippage_bps') {
     return `${v} bps (${(v / 100).toFixed(1)}%)`;
