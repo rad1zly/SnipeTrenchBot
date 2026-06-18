@@ -22,7 +22,15 @@ import { Keypair, Connection, VersionedTransaction } from '@solana/web3.js';
 import config from './config.js';
 import { guardTrade } from './safety.js';
 import { positionsDb, signalsDb, walletsDb } from './db.js';
-import { getBuyQuote, getSellQuote, buildSwapTransaction, effectiveJupiterUrl } from './jupiterMetis.js';
+// v0.8.0 (critical fix): get quotes + buildSwapTransaction from swapRouter.js
+// (which auto-routes to pump.fun for pre-graduation tokens). The jupiterMetis
+// versions are Jupiter-only and return raw quote objects, which would not
+// destructure into { quote, route } — causing the executor to fail with
+// 'no quote' even when a valid route exists. This was a wiring bug introduced
+// when pump.fun direct swap was added (commit 159a770) — the new module was
+// created but the executor import wasn't updated.
+import { getBuyQuote, getSellQuote, buildSwapTransaction } from './swapRouter.js';
+import { effectiveJupiterUrl } from './jupiterMetis.js';
 import notifier from './notifier.js';
 import * as settings from './settings.js';
 import { passesFilters, activeFilters } from './filters.js';
