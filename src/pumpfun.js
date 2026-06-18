@@ -365,7 +365,7 @@ function createBuyInstruction({ mint, user, amount, maxSolCost, creator }) {
       { pubkey: findUserVolumeAccumulator(u), isSigner: false, isWritable: true },  // 13 NEW
       { pubkey: findFeeConfig(), isSigner: false, isWritable: false },              // 14 NEW
       { pubkey: PUMP_FEE_PROGRAM_ID, isSigner: false, isWritable: false },          // 15 NEW
-      { pubkey: findBondingCurveV2(m), isSigner: false, isWritable: false },         // 16 NEW (remaining)
+      { pubkey: findBondingCurveV2(m), isSigner: false, isWritable: true },          // 16 NEW (remaining, writable — program creates it)
       { pubkey: BUYBACK_FEE_RECIPIENT, isSigner: false, isWritable: true },          // 17 NEW (remaining)
     ],
     data,

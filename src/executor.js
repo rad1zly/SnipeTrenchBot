@@ -168,9 +168,14 @@ async function submitSwap({ quoteResponse, label, chatId }) {
   // v0.8.0 (speed): 'processed' commitment for send (single slot ~400ms).
   // skipPreflight: true saves ~200ms by skipping simulate step.
   // Trade-off: 'processed' can be re-org'd, but we sell within 1s anyway.
-  const signature = await connection.sendTransaction(tx, {
-    maxRetries: 3,
+  // v0.8.1: use sendRawTransaction to bypass Helius sendTransaction's
+  // pre-validation (simulateTransaction → 422 AccountNotFound for PDAs
+  // that don't exist yet, e.g. bonding-curve-v2, user-volume-accumulator).
+  // sendRawTransaction skips simulation and submits directly.
+  const raw = tx.serialize();
+  const signature = await connection.sendRawTransaction(raw, {
     skipPreflight: true,
+    maxRetries: 3,
     preflightCommitment: 'processed',
   });
   // v0.8.0 (speed): poll for 'processed' (1 slot, ~400ms) instead of 'confirmed'.
