@@ -114,7 +114,7 @@ function isWithinTradingHours() {
 // Returns the first successful result. If all retries fail, returns null
 // so the caller can fail the position with the last error.
 // =============================================================================
-async function submitSwapWithRetry({ quoteResponse, label, maxAttempts = 0, chatId }) {
+async function submitSwapWithRetry({ quoteResponse, label, maxAttempts = 0, chatId, route = 'jupiter', side = null }) {
   const attempts = Math.max(1, (maxAttempts || 0) + 1);
   let lastErr = null;
   for (let i = 0; i < attempts; i++) {
@@ -255,13 +255,14 @@ export async function executeSignal(event) {
   }
 
   // ----- BUY -----
-  const buyQuote = await getBuyQuote({ solAmount, outputMint: mint, slippageBps });
+  const { quote: buyQuote, route: buyRoute } = await getBuyQuote({ solAmount, outputMint: mint, slippageBps });
   if (!buyQuote || buyQuote.error) {
     logStep('BUY_QUOTE_FAILED', { error: buyQuote?.error });
     notifier.tradeFailed({ stage: 'BUY_QUOTE', mint, error: buyQuote?.error || 'no quote', chatId, solAmount }).catch(() => {});
     return;
   }
   const tokensExpected = Number(buyQuote.outAmount);
+  logStep('BUY_ROUTE', { route: buyRoute, mint });
   logStep('BUY_QUOTE_OK', {
     dev,
     mint,
@@ -282,7 +283,7 @@ export async function executeSignal(event) {
 
   let buyResult;
   try {
-    buyResult = await submitSwapWithRetry({ quoteResponse: buyQuote, label: 'BUY', maxAttempts: autoRetry, chatId });
+    buyResult = await submitSwapWithRetry({ quoteResponse: buyQuote, label: 'BUY', maxAttempts: autoRetry, chatId, route: buyRoute, side: 'buy' });
   } catch (err) {
     positionsDb.fail(positionId, `buy: ${err.message}`);
     logStep('BUY_FAILED', { error: err.message });
@@ -338,7 +339,7 @@ export async function executeSignal(event) {
   // sell amount. (For SPL tokens with decimals, the quote uses raw units too,
   // so this is consistent.)
   const tokensToSell = tokensExpected;
-  const sellQuote = await getSellQuote({ tokenRawAmount: tokensToSell, inputMint: mint, slippageBps });
+  const { quote: sellQuote, route: sellRoute } = await getSellQuote({ tokenRawAmount: tokensToSell, inputMint: mint, slippageBps });
   if (!sellQuote || sellQuote.error) {
     positionsDb.fail(positionId, `sell quote: ${sellQuote?.error || 'no quote'}`);
     logStep('SELL_QUOTE_FAILED', { error: sellQuote?.error });
@@ -350,7 +351,7 @@ export async function executeSignal(event) {
 
   let sellResult;
   try {
-    sellResult = await submitSwapWithRetry({ quoteResponse: sellQuote, label: 'SELL', maxAttempts: autoRetry, chatId });
+    sellResult = await submitSwapWithRetry({ quoteResponse: sellQuote, label: 'SELL', maxAttempts: autoRetry, chatId, route: sellRoute, side: 'sell' });
   } catch (err) {
     positionsDb.fail(positionId, `sell: ${err.message}`);
     logStep('SELL_FAILED', { error: err.message });
