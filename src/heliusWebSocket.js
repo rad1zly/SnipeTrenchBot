@@ -190,6 +190,7 @@ export class HeliusWebSocketMonitor extends EventEmitter {
         seen(address).add(signature);
         const event = classifyTx(tx, address);
         if (event) {
+          console.log(`[monitor] detected ${event.type} for ${address.slice(0,8)}... mint=${event.mint.slice(0,8)}...`);
           const owner = walletsDb.get(address);
           if (owner) event.chatId = owner.chat_id;
           this.emit('event', event);
