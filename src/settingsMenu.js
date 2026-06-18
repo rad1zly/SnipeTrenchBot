@@ -289,6 +289,30 @@ export async function handleSetCallback(ctx, action, key) {
  * Process a text message from a user who is in edit mode. Returns true if
  * the message was consumed (caller should NOT fall through to other handlers).
  */
+// v0.8.0: extract re-render logic to a helper, used by both the success path
+// and the nullable "set to null" path.
+async function rerenderSettingsMenu(ctx, chatId, menuMessageId) {
+  const text = buildFlatText();
+  const kb = buildFlatKeyboard();
+  if (menuMessageId) {
+    try {
+      await ctx.telegram.editMessageText(
+        chatId,
+        menuMessageId,
+        undefined,
+        text,
+        { parse_mode: 'HTML', disable_web_page_preview: true, ...kb }
+      );
+    } catch (err) {
+      if (!String(err.message || '').includes('message is not modified')) {
+        await ctx.replyWithHTML(text, kb);
+      }
+    }
+  } else {
+    await ctx.replyWithHTML(text, kb);
+  }
+}
+
 export async function handlePendingText(ctx) {
   const chatId = ctx.chat?.id;
   if (chatId == null) return false;
@@ -322,7 +346,7 @@ export async function handlePendingText(ctx) {
           `✅ <b>${setting.label}</b> set to <b>Not Limited</b>  ${formatSource(pending.key)}`,
           { parse_mode: 'HTML' }
         );
-        return await rerenderMenu(ctx, chatId);
+        return await rerenderSettingsMenu(ctx, chatId, pending.menuMessageId);
       } catch (err) {
         await ctx.reply(`❌ Error: ${err.message}`, { parse_mode: 'HTML' });
         return true;
@@ -342,37 +366,7 @@ export async function handlePendingText(ctx) {
       `✅ <b>${setting.label}</b> set to <b>${formatValue(pending.key)}</b>  ${formatSource(pending.key)}`,
       { parse_mode: 'HTML' }
     );
-    // Re-render the flat menu. If we have the original menu message_id,
-    // edit it in place (so the chat doesn't fill up with one new menu
-    // per edit). If we don't have it (e.g. user opened the menu in a
-    // different bot session), fall back to a new message.
-    const text = buildFlatText();
-    const kb = buildFlatKeyboard();
-    if (pending.menuMessageId) {
-      try {
-        await ctx.telegram.editMessageText(
-          chatId,
-          pending.menuMessageId,
-          undefined,  // inline_message_id (not used)
-          text,
-          {
-            parse_mode: 'HTML',
-            disable_web_page_preview: true,
-            ...kb,
-          }
-        );
-      } catch (err) {
-        if (String(err.message || '').includes('message is not modified')) {
-          // value didn't actually change — that's fine, don't spam errors
-        } else {
-          // fall back to a new message if edit fails for any other reason
-          await ctx.replyWithHTML(text, kb);
-        }
-      }
-    } else {
-      await ctx.replyWithHTML(text, kb);
-    }
-    return true;
+    return await rerenderSettingsMenu(ctx, chatId, pending.menuMessageId);
   } catch (e) {
     await ctx.reply(`❌ Error: ${e.message}`);
     return true;
