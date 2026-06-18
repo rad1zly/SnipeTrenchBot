@@ -226,18 +226,19 @@ export class HeliusMonitor extends EventEmitter {
       seenSet.add(tx.signature);
       const event = classifyTx(tx, address);
       if (event) {
-        // v0.6.1: tag the event with the owning chat_id so notifier + executor
-        // can route to a single user (privacy in multi-user mode). If the
-        // wallet was added by multiple users, only the FIRST owner gets the
-        // signal — acceptable for v0.6.1; a fan-out mode can be added later.
-        const owner = walletsDb.get(address);
-        if (owner) event.chatId = owner.chat_id;
-        this.emit('event', event);
+        // v0.8.0: fan out to ALL owners of the wallet (was: only the first).
+        // Without fan-out, only the first owner of a shared watch wallet
+        // gets the signal — bad UX in multi-user mode.
+        const owners = walletsDb.listOwners(address);
+        for (const owner of owners) {
+          const ownerEvent = { ...event, chatId: owner.chat_id };
+          this.emit('event', ownerEvent);
+        }
         signalsDb.log({
           type: event.type,
           wallet: event.wallet,
           mint: event.mint,
-          data: event,
+          data: { ...event, ownerCount: owners.length },
         });
       }
       freshCount++;

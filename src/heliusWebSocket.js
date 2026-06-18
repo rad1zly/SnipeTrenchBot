@@ -200,14 +200,19 @@ export class HeliusWebSocketMonitor extends EventEmitter {
         const event = classifyTx(tx, address);
         if (event) {
           console.log(`[monitor] detected ${event.type} for ${address.slice(0,8)}... mint=${event.mint.slice(0,8)}...`);
-          const owner = walletsDb.get(address);
-          if (owner) event.chatId = owner.chat_id;
-          this.emit('event', event);
+          // v0.8.0: emit one event per owner. Without fan-out, only the
+          // first owner of a shared watch wallet gets the signal — bad UX
+          // for multi-user mode where multiple users watch the same dev.
+          const owners = walletsDb.listOwners(address);
+          for (const owner of owners) {
+            const ownerEvent = { ...event, chatId: owner.chat_id };
+            this.emit('event', ownerEvent);
+          }
           signalsDb.log({
             type: event.type,
             wallet: event.wallet,
             mint: event.mint,
-            data: event,
+            data: { ...event, ownerCount: owners.length },
           });
         }
       }
