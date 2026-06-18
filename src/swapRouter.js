@@ -25,13 +25,25 @@ export async function getBuyQuote({ solAmount, outputMint, slippageBps = 500 }) 
   if (isPF) {
     try {
       const quote = await pumpfun.getBuyQuote({ solAmount, outputMint, slippageBps });
-      return { quote, route: 'pumpfun' };
+      if (quote && quote.outAmount && quote.outAmount !== '0') {
+        return { quote, route: 'pumpfun' };
+      }
+      // quote returned but outAmount is 0/invalid → treat as failure
+      console.warn(`[swapRouter] pumpfun getBuyQuote returned invalid quote (outAmount=${quote?.outAmount}); falling back to jupiter`);
     } catch (e) {
-      // Fall through to Jupiter if pump.fun fails (e.g. complete=true detected late)
-      console.warn(`[swapRouter] pumpfun getBuyQuote failed: ${e.message}; falling back to jupiter`);
+      // v0.8.0: detailed log so we can diagnose 'no quote' errors.
+      // Common causes: "graduated" → use Jupiter. "not found" → use Jupiter.
+      // But for bonding-curve tokens, the path SHOULD work — log it.
+      console.warn(`[swapRouter] pumpfun getBuyQuote failed for ${outputMint.toString()}: ${e.message}; falling back to jupiter`);
     }
   }
   const quote = await jupiter.getBuyQuote({ solAmount, outputMint, slippageBps });
+  if (!quote || !quote.outAmount) {
+    throw new Error(
+      `no quote available for ${outputMint.toString()} (route=${isPF ? 'pumpfun-fallback' : 'jupiter'}); ` +
+      `solAmount=${solAmount} SOL, slippageBps=${slippageBps}`
+    );
+  }
   return { quote, route: 'jupiter' };
 }
 
@@ -40,12 +52,20 @@ export async function getSellQuote({ tokenRawAmount, inputMint, slippageBps = 50
   if (isPF) {
     try {
       const quote = await pumpfun.getSellQuote({ tokenRawAmount, inputMint, slippageBps });
-      return { quote, route: 'pumpfun' };
+      if (quote && quote.outAmount && quote.outAmount !== '0') {
+        return { quote, route: 'pumpfun' };
+      }
+      console.warn(`[swapRouter] pumpfun getSellQuote returned invalid quote; falling back to jupiter`);
     } catch (e) {
-      console.warn(`[swapRouter] pumpfun getSellQuote failed: ${e.message}; falling back to jupiter`);
+      console.warn(`[swapRouter] pumpfun getSellQuote failed for ${inputMint.toString()}: ${e.message}; falling back to jupiter`);
     }
   }
   const quote = await jupiter.getSellQuote({ tokenRawAmount, inputMint, slippageBps });
+  if (!quote || !quote.outAmount) {
+    throw new Error(
+      `no sell quote available for ${inputMint.toString()} (route=${isPF ? 'pumpfun-fallback' : 'jupiter'})`
+    );
+  }
   return { quote, route: 'jupiter' };
 }
 
