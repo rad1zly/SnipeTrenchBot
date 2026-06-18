@@ -164,7 +164,8 @@ const CATALOG = [
     parseUserInput: (t) => /^(1|true|yes|on|y)$/i.test(t.trim()),
   },
   {
-    key: 'min_mc_usd', type: 'number', category: 'filters',
+    key: 'min_mc_usd', type: 'number', nullable: true,  // v0.8.0: '0'/'none' sets to null (disabled)
+    category: 'filters',
     label: 'Min MC (USD)',
     default: null,  // null = unlimited. User can type any positive number.
     min: 0,        // no upper bound — user can set "0.001" or "1000000000" if they want
@@ -177,7 +178,8 @@ const CATALOG = [
     },
   },
   {
-    key: 'max_mc_usd', type: 'number', category: 'filters',
+    key: 'max_mc_usd', type: 'number', nullable: true,  // v0.8.0: '0'/'none' sets to null (disabled)
+    category: 'filters',
     label: 'Max MC (USD)',
     default: null,
     min: 0,        // no upper bound
@@ -190,7 +192,8 @@ const CATALOG = [
     },
   },
   {
-    key: 'min_token_age_min', type: 'number', category: 'filters',
+    key: 'min_token_age_min', type: 'number', nullable: true,  // v0.8.0: '0'/'none' sets to null (disabled)
+    category: 'filters',
     label: 'Min Token Age (s)',  // v0.8.0: unit changed to seconds
     default: null,
     min: 0,        // no upper bound
@@ -203,7 +206,8 @@ const CATALOG = [
     },
   },
   {
-    key: 'max_token_age_min', type: 'number', category: 'filters',
+    key: 'max_token_age_min', type: 'number', nullable: true,  // v0.8.0: '0'/'none' sets to null (disabled)
+    category: 'filters',
     label: 'Max Token Age (s)',  // v0.8.0: unit changed to seconds
     default: null,
     min: 0,        // no upper bound
@@ -241,7 +245,8 @@ const CATALOG = [
 
   // ── Token ──────────────────────────────────────────────────────────────
   {
-    key: 'sol_spending_limit', type: 'number', category: 'token',
+    key: 'sol_spending_limit', type: 'number', nullable: true,  // v0.8.0: '0'/'none' sets to null (disabled)
+    category: 'token',
     label: 'SOL Spending Limit (daily)',
     default: null,
     min: 0,        // no upper bound — user can set "0.5" or "10000" if they want

@@ -312,6 +312,22 @@ export async function handlePendingText(ctx) {
 
   const parsed = setting.parseUserInput(text);
   if (parsed === null || parsed === undefined) {
+    // v0.8.0: nullable settings (filters, limits) accept null as "disabled".
+    // The parser returns null when user types '0', 'none', 'off', or empty.
+    if (setting.nullable) {
+      try {
+        set(pending.key, null);
+        clearPending(chatId);
+        await ctx.reply(
+          `✅ <b>${setting.label}</b> set to <b>Not Limited</b>  ${formatSource(pending.key)}`,
+          { parse_mode: 'HTML' }
+        );
+        return await rerenderMenu(ctx, chatId);
+      } catch (err) {
+        await ctx.reply(`❌ Error: ${err.message}`, { parse_mode: 'HTML' });
+        return true;
+      }
+    }
     await ctx.reply(
       `❌ <b>Invalid value.</b>\n\nRange: ${describeRange(setting)}\n\nTry again, or /cancel.`,
       { parse_mode: 'HTML' }
