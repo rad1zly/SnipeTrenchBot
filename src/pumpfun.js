@@ -27,6 +27,26 @@ const GLOBAL_PDA = new PublicKey('4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf')
 const FEE_RECIPIENT = new PublicKey('CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM');
 const EVENT_AUTHORITY = new PublicKey('Ce6TQqeQHcc7eCS78PTWa1W7U53NDeFDQUhM3bj1bpm8');
 
+// v0.8.0 (post pump.fun May 2026 program upgrade): new program accounts required.
+// Pump.fun added 0.05% creator fee + buyback fee recipient + volume accumulators.
+// Omitting them = AnchorError 6062 (BuybackFeeRecipientMissing).
+// Source: Based-LTD/prooflaunch/src/services/pumpfun.ts (production bot, May 2026)
+const PUMP_FEE_PROGRAM_ID = new PublicKey('pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ');
+
+// 8 buyback fee recipients (from @pump-fun/pump-sdk CURRENT_FEE_RECIPIENTS_FOR_BUYBACK)
+// One is picked at random per buy, matching SDK behavior.
+const BUYBACK_FEE_RECIPIENTS = [
+  '5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD',
+  '9M4giFFMxmFGXtc3feFzRai56WbBqehoSeRE5GK7gf7',
+  'GXPFM2caqTtQYC2cJ5yJRi9VDkpsYZXzYdwYpGnLmtDL',
+  '3BpXnfJaUTiwXnJNe7Ej1rcbzqTTQUvLShZaWazebsVR',
+  '5cjcW9wExnJJiqgLjq7DEG75Pm6JBgE1hNv4B2vHXUW6',
+  'EHAAiTxcdDwQ3U4bU6YcMsQGaekdzLS3B5SmYo46kJtL',
+  '5eHhjP8JaYkz83CWwvGU2uMUXefd3AazWGx4gpcuEEYD',
+  'A7hAgCzFw14fejgCp387JUJRMNyz4j89JKnhtKU8piqW',
+].map((a) => new PublicKey(a));
+const BUYBACK_FEE_RECIPIENT = BUYBACK_FEE_RECIPIENTS[0];  // default (deterministic for tests)
+
 // Pump.fun fee = 100 bps (1%) on buy/sell
 // Creator fee on sell = 50 bps (0.5%) routed to token creator
 const PROTOCOL_FEE_BPS = 100n;
@@ -46,6 +66,8 @@ const BC_LAYOUT = {
   realSolReserves: { offset: 32, size: 8 },
   tokenTotalSupply: { offset: 40, size: 8 },
   complete: { offset: 48, size: 1 },
+  // v0.8.0: creator Pubkey (32 bytes) at offset 49. Required for creator-vault PDA.
+  creator: { offset: 49, size: 32 },
 };
 
 // Instruction discriminators (8-byte sighash, sha256 of "global:buy"/"global:sell")
@@ -118,6 +140,8 @@ export async function getBondingCurveState(mint) {
     realSolReserves: readU64(data, BC_LAYOUT.realSolReserves.offset),
     tokenTotalSupply: readU64(data, BC_LAYOUT.tokenTotalSupply.offset),
     complete: data[BC_LAYOUT.complete.offset] === 1,
+    // v0.8.0: parse creator Pubkey for creator-vault PDA derivation.
+    creator: new PublicKey(data.slice(BC_LAYOUT.creator.offset, BC_LAYOUT.creator.offset + 32)).toBase58(),
   };
   BC_CACHE.set(cacheKey, { state, cachedAt: Date.now() });
   return state;
@@ -126,6 +150,45 @@ export async function getBondingCurveState(mint) {
 function readU64(buf, offset) {
   // Use BigInt to handle 64-bit unsigned values
   return buf.readBigUInt64LE(offset);
+}
+
+// v0.8.0: derive PDAs required by the new pump.fun instruction format.
+// All seeds verified against @pump-fun/pump-sdk (May 2026 release).
+function findCreatorVault(creator) {
+  return PublicKey.findProgramAddressSync(
+    [Buffer.from('creator-vault'), creator.toBuffer()],
+    PUMP_FUN_PROGRAM_ID
+  )[0];
+}
+function findEventAuthority() {
+  return PublicKey.findProgramAddressSync(
+    [Buffer.from('__event_authority')],
+    PUMP_FUN_PROGRAM_ID
+  )[0];
+}
+function findFeeConfig() {
+  return PublicKey.findProgramAddressSync(
+    [Buffer.from('fee_config'), PUMP_FUN_PROGRAM_ID.toBuffer()],
+    PUMP_FEE_PROGRAM_ID
+  )[0];
+}
+function findBondingCurveV2(mint) {
+  return PublicKey.findProgramAddressSync(
+    [Buffer.from('bonding-curve-v2'), mint.toBuffer()],
+    PUMP_FUN_PROGRAM_ID
+  )[0];
+}
+function findGlobalVolumeAccumulator() {
+  return PublicKey.findProgramAddressSync(
+    [Buffer.from('global_volume_accumulator')],
+    PUMP_FUN_PROGRAM_ID
+  )[0];
+}
+function findUserVolumeAccumulator(user) {
+  return PublicKey.findProgramAddressSync(
+    [Buffer.from('user_volume_accumulator'), user.toBuffer()],
+    PUMP_FUN_PROGRAM_ID
+  )[0];
 }
 
 export function invalidateBondingCurveCache(mint) {
@@ -249,13 +312,14 @@ export async function getSellQuote({ tokenRawAmount, inputMint, slippageBps = 50
     priceImpactPct: String(priceImpact),
     _pumpfun: true,
     _minSolOutput: minSolOutput.toString(),
+    _creator: state.creator,  // v0.8.0: needed for creator-vault PDA
   };
 }
 
 // -----------------------------------------------------------------------------
 // Build swap transaction
 // -----------------------------------------------------------------------------
-function createBuyInstruction({ mint, user, amount, maxSolCost }) {
+function createBuyInstruction({ mint, user, amount, maxSolCost, creator }) {
   const m = typeof mint === 'string' ? new PublicKey(mint) : mint;
   const u = typeof user === 'string' ? new PublicKey(user) : user;
   const bc = findBondingCurve(m);
@@ -264,35 +328,51 @@ function createBuyInstruction({ mint, user, amount, maxSolCost }) {
     [u.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), m.toBuffer()],
     ASSOCIATED_TOKEN_PROGRAM_ID
   )[0];
+  // v0.8.0: creator needed for creator-vault PDA. If not provided, derive
+  // a placeholder (will fail on chain if BC state has a different creator).
+  const creatorKey = creator ? new PublicKey(creator) : new PublicKey('11111111111111111111111111111111');
+  const creatorVault = findCreatorVault(creatorKey);
 
-  // Data: discriminator (8) + amount (u64) + max_sol_cost (u64)
-  const data = Buffer.alloc(8 + 8 + 8);
+  // v0.8.0: data layout = discriminator (8) + amount (8) + max_sol_cost (8)
+  // + trackVolume Option<bool> (2) = 26 bytes total
+  // trackVolume = Some(true) encoded as [1, 1]
+  const data = Buffer.alloc(8 + 8 + 8 + 2);
   BUY_DISCRIMINATOR.copy(data, 0);
   data.writeBigUInt64LE(BigInt(amount), 8);
   data.writeBigUInt64LE(BigInt(maxSolCost), 16);
+  data.writeUInt8(1, 24);  // Some
+  data.writeUInt8(1, 25);  // true
 
+  // v0.8.0: 18 accounts (was 13 pre-May 2026).
+  // 16 from published IDL + 2 remaining accounts (bonding-curve-v2 + buyback recipient)
+  // required by the May 2026 program upgrade.
   return new TransactionInstruction({
     programId: PUMP_FUN_PROGRAM_ID,
     keys: [
-      { pubkey: GLOBAL_PDA, isSigner: false, isWritable: false },
-      { pubkey: FEE_RECIPIENT, isSigner: false, isWritable: true },
-      { pubkey: m, isSigner: false, isWritable: false },
-      { pubkey: bc, isSigner: false, isWritable: true },
-      { pubkey: bcAta, isSigner: false, isWritable: true },
-      { pubkey: userAta, isSigner: false, isWritable: true },
-      { pubkey: u, isSigner: true, isWritable: true },
-      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-      { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-      { pubkey: ASSOCIATED_TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-      { pubkey: SYSVAR_RENT_PUBKEY, isSigner: false, isWritable: false },
-      { pubkey: EVENT_AUTHORITY, isSigner: false, isWritable: false },
-      { pubkey: PUMP_FUN_PROGRAM_ID, isSigner: false, isWritable: false },
+      { pubkey: GLOBAL_PDA, isSigner: false, isWritable: false },                    // 0
+      { pubkey: FEE_RECIPIENT, isSigner: false, isWritable: true },                  // 1
+      { pubkey: m, isSigner: false, isWritable: false },                             // 2
+      { pubkey: bc, isSigner: false, isWritable: true },                             // 3
+      { pubkey: bcAta, isSigner: false, isWritable: true },                          // 4
+      { pubkey: userAta, isSigner: false, isWritable: true },                        // 5
+      { pubkey: u, isSigner: true, isWritable: true },                               // 6
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },       // 7
+      { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },              // 8
+      { pubkey: creatorVault, isSigner: false, isWritable: true },                   // 9 NEW
+      { pubkey: findEventAuthority(), isSigner: false, isWritable: false },          // 10
+      { pubkey: PUMP_FUN_PROGRAM_ID, isSigner: false, isWritable: false },           // 11
+      { pubkey: findGlobalVolumeAccumulator(), isSigner: false, isWritable: false },// 12 NEW
+      { pubkey: findUserVolumeAccumulator(u), isSigner: false, isWritable: true },  // 13 NEW
+      { pubkey: findFeeConfig(), isSigner: false, isWritable: false },              // 14 NEW
+      { pubkey: PUMP_FEE_PROGRAM_ID, isSigner: false, isWritable: false },          // 15 NEW
+      { pubkey: findBondingCurveV2(m), isSigner: false, isWritable: false },         // 16 NEW (remaining)
+      { pubkey: BUYBACK_FEE_RECIPIENT, isSigner: false, isWritable: true },          // 17 NEW (remaining)
     ],
     data,
   });
 }
 
-function createSellInstruction({ mint, user, amount, minSolOutput }) {
+function createSellInstruction({ mint, user, amount, minSolOutput, creator }) {
   const m = typeof mint === 'string' ? new PublicKey(mint) : mint;
   const u = typeof user === 'string' ? new PublicKey(user) : user;
   const bc = findBondingCurve(m);
@@ -301,28 +381,41 @@ function createSellInstruction({ mint, user, amount, minSolOutput }) {
     [u.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), m.toBuffer()],
     ASSOCIATED_TOKEN_PROGRAM_ID
   )[0];
+  // v0.8.0: same new accounts as buy. Creator-vault PDA needed.
+  const creatorKey = creator ? new PublicKey(creator) : new PublicKey('11111111111111111111111111111111');
+  const creatorVault = findCreatorVault(creatorKey);
 
-  // Data: discriminator (8) + amount (u64) + min_sol_output (u64)
-  const data = Buffer.alloc(8 + 8 + 8);
+  // v0.8.0: data layout = discriminator (8) + amount (8) + min_sol_output (8)
+  // + trackVolume Option<bool> (2) = 26 bytes total
+  const data = Buffer.alloc(8 + 8 + 8 + 2);
   SELL_DISCRIMINATOR.copy(data, 0);
   data.writeBigUInt64LE(BigInt(amount), 8);
   data.writeBigUInt64LE(BigInt(minSolOutput), 16);
+  data.writeUInt8(1, 24);  // Some
+  data.writeUInt8(1, 25);  // true
 
+  // v0.8.0: 18 accounts (mirror of buy layout, same May 2026 program upgrade).
   return new TransactionInstruction({
     programId: PUMP_FUN_PROGRAM_ID,
     keys: [
-      { pubkey: GLOBAL_PDA, isSigner: false, isWritable: false },
-      { pubkey: FEE_RECIPIENT, isSigner: false, isWritable: true },
-      { pubkey: m, isSigner: false, isWritable: false },
-      { pubkey: bc, isSigner: false, isWritable: true },
-      { pubkey: bcAta, isSigner: false, isWritable: true },
-      { pubkey: userAta, isSigner: false, isWritable: true },
-      { pubkey: u, isSigner: true, isWritable: true },
-      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-      { pubkey: ASSOCIATED_TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-      { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-      { pubkey: EVENT_AUTHORITY, isSigner: false, isWritable: false },
-      { pubkey: PUMP_FUN_PROGRAM_ID, isSigner: false, isWritable: false },
+      { pubkey: GLOBAL_PDA, isSigner: false, isWritable: false },                    // 0
+      { pubkey: FEE_RECIPIENT, isSigner: false, isWritable: true },                  // 1
+      { pubkey: m, isSigner: false, isWritable: false },                             // 2
+      { pubkey: bc, isSigner: false, isWritable: true },                             // 3
+      { pubkey: bcAta, isSigner: false, isWritable: true },                          // 4
+      { pubkey: userAta, isSigner: false, isWritable: true },                        // 5
+      { pubkey: u, isSigner: true, isWritable: true },                               // 6
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },       // 7
+      { pubkey: ASSOCIATED_TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },   // 8 (sell uses ATA program before token program)
+      { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },              // 9
+      { pubkey: creatorVault, isSigner: false, isWritable: true },                   // 10 NEW
+      { pubkey: findEventAuthority(), isSigner: false, isWritable: false },          // 11
+      { pubkey: PUMP_FUN_PROGRAM_ID, isSigner: false, isWritable: false },           // 12
+      { pubkey: findGlobalVolumeAccumulator(), isSigner: false, isWritable: false },// 13 NEW
+      { pubkey: findUserVolumeAccumulator(u), isSigner: false, isWritable: true },  // 14 NEW
+      { pubkey: findFeeConfig(), isSigner: false, isWritable: false },              // 15 NEW
+      { pubkey: PUMP_FEE_PROGRAM_ID, isSigner: false, isWritable: false },          // 16 NEW
+      // No buyback recipient for sells (it's a sell-side fee)
     ],
     data,
   });
@@ -344,12 +437,17 @@ export async function buildSwapTransaction({ quoteResponse, userPublicKey, side 
   const lamports = await conn.getMinimumBalanceForRentExemption(165);  // 165 = account size
 
   let mainIx;
+  // v0.8.0: pass creator from quote state for creator-vault PDA derivation.
+  // The quote fetches bonding curve state which has the creator field; we
+  // stash it as _creator so the builder can use it without a 2nd RPC call.
+  const creator = quoteResponse._creator;
   if (side === 'buy') {
     mainIx = createBuyInstruction({
       mint,
       user,
       amount: quoteResponse.outAmount,
       maxSolCost: quoteResponse._maxSolCost,
+      creator,
     });
   } else if (side === 'sell') {
     mainIx = createSellInstruction({
@@ -357,6 +455,7 @@ export async function buildSwapTransaction({ quoteResponse, userPublicKey, side 
       user,
       amount: quoteResponse.inAmount,
       minSolOutput: quoteResponse._minSolOutput,
+      creator,
     });
   } else {
     throw new Error(`pumpfun.buildSwapTransaction: side must be 'buy' or 'sell', got ${side}`);
