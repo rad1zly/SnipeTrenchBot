@@ -193,6 +193,12 @@ async function submitSwap({ quoteResponse, label, chatId, route = 'jupiter', sid
   // v0.8.3: searchTransactionHistory=true (was false) so we find old txs in
   // the node's history cache — important for failed txs that drop out of
   // the recent status cache quickly. Also widen the budget to 2.5s.
+  // v0.8.4 (CRITICAL): the v0.8.3 late check only threw on meta.err, NOT
+  // on getTransaction returning null. Bug observed 2026-06-19 12:17:43Z —
+  // tx sig 2M8zVDWa... never landed on-chain, but bot reported BUY_OK and
+  // proceeded to SELL phantom tokens → on-chain 3007. Now: getTransaction
+  // is retried multiple times; if still null after extended wait → throw
+  // (tx didn't reach the network / was dropped / RPC returned fake sig).
   const pollStart = Date.now();
   const POLL_BUDGET_MS = 2500;
   let status = null;
@@ -209,23 +215,32 @@ async function submitSwap({ quoteResponse, label, chatId, route = 'jupiter', sid
     }
     await new Promise(r => setTimeout(r, 50));
   }
-  // v0.8.3: budget exhausted — don't blindly proceed. Do one last
-  // getTransaction (returns err if tx failed on-chain even if it's not
-  // in the recent status cache). This is the safety net for the case
-  // observed 2026-06-19 07:05Z where Helius's status cache was slow and
-  // the bot reported BUY_OK on a tx that actually failed with 3012.
-  try {
-    const last = await connection.getTransaction(signature, { maxSupportedTransactionVersion: 0, commitment: 'confirmed' });
-    if (last?.meta?.err) {
-      throw new Error(`${label} tx failed on-chain (late check): ${JSON.stringify(last.meta.err)}`);
+  // v0.8.4: budget exhausted. Try getTransaction multiple times with retry.
+  // If still null after 3s of extra polling → tx never landed → throw.
+  const LATE_POLL_MS = 3000;
+  const lateStart = Date.now();
+  let last = null;
+  while (Date.now() - lateStart < LATE_POLL_MS) {
+    try {
+      last = await connection.getTransaction(signature, { maxSupportedTransactionVersion: 0, commitment: 'confirmed' });
+    } catch (e) {
+      console.warn(`[executor] ${label} late getTransaction attempt error: ${e.message}`);
     }
-  } catch (e) {
-    if (e.message.includes('tx failed on-chain')) throw e;
-    // Network error on the late check — log but accept as best-effort.
-    console.warn(`[executor] ${label} late status check failed for ${signature.slice(0,8)}...: ${e.message}`);
+    if (last) {
+      if (last.meta?.err) {
+        throw new Error(`${label} tx failed on-chain (late check): ${JSON.stringify(last.meta.err)}`);
+      }
+      // tx found, no err — proceed
+      console.log(`[executor] ${label} sig ${signature.slice(0,8)}... found via getTransaction after ${Date.now() - pollStart}ms`);
+      return { signature, simulated: false, landedIn: Date.now() - pollStart };
+    }
+    await new Promise(r => setTimeout(r, 200));
   }
-  console.warn(`[executor] ${label} signature ${signature.slice(0,8)}... no processed status in ${POLL_BUDGET_MS}ms; proceeding`);
-  return { signature, simulated: false, landedIn: POLL_BUDGET_MS };
+  // Still null after extended wait — tx never landed. DO NOT proceed to
+  // next leg (SELL). This is the v0.8.3 bug fix: a missing tx means we
+  // either have phantom tokens (next leg will 3007) or the RPC returned
+  // a sig for a tx that never hit the network. Either way: abort.
+  throw new Error(`${label} tx NOT FOUND on-chain after ${pollStart + LATE_POLL_MS - pollStart + POLL_BUDGET_MS}ms (sig=${signature})`);
 }
 
 /**
