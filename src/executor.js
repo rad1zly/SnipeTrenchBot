@@ -127,7 +127,11 @@ async function submitSwapWithRetry({ quoteResponse, label, maxAttempts = 0, chat
   let lastErr = null;
   for (let i = 0; i < attempts; i++) {
     try {
-      return await submitSwap({ quoteResponse, label, chatId });
+      // v0.8.2: forward route + side so the builder uses the right program
+      // (pumpfun vs jupiter). Without these, swapRouter falls through to
+      // Jupiter for everything — including pump.fun pre-graduation tokens,
+      // which Helius then 422s because the referenced accounts don't exist.
+      return await submitSwap({ quoteResponse, label, chatId, route, side });
     } catch (err) {
       lastErr = err;
       const msg = String(err.message || err);
@@ -142,7 +146,7 @@ async function submitSwapWithRetry({ quoteResponse, label, maxAttempts = 0, chat
   throw lastErr;
 }
 
-async function submitSwap({ quoteResponse, label, chatId }) {
+async function submitSwap({ quoteResponse, label, chatId, route = 'jupiter', side = null }) {
   if (config.DRY_RUN) {
     logStep(`${label}:DRY_RUN`, { inputAmount: quoteResponse?.inAmount, outputAmount: quoteResponse?.outAmount });
     return { signature: 'DRY_RUN_' + Date.now(), simulated: true };
@@ -158,9 +162,14 @@ async function submitSwap({ quoteResponse, label, chatId }) {
         '(The wallet is encrypted at rest; you do NOT need to add BOT_WALLET_PRIVATE_KEY to .env.)'
     );
   }
+  // v0.8.2: pass route + side so the right builder is used.
+  // Before this, route was undefined and swapRouter always fell through to
+  // Jupiter, even for pump.fun pre-graduation tokens (→ Helius 422).
   const txB64 = await buildSwapTransaction({
     quoteResponse,
     userPublicKey: kp.publicKey.toBase58(),
+    route,
+    side,
   });
   if (!txB64) throw new Error(`buildSwapTransaction returned null for ${label}`);
   const tx = VersionedTransaction.deserialize(Buffer.from(txB64, 'base64'));
