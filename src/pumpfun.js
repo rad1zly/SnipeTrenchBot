@@ -572,3 +572,24 @@ export async function isPumpfunToken(mint) {
     return false;
   }
 }
+
+/**
+ * Check if a token has is_mayhem_mode=true (v0.8.5).
+ * Mayhem-mode tokens require reserved fee recipients that the on-chain program
+ * validates; the regular 8 fee_recipients in @pump-fun/pump-sdk IDL are rejected
+ * with NotAuthorized 6000. Bot should SKIP mayhem tokens entirely.
+ * @returns {Promise<boolean>} - true if mayhem mode, false if normal
+ */
+export async function isMayhemModeToken(mint) {
+  try {
+    const { Connection } = await import('@solana/web3.js');
+    const conn = new Connection(config.SOLANA_RPC_URL, 'confirmed');
+    const bc = findBondingCurve(mint);
+    const info = await conn.getAccountInfo(bc);
+    if (!info) return false;
+    // is_mayhem_mode is at byte 81 of BC state (151 bytes V2 layout)
+    return info.data[81] === 1;
+  } catch {
+    return false;
+  }
+}
