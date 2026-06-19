@@ -34,6 +34,7 @@ const HELIUS_HTTP_BASE = 'https://api.helius.xyz';
 const FETCH_TIMEOUT_MS = 5000;
 const RECONNECT_INITIAL_MS = 1000;
 const RECONNECT_MAX_MS = 30_000;
+const REPLAY_PER_WALLET = 10;  // v0.8.7.3: backfill window on startup
 
 const seenSignatures = new Map();  // walletAddress -> Set<sig>
 
@@ -247,6 +248,53 @@ export class HeliusWebSocketMonitor extends EventEmitter {
       }
     }
     this.emit('status', `subscribed to ${this._subscriptions.size} wallet(s)`);
+    // v0.8.7.3: replay recent txs on startup to catch signals that fired
+    // while bot was offline (restart, deploy, network blip). Without this,
+    // any signal that happened during the downtime window is missed forever.
+    // Live failure: 2026-06-19 16:29-16:30 UTC — bot was restarting (v0.8.6.8
+    // deploy at 16:30:34) and missed rYn57 BUY `5F9GJw2t...` + SELL
+    // `4WFFkQ...` for `5GF4wYym...pump`.
+    this._replayRecentTxs().catch((err) => this.emit('error', err));
+  }
+
+  /**
+   * Fetch the most recent transactions for each watched wallet and run them
+   * through classifyTx. Used on startup + reconnect to backfill signals that
+   * arrived while the bot was offline. Limits to REPLAY_PER_WALLET (10) to
+   * avoid hammering Helius on startup with many wallets.
+   */
+  async _replayRecentTxs() {
+    const addresses = walletsDb.listAll();
+    for (const address of addresses) {
+      try {
+        const url = `${HELIUS_HTTP_BASE}/v0/addresses/${address}/transactions?api-key=${config.HELIUS_API_KEY}&limit=${REPLAY_PER_WALLET}`;
+        const res = await axios.get(url, { timeout: FETCH_TIMEOUT_MS });
+        const txs = res.data || [];
+        this.emit('status', `replay: ${address.slice(0,8)}... ${txs.length} recent txs`);
+        for (const tx of txs) {
+          // Dedup via seen set
+          if (seen(address).has(tx.signature)) continue;
+          seen(address).add(tx.signature);
+          const event = classifyTx(tx, address);
+          if (event) {
+            console.log(`[monitor] (replay) detected ${event.type} for ${address.slice(0,8)}... mint=${event.mint.slice(0,8)}...`);
+            const owners = walletsDb.listOwners(address);
+            for (const owner of owners) {
+              const ownerEvent = { ...event, chatId: owner.chat_id };
+              this.emit('event', ownerEvent);
+            }
+            signalsDb.log({
+              type: event.type,
+              wallet: event.wallet,
+              mint: event.mint,
+              data: { ...event, ownerCount: owners.length, replayed: true },
+            });
+          }
+        }
+      } catch (err) {
+        this.emit('error', new Error(`replay ${address} failed: ${err.message}`));
+      }
+    }
   }
 
   async _subscribe(address) {
