@@ -441,60 +441,27 @@ function buildBuyInstruction({ mint, user, tokenAmount, maxSolCost, creator }) {
   });
 }
 
-function buildSellInstruction({ mint, user, tokenAmount, minSolOutput, creator }) {
+async function buildSellInstruction({ mint, user, tokenAmount, minSolOutput, creator }) {
   const m = typeof mint === 'string' ? new PublicKey(mint) : mint;
   const u = typeof user === 'string' ? new PublicKey(user) : user;
-  const bc = findBondingCurve(m);
-  const bcAta = findBondingCurveAta(m);
-  const userAta = PublicKey.findProgramAddressSync(
-    [u.toBuffer(), TOKEN_2022_PROGRAM_ID.toBuffer(), m.toBuffer()],
-    ASSOCIATED_TOKEN_PROGRAM_ID
-  )[0];
-  const creatorKey = creator ? new PublicKey(creator) : new PublicKey('11111111111111111111111111111111');
-  const creatorVault = findCreatorVault(creatorKey);
-  const feeRecipient = pickFeeRecipient();
-
-  // Data layout (V2 sell): disc(8) + amount(u64) + min_sol_output(u64) + trackVolume(OptionBool) = 8+8+8+1=25
-  const data = Buffer.alloc(8 + 8 + 8 + 1);
-  SELL_V2_DISC.copy(data, 0);
-  data.writeBigUInt64LE(BigInt(tokenAmount), 8);   // amount of tokens to sell
-  data.writeBigUInt64LE(BigInt(minSolOutput), 16); // min SOL output
-  data.writeUInt8(0, 24);                           // trackVolume = None
-
-  // 17 accounts (sell doesn't need buyback recipient — buyback is buy-only)
-  // CRITICAL: SELL has DIFFERENT account order than BUY! On-chain verified:
-  //   - Account 2 = WSOL_MINT (not project mint!)
-  //   - Account 3 = mint (project mint)
-  //   - Account 4 = bc
-  //   - Account 5 = bcAta
-  //   - Account 6 = userAta
-  //   - Account 7 = user
-  // Found via tx 3HKyiG7xU4YesSzS4rbTJim7n5RgCJPfpxND7Qm6XdexdMPmsaRMEcv86a4E6EvfboHXM5zzPxX2LGJpQ2arEHL6
-  // (3007 AccountOwnedByWrongProgram on BC) — the BC was at the wrong index
-  const WSOL_MINT = new PublicKey('So11111111111111111111111111111111111111112');
-  return new TransactionInstruction({
-    programId: PUMP_FUN_PROGRAM_ID,
-    keys: [
-      { pubkey: GLOBAL_PDA, isSigner: false, isWritable: false },                    // 0
-      { pubkey: feeRecipient, isSigner: false, isWritable: true },                   // 1
-      { pubkey: WSOL_MINT, isSigner: false, isWritable: false },                     // 2
-      { pubkey: m, isSigner: false, isWritable: false },                             // 3
-      { pubkey: bc, isSigner: false, isWritable: true },                             // 4
-      { pubkey: bcAta, isSigner: false, isWritable: true },                          // 5
-      { pubkey: userAta, isSigner: false, isWritable: true },                        // 6
-      { pubkey: u, isSigner: true, isWritable: true },                               // 7
-      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },       // 8
-      { pubkey: TOKEN_2022_PROGRAM_ID, isSigner: false, isWritable: false },         // 9
-      { pubkey: creatorVault, isSigner: false, isWritable: true },                   // 10
-      { pubkey: findEventAuthority(), isSigner: false, isWritable: false },          // 11
-      { pubkey: PUMP_FUN_PROGRAM_ID, isSigner: false, isWritable: false },           // 12
-      { pubkey: findGlobalVolumeAccumulator(), isSigner: false, isWritable: false },// 13
-      { pubkey: findUserVolumeAccumulator(u), isSigner: false, isWritable: true },  // 14
-      { pubkey: findFeeConfig(), isSigner: false, isWritable: false },              // 15
-      { pubkey: PUMP_FEE_PROGRAM_ID, isSigner: false, isWritable: false },          // 16
-    ],
-    data,
+  // v0.8.5: Use SDK V2 sell (getSellV2InstructionRaw) — the V1 sell disc
+  // (33e685a4...) fails on-chain for Token-2022 mints with 3007
+  // AccountOwnedByWrongProgram. V2 sell uses base/quote model and works.
+  // ON-CHAIN VERIFIED: sig THBMzv8UZW4suWyPGRYqHxuPPeZttDqNBTKeBwVfyvQe8Nt3XZuZNe8vFPz3q1ine83bTaUeB2rVniFwAD39Ezo
+  // (sold 1.1M tokens → 30 lamports SOL → all routed correctly)
+  const { BN } = require('@coral-xyz/anchor');
+  const creatorPk = creator ? new PublicKey(creator) : new PublicKey('11111111111111111111111111111111');
+  const ix = await _pumpSdkInstance.getSellV2InstructionRaw({
+    user: u,
+    mint: m,
+    creator: creatorPk,
+    amount: new BN(tokenAmount.toString()),
+    quoteAmount: new BN(minSolOutput.toString()),
+    tokenProgram: TOKEN_2022_PROGRAM_ID,
+    quoteMint: new PublicKey(config.SOL_MINT),
+    quoteTokenProgram: TOKEN_PROGRAM_ID,
   });
+  return ix;
 }
 
 /**
@@ -529,10 +496,10 @@ export async function buildSwapTransaction({ quoteResponse, userPublicKey, side 
       creator,
     });
   } else if (side === 'sell') {
-    // v0.8.5: handcrafted V1 sell (disc 33e685a4017f83ad) — on-chain verified
-    // The V1 sell discriminator still works post-May 2026 upgrade. The V2
-    // sell (5df6823ce7e940b2) requires mayhem-aware SDK that doesn't exist yet.
-    mainIx = buildSellInstruction({
+    // v0.8.5: SDK V2 sell — V1 sell fails for Token-2022 mints (3007
+    // AccountOwnedByWrongProgram). V2 sell uses base/quote model and is
+    // on-chain verified working (sig THBMzv8UZW4s...).
+    mainIx = await buildSellInstruction({
       mint,
       user,
       tokenAmount: quoteResponse.inAmount,
