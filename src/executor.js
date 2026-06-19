@@ -190,11 +190,14 @@ async function submitSwap({ quoteResponse, label, chatId, route = 'jupiter', sid
   // v0.8.0 (speed): poll for 'processed' (1 slot, ~400ms) instead of 'confirmed'.
   // 'processed' is enough for our 1s hold — if buy reorgs, sell won't fire.
   // Fallback: bump to 'confirmed' if 'processed' doesn't land in 1.5s.
+  // v0.8.3: searchTransactionHistory=true (was false) so we find old txs in
+  // the node's history cache — important for failed txs that drop out of
+  // the recent status cache quickly. Also widen the budget to 2.5s.
   const pollStart = Date.now();
-  const POLL_BUDGET_MS = 1500;
+  const POLL_BUDGET_MS = 2500;
   let status = null;
   while (Date.now() - pollStart < POLL_BUDGET_MS) {
-    const r = await connection.getSignatureStatuses([signature], { searchTransactionHistory: false });
+    const r = await connection.getSignatureStatuses([signature], { searchTransactionHistory: true });
     status = r?.value?.[0];
     if (status) {
       if (status.err) {
@@ -206,8 +209,22 @@ async function submitSwap({ quoteResponse, label, chatId, route = 'jupiter', sid
     }
     await new Promise(r => setTimeout(r, 50));
   }
-  // Budget exhausted — log but accept as best-effort. Sell leg will check actual balance.
-  console.warn(`[executor] ${label} signature ${signature.slice(0,8)}... no processed status in ${POLL_BUDGET_MS}ms; proceeding to sell`);
+  // v0.8.3: budget exhausted — don't blindly proceed. Do one last
+  // getTransaction (returns err if tx failed on-chain even if it's not
+  // in the recent status cache). This is the safety net for the case
+  // observed 2026-06-19 07:05Z where Helius's status cache was slow and
+  // the bot reported BUY_OK on a tx that actually failed with 3012.
+  try {
+    const last = await connection.getTransaction(signature, { maxSupportedTransactionVersion: 0, commitment: 'confirmed' });
+    if (last?.meta?.err) {
+      throw new Error(`${label} tx failed on-chain (late check): ${JSON.stringify(last.meta.err)}`);
+    }
+  } catch (e) {
+    if (e.message.includes('tx failed on-chain')) throw e;
+    // Network error on the late check — log but accept as best-effort.
+    console.warn(`[executor] ${label} late status check failed for ${signature.slice(0,8)}...: ${e.message}`);
+  }
+  console.warn(`[executor] ${label} signature ${signature.slice(0,8)}... no processed status in ${POLL_BUDGET_MS}ms; proceeding`);
   return { signature, simulated: false, landedIn: POLL_BUDGET_MS };
 }
 

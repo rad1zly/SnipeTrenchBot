@@ -15,10 +15,16 @@
 // =============================================================================
 
 import web3 from '@solana/web3.js';
-const { Connection, PublicKey, TransactionInstruction, VersionedTransaction, TransactionMessage, ComputeBudgetProgram, SystemProgram, SYSVAR_RENT_PUBKEY } = web3;
+const { Connection, PublicKey, TransactionInstruction, VersionedTransaction, TransactionMessage, ComputeBudgetProgram, SystemProgram, SYSVAR_RENT_PUBKEY, Keypair } = web3;
 // Some constants don't survive CJS->ESM interop cleanly. Hardcode them.
 const TOKEN_PROGRAM_ID = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
 const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL');
+// v0.8.3: May 2026 pump.fun upgrade uses Token-2022 for the base mint
+// (default in @pump-fun/pump-sdk 1.36.0). Old programs used regular Token.
+const TOKEN_2022_PROGRAM_ID = new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+const pumpSdk = require('@pump-fun/pump-sdk');
 import config from './config.js';
 
 // Pump.fun program constants (from on-chain IDL)
@@ -70,9 +76,17 @@ const BC_LAYOUT = {
   creator: { offset: 49, size: 32 },
 };
 
-// Instruction discriminators (8-byte sighash, sha256 of "global:buy"/"global:sell")
-const BUY_DISCRIMINATOR = Buffer.from([0x66, 0x06, 0x3d, 0x12, 0x01, 0xda, 0xeb, 0xea]);
-const SELL_DISCRIMINATOR = Buffer.from([0x33, 0xe6, 0x85, 0xa4, 0x01, 0x7f, 0x83, 0xad]);
+// v0.8.3: pump.fun May 2026 program upgrade renamed/added BuyV2 & SellV2 instructions.
+// The old Buy/Sell discriminators (0x66063d12... / 0x33e685a4...) now hit
+// AccountNotInitialized (3012) on the bonding-curve ATA for fresh tokens
+// (see test logs 2026-06-19). Use BuyV2 / SellV2 via @pump-fun/pump-sdk 1.36.0.
+// Old discriminators are kept commented for forensics only.
+// const BUY_DISCRIMINATOR = Buffer.from([0x66, 0x06, 0x3d, 0x12, 0x01, 0xda, 0xeb, 0xea]);
+// const SELL_DISCRIMINATOR = Buffer.from([0x33, 0xe6, 0x85, 0xa4, 0x01, 0x7f, 0x83, 0xad]);
+// Singleton PumpSdk instance — the SDK uses `this.offlinePumpProgram`
+// internally so we can't just call prototype methods. No connection needed
+// for the offline builders; the SDK ships with its own IDL.
+const _pumpSdkInstance = new pumpSdk.PumpSdk();
 
 // In-memory cache of bonding-curve state. Mint graduates after ~$69k mcap;
 // once `complete=true`, cache is invalidated.
@@ -317,108 +331,51 @@ export async function getSellQuote({ tokenRawAmount, inputMint, slippageBps = 50
 }
 
 // -----------------------------------------------------------------------------
-// Build swap transaction
+// Build swap transaction (v0.8.3 — BuyV2 / SellV2 via @pump-fun/pump-sdk 1.36.0)
 // -----------------------------------------------------------------------------
-function createBuyInstruction({ mint, user, amount, maxSolCost, creator }) {
-  const m = typeof mint === 'string' ? new PublicKey(mint) : mint;
-  const u = typeof user === 'string' ? new PublicKey(user) : user;
-  const bc = findBondingCurve(m);
-  const bcAta = findBondingCurveAta(m);
-  const userAta = PublicKey.findProgramAddressSync(
-    [u.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), m.toBuffer()],
-    ASSOCIATED_TOKEN_PROGRAM_ID
-  )[0];
-  // v0.8.0: creator needed for creator-vault PDA. If not provided, derive
-  // a placeholder (will fail on chain if BC state has a different creator).
-  const creatorKey = creator ? new PublicKey(creator) : new PublicKey('11111111111111111111111111111111');
-  const creatorVault = findCreatorVault(creatorKey);
-
-  // v0.8.0: data layout = discriminator (8) + amount (8) + max_sol_cost (8)
-  // + trackVolume Option<bool> (2) = 26 bytes total
-  // trackVolume = Some(true) encoded as [1, 1]
-  const data = Buffer.alloc(8 + 8 + 8 + 2);
-  BUY_DISCRIMINATOR.copy(data, 0);
-  data.writeBigUInt64LE(BigInt(amount), 8);
-  data.writeBigUInt64LE(BigInt(maxSolCost), 16);
-  data.writeUInt8(1, 24);  // Some
-  data.writeUInt8(1, 25);  // true
-
-  // v0.8.0: 18 accounts (was 13 pre-May 2026).
-  // 16 from published IDL + 2 remaining accounts (bonding-curve-v2 + buyback recipient)
-  // required by the May 2026 program upgrade.
-  return new TransactionInstruction({
-    programId: PUMP_FUN_PROGRAM_ID,
-    keys: [
-      { pubkey: GLOBAL_PDA, isSigner: false, isWritable: false },                    // 0
-      { pubkey: FEE_RECIPIENT, isSigner: false, isWritable: true },                  // 1
-      { pubkey: m, isSigner: false, isWritable: false },                             // 2
-      { pubkey: bc, isSigner: false, isWritable: true },                             // 3
-      { pubkey: bcAta, isSigner: false, isWritable: true },                          // 4
-      { pubkey: userAta, isSigner: false, isWritable: true },                        // 5
-      { pubkey: u, isSigner: true, isWritable: true },                               // 6
-      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },       // 7
-      { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },              // 8
-      { pubkey: creatorVault, isSigner: false, isWritable: true },                   // 9 NEW
-      { pubkey: findEventAuthority(), isSigner: false, isWritable: false },          // 10
-      { pubkey: PUMP_FUN_PROGRAM_ID, isSigner: false, isWritable: false },           // 11
-      { pubkey: findGlobalVolumeAccumulator(), isSigner: false, isWritable: false },// 12 NEW
-      { pubkey: findUserVolumeAccumulator(u), isSigner: false, isWritable: true },  // 13 NEW
-      { pubkey: findFeeConfig(), isSigner: false, isWritable: false },              // 14 NEW
-      { pubkey: PUMP_FEE_PROGRAM_ID, isSigner: false, isWritable: false },          // 15 NEW
-      { pubkey: findBondingCurveV2(m), isSigner: false, isWritable: true },          // 16 NEW (remaining, writable — program creates it)
-      { pubkey: BUYBACK_FEE_RECIPIENT, isSigner: false, isWritable: true },          // 17 NEW (remaining)
-    ],
-    data,
+// The May 2026 pump.fun program upgrade moved trading to the V2 instruction
+// family (BuyV2 / SellV2) with a base/quote account model and Token-2022 for
+// the base mint. The old Buy / Sell discriminators (0x66…/0x33…) now hit
+// `AccountNotInitialized` (Anchor error 3012) on the bonding-curve ATA for
+// fresh tokens (observed 2026-06-19 07:05Z). We use the official SDK to build
+// the V2 instructions to stay aligned with pump.fun's published IDL.
+async function buildV2BuyInstruction({ mint, user, tokenAmount, maxSolCost, creator }) {
+  const mintPk = typeof mint === 'string' ? new PublicKey(mint) : mint;
+  const userPk = typeof user === 'string' ? new PublicKey(user) : user;
+  const creatorPk = creator ? new PublicKey(creator) : new PublicKey('11111111111111111111111111111111');
+  // Slippage already baked into maxSolCost by the quote layer.
+  // getBuyV2InstructionRaw uses raw tokenAmount (BN) and maxQuote (BN).
+  // BN is exported from @coral-xyz/anchor; require() it lazily.
+  const { BN } = require('@coral-xyz/anchor');
+  const ix = await _pumpSdkInstance.getBuyV2InstructionRaw({
+    user: userPk,
+    mint: mintPk,
+    creator: creatorPk,
+    amount: new BN(tokenAmount.toString()),
+    quoteAmount: new BN(maxSolCost.toString()),
+    tokenProgram: TOKEN_2022_PROGRAM_ID,
+    quoteMint: new PublicKey(config.SOL_MINT),
+    quoteTokenProgram: TOKEN_PROGRAM_ID,
   });
+  return ix;
 }
 
-function createSellInstruction({ mint, user, amount, minSolOutput, creator }) {
-  const m = typeof mint === 'string' ? new PublicKey(mint) : mint;
-  const u = typeof user === 'string' ? new PublicKey(user) : user;
-  const bc = findBondingCurve(m);
-  const bcAta = findBondingCurveAta(m);
-  const userAta = PublicKey.findProgramAddressSync(
-    [u.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), m.toBuffer()],
-    ASSOCIATED_TOKEN_PROGRAM_ID
-  )[0];
-  // v0.8.0: same new accounts as buy. Creator-vault PDA needed.
-  const creatorKey = creator ? new PublicKey(creator) : new PublicKey('11111111111111111111111111111111');
-  const creatorVault = findCreatorVault(creatorKey);
-
-  // v0.8.0: data layout = discriminator (8) + amount (8) + min_sol_output (8)
-  // + trackVolume Option<bool> (2) = 26 bytes total
-  const data = Buffer.alloc(8 + 8 + 8 + 2);
-  SELL_DISCRIMINATOR.copy(data, 0);
-  data.writeBigUInt64LE(BigInt(amount), 8);
-  data.writeBigUInt64LE(BigInt(minSolOutput), 16);
-  data.writeUInt8(1, 24);  // Some
-  data.writeUInt8(1, 25);  // true
-
-  // v0.8.0: 18 accounts (mirror of buy layout, same May 2026 program upgrade).
-  return new TransactionInstruction({
-    programId: PUMP_FUN_PROGRAM_ID,
-    keys: [
-      { pubkey: GLOBAL_PDA, isSigner: false, isWritable: false },                    // 0
-      { pubkey: FEE_RECIPIENT, isSigner: false, isWritable: true },                  // 1
-      { pubkey: m, isSigner: false, isWritable: false },                             // 2
-      { pubkey: bc, isSigner: false, isWritable: true },                             // 3
-      { pubkey: bcAta, isSigner: false, isWritable: true },                          // 4
-      { pubkey: userAta, isSigner: false, isWritable: true },                        // 5
-      { pubkey: u, isSigner: true, isWritable: true },                               // 6
-      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },       // 7
-      { pubkey: ASSOCIATED_TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },   // 8 (sell uses ATA program before token program)
-      { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },              // 9
-      { pubkey: creatorVault, isSigner: false, isWritable: true },                   // 10 NEW
-      { pubkey: findEventAuthority(), isSigner: false, isWritable: false },          // 11
-      { pubkey: PUMP_FUN_PROGRAM_ID, isSigner: false, isWritable: false },           // 12
-      { pubkey: findGlobalVolumeAccumulator(), isSigner: false, isWritable: false },// 13 NEW
-      { pubkey: findUserVolumeAccumulator(u), isSigner: false, isWritable: true },  // 14 NEW
-      { pubkey: findFeeConfig(), isSigner: false, isWritable: false },              // 15 NEW
-      { pubkey: PUMP_FEE_PROGRAM_ID, isSigner: false, isWritable: false },          // 16 NEW
-      // No buyback recipient for sells (it's a sell-side fee)
-    ],
-    data,
+async function buildV2SellInstruction({ mint, user, tokenAmount, minSolOutput, creator }) {
+  const mintPk = typeof mint === 'string' ? new PublicKey(mint) : mint;
+  const userPk = typeof user === 'string' ? new PublicKey(user) : user;
+  const creatorPk = creator ? new PublicKey(creator) : new PublicKey('11111111111111111111111111111111');
+  const { BN } = require('@coral-xyz/anchor');
+  const ix = await _pumpSdkInstance.getSellV2InstructionRaw({
+    user: userPk,
+    mint: mintPk,
+    creator: creatorPk,
+    amount: new BN(tokenAmount.toString()),
+    quoteAmount: new BN(minSolOutput.toString()),
+    tokenProgram: TOKEN_2022_PROGRAM_ID,
+    quoteMint: new PublicKey(config.SOL_MINT),
+    quoteTokenProgram: TOKEN_PROGRAM_ID,
   });
+  return ix;
 }
 
 /**
@@ -442,18 +399,21 @@ export async function buildSwapTransaction({ quoteResponse, userPublicKey, side 
   // stash it as _creator so the builder can use it without a 2nd RPC call.
   const creator = quoteResponse._creator;
   if (side === 'buy') {
-    mainIx = createBuyInstruction({
+    // v0.8.3: BuyV2 (May 2026 program upgrade). SDK handles the new
+    // 26-account base/quote layout + Token-2022 base mint.
+    mainIx = await buildV2BuyInstruction({
       mint,
       user,
-      amount: quoteResponse.outAmount,
+      tokenAmount: quoteResponse.outAmount,
       maxSolCost: quoteResponse._maxSolCost,
       creator,
     });
   } else if (side === 'sell') {
-    mainIx = createSellInstruction({
+    // v0.8.3: SellV2 (May 2026 program upgrade). Same V2 layout.
+    mainIx = await buildV2SellInstruction({
       mint,
       user,
-      amount: quoteResponse.inAmount,
+      tokenAmount: quoteResponse.inAmount,
       minSolOutput: quoteResponse._minSolOutput,
       creator,
     });
