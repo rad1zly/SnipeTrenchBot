@@ -82,24 +82,13 @@ export async function buildSwapTransaction({ quoteResponse, userPublicKey, route
 }
 
 // Internal: cached "is pump.fun token" check
-// v0.8.5: also returns false for mayhem-mode tokens (they fail on-chain
-// with NotAuthorized 6000 because the reserved fee recipients list isn't
-// in the SDK IDL). Bot should fall back to Jupiter for mayhem tokens.
 async function _isPumpfunToken(mint) {
   const m = typeof mint === 'string' ? mint : mint.toString();
   const cached = PUMP_CHECK_CACHE.get(m);
   if (cached && Date.now() - cached.checkedAt < PUMP_CHECK_TTL_MS) {
     return cached.value;
   }
-  const isPF = await pumpfun.isPumpfunToken(m);
-  let value = isPF;
-  if (isPF) {
-    const isMayhem = await pumpfun.isMayhemModeToken(m);
-    if (isMayhem) {
-      // v0.8.5: mayhem mode rejected → fall back to Jupiter
-      value = false;
-    }
-  }
+  const value = await pumpfun.isPumpfunToken(m);
   PUMP_CHECK_CACHE.set(m, { value, checkedAt: Date.now() });
   return value;
 }
