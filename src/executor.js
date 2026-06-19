@@ -245,26 +245,29 @@ async function submitSwap({ quoteResponse, label, chatId, route = 'jupiter', sid
 
 /**
  * Main entry point. Called by index.js for every event the monitor emits.
- * Only acts on SELL_DETECTED. Logs but ignores everything else.
+ * Acts on SELL_DETECTED (counter-trade: bot buys when dev sells) AND
+ * BUY_DETECTED (mirror-trade: bot buys when dev buys). v0.8.7: also support
+ * GMGN/Jupiter aggregator routes for both directions.
  */
 export async function executeSignal(event) {
   if (event.type === 'TOKEN_CREATED') {
     recordTokenCreated(event);
     return;
   }
-  if (event.type !== 'SELL_DETECTED') return;
+  if (event.type !== 'SELL_DETECTED' && event.type !== 'BUY_DETECTED') return;
 
-  const { wallet: dev, mint, solReceived, signature: devSellSig } = event;
+  const { wallet: dev, mint } = event;
+  const isMirror = event.type === 'BUY_DETECTED';
   // v0.7.0: per-user keypair. chatId is set by the helius monitor from the
   // watched_wallets row, identifying which Telegram subscriber added this
   // dev wallet. The executor uses it to look up that user's trading wallet
   // for the buy/sell leg, and to route notifier messages back to them only.
   const chatId = event.chatId;
 
-  // v0.7.0 (06-15): user override — any watched wallet sell = buy trigger.
+  // v0.7.0 (06-15): user override — any watched wallet sell/buy = trigger.
   // Skip isRecentToken check; we don't care if it's our token, a recent
-  // launch, or a random token the wallet is dumping.
-  logStep('SIGNAL_ACCEPTED', { dev, mint });
+  // launch, or a random token the wallet is dumping/loading.
+  logStep('SIGNAL_ACCEPTED', { dev, mint, mode: isMirror ? 'MIRROR_BUY' : 'COUNTER_BUY' });
 
   // ---- Time window gate (UTC) ----
   if (!isWithinTradingHours()) {

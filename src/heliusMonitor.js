@@ -115,11 +115,67 @@ function isSell(tx, wallet) {
   const acct = (tx.accountData || []).find(a => a.account === wallet);
   const netSol = acct ? (acct.nativeBalanceChange || 0) : 0;
   if (netSol >= 0) return null;  // no SOL loss → not a sell
+  // v0.8.7: filter tiny SOL movements (rent reclaim, priority fee refunds)
+  // that aren't real sells. Same threshold as isBuy.
+  if (Math.abs(netSol) < 500_000) return null;
 
   return {
     mint: sentToken.mint,
     solReceived: 0,  // unknown; executor will quote via Jupiter
     tokenSent: sentToken.tokenAmount,
+  };
+}
+
+/**
+ * Decide if a tx is a BUY by `wallet`.
+ * Heuristic: wallet RECEIVES an SPL token (tokenAmount > 0, toUserAccount = wallet)
+ * AND either spent native SOL directly OR has negative net SOL balance change.
+ *
+ * v0.8.7 (20 Jun 2026): support GMGN / Jupiter / Pump.fun aggregator routes.
+ * Without this, bot only reacted to SELL_DETECTED (counter-trade strategy).
+ * User feedback: "teman ku trade pake gmgn gak ke track" — bot missed BUY
+ * signals from watched wallets when they used GMGN as frontend.
+ *
+ * Symmetric to isSell(): wallet receives token + wallet loses SOL.
+ */
+function isBuy(tx, wallet) {
+  const transfers = tx.tokenTransfers || [];
+  const natives = tx.nativeTransfers || [];
+  const receivedToken = transfers.find(
+    (t) => t.toUserAccount === wallet && t.tokenAmount > 0
+  );
+  if (!receivedToken) return null;
+  // Filter wSOL wraps/unwraps — not a real buy, just SOL wrapping.
+  if (receivedToken.mint === config.WSOL_MINT) return null;
+
+  // Try direct SOL spend first (most precise).
+  const directSol = natives.find(
+    (t) => t.fromUserAccount === wallet && t.amount > 0
+  );
+  if (directSol) {
+    return {
+      mint: receivedToken.mint,
+      solSpent: directSol.amount / config.LAMPORTS_PER_SOL,
+      tokenReceived: receivedToken.tokenAmount,
+    };
+  }
+
+  // Fallback: GMGN/Jupiter-routed buys. Use accountData's nativeBalanceChange.
+  // If the wallet lost SOL (any negative amount), it's a buy.
+  const acct = (tx.accountData || []).find(a => a.account === wallet);
+  const netSol = acct ? (acct.nativeBalanceChange || 0) : 0;
+  if (netSol >= 0) return null;  // no SOL loss → not a buy
+
+  // v0.8.7: minimum SOL loss threshold to filter out airdrops/transfers where
+  // SOL barely moves but tokens arrive. Without threshold, a 0.001 SOL change
+  // from rent reclaim would falsely trigger BUY. Threshold: ≥ 0.0005 SOL (500K
+  // lamports = $0.067) so legitimate buy intent is captured.
+  if (Math.abs(netSol) < 500_000) return null;
+
+  return {
+    mint: receivedToken.mint,
+    solSpent: 0,  // unknown; executor will use fixed_buy_sol
+    tokenReceived: receivedToken.tokenAmount,
   };
 }
 
@@ -150,6 +206,19 @@ function classifyTx(tx, wallet) {
       mint: sold.mint,
       solReceived: sold.solReceived,
       tokenSent: sold.tokenSent,
+      signature: sig,
+      timestamp: ts,
+    };
+  }
+  // Buy? v0.8.7 — detect GMGN/Jupiter/Pump.fun aggregator routes for BUY.
+  const bought = isBuy(tx, wallet);
+  if (bought) {
+    return {
+      type: 'BUY_DETECTED',
+      wallet,
+      mint: bought.mint,
+      solSpent: bought.solSpent,
+      tokenReceived: bought.tokenReceived,
       signature: sig,
       timestamp: ts,
     };
