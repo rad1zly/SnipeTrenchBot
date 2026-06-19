@@ -296,16 +296,23 @@ export async function getBuyQuote({ solAmount, outputMint, slippageBps = 500 }) 
   );
   // max_sol_cost = solLamports * (10000 + slippageBps) / 10000
   const maxSolCost = (solLamports * BigInt(10000 + slippageBps)) / 10000n;
+  // v0.8.6.6: min_tokens_out = tokensOut * (10000 - slippageBps) / 10000
+  // BuyExactSolIn on-chain REQUIRES min_tokens_out as slippage floor.
+  // Old code: otherAmountThreshold = tokensOut (no slippage applied) →
+  //   any price movement between quote and execute → 6042 buySlippageBelowMinTokensOut
+  // Confirmed live failure: 2026-06-19 15:50Z, mint FCZ9Ej...pump, mayhem mode.
+  const minTokensOut = (tokensOut * BigInt(10000 - slippageBps)) / 10000n;
   return {
     inputMint: config.SOL_MINT,
     outputMint: outputMint.toString(),
     inAmount: solLamports.toString(),
     outAmount: tokensOut.toString(),
-    otherAmountThreshold: tokensOut.toString(),  // min out (we already computed with fee)
+    otherAmountThreshold: minTokensOut.toString(),  // min tokens we'll accept (with slippage)
     slippageBps,
     priceImpactPct: String(priceImpact),
     _pumpfun: true,  // marker for executor to call pumpfun builder
     _maxSolCost: maxSolCost.toString(),
+    _minTokensOut: minTokensOut.toString(),  // v0.8.6.6: explicit min for buildBuyInstruction
     _virtualSolReserves: state.virtualSolReserves.toString(),
     _virtualTokenReserves: state.virtualTokenReserves.toString(),
     _creator: state.creator,  // v0.8.4: needed for creator-vault PDA (BUG: missing in v0.8.0–v0.8.3 — caused Anchor 2006 ConstraintSeeds error on BuyV2)
@@ -572,7 +579,7 @@ export async function buildSwapTransaction({ quoteResponse, userPublicKey, side 
     mainIx = buildBuyInstruction({
       mint,
       user,
-      tokenAmount: quoteResponse.outAmount,
+      tokenAmount: quoteResponse._minTokensOut,  // v0.8.6.6: pass min_tokens_out (slippage-adjusted) — was outAmount (no slippage) → 6042 fail
       maxSolCost: quoteResponse._maxSolCost,
       creator,
       isMayhem,
