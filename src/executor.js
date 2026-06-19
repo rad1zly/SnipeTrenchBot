@@ -309,7 +309,16 @@ export async function executeSignal(event) {
   }
 
   // ----- BUY -----
-  const { quote: buyQuote, route: buyRoute } = await getBuyQuote({ solAmount, outputMint: mint, slippageBps });
+  // v0.8.6.7: Use route-aware slippage. pump.fun (and especially mayhem-mode
+  // tokens) need wider tolerance than Jupiter — Jupiter aggregates many LPs,
+  // but pump.fun bonding curve is single-source with high sandwich exposure.
+  //   - Jupiter route: use slippage_bps (default 5 bps = 0.05%, tight)
+  //   - pump.fun route: use pump_slippage_bps (default 1500 bps = 15%, wide)
+  // Old code passed slippage_bps (5) to BOTH → 0.05% floor on pump.fun
+  // trades → 6042 BuySlippageBelowMinTokensOut on every mayhem buy.
+  // Live failure: 2026-06-19 16:07Z mint 4k3tYz...pump, sig 29o68pFW...
+  const buySlippageBps = pumpSlippageBps;  // try pump.fun slippage first
+  const { quote: buyQuote, route: buyRoute } = await getBuyQuote({ solAmount, outputMint: mint, slippageBps: buySlippageBps });
   if (!buyQuote || buyQuote.error) {
     logStep('BUY_QUOTE_FAILED', { error: buyQuote?.error });
     notifier.tradeFailed({ stage: 'BUY_QUOTE', mint, error: buyQuote?.error || 'no quote', chatId, solAmount }).catch(() => {});
@@ -322,7 +331,8 @@ export async function executeSignal(event) {
     mint,
     solIn: solAmount,
     tokensOut: tokensExpected,
-    slippageBps,
+    slippageBps: buySlippageBps,
+    minTokensOut: buyQuote._minTokensOut,
   });
 
   // Open position row FIRST, then submit, then update on success.
@@ -352,7 +362,7 @@ export async function executeSignal(event) {
     type: 'BUY',
     wallet: buyerWallet,
     mint,
-    data: { solSpent: solAmount, tokensExpected, tx: buyResult.signature, slippageBps },
+    data: { solSpent: solAmount, tokensExpected, tx: buyResult.signature, slippageBps: buySlippageBps },
   });
   // v0.6.0: bump this wallet's copy_count + last_copy_at (atomic).
   // We do this AFTER signalsDb.log so a DB failure on stats doesn't lose the
@@ -393,7 +403,12 @@ export async function executeSignal(event) {
   // sell amount. (For SPL tokens with decimals, the quote uses raw units too,
   // so this is consistent.)
   const tokensToSell = tokensExpected;
-  const { quote: sellQuote, route: sellRoute } = await getSellQuote({ tokenRawAmount: tokensToSell, inputMint: mint, slippageBps });
+  // v0.8.6.7: pump.fun route needs wider slippage than Jupiter. Same logic
+  // as BUY: pass pump_slippage_bps (1500) so the sell floor protects against
+  // post-buy sandwich drops within 15%. Without this, bot would set
+  // min_sol_output very close to spot and reject 90% of sells when market
+  // moved 1% during the 1s hold window.
+  const { quote: sellQuote, route: sellRoute } = await getSellQuote({ tokenRawAmount: tokensToSell, inputMint: mint, slippageBps: pumpSlippageBps });
   if (!sellQuote || sellQuote.error) {
     positionsDb.fail(positionId, `sell quote: ${sellQuote?.error || 'no quote'}`);
     logStep('SELL_QUOTE_FAILED', { error: sellQuote?.error });
