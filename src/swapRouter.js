@@ -82,13 +82,31 @@ export async function buildSwapTransaction({ quoteResponse, userPublicKey, route
 }
 
 // Internal: cached "is pump.fun token" check
+// v0.8.6.2 (REVISED): mayhem-mode pump.fun tokens reject V1 buy on-chain
+// with NotAuthorized 6000 (confirmed by real on-chain test 2026-06-19
+// 22:51Z, mint 7Zg4GGUE18sTBZg6t68gRcJEzWFdApXymHnyTg6Dpump, sig
+// JVJnGbuvfgoDJA7DYEFNHVqzWTNeccwdGBwSsVDbkYfLmUqQsopWTVbpJq1r9MD3fwdDagdQEPv5ZPu27wFDn1z).
+// v0.8.6.1 had removed this guard based on a quote/build success — but
+// build() doesn't validate on-chain authorization. V1 buy disc (66063d12...)
+// for mayhem tokens: rejected at fee_recipient.rs:19 with NotAuthorized 6000.
+// SDK BuyV2 disc (b817ee6167c5d33d) is in IDL but unverified on mainnet for
+// mayhem tokens. The conservative path: skip mayhem tokens → fall back to
+// Jupiter (which DOES work, on-chain verified 9/9 test-pumpfun-router.js pass).
 async function _isPumpfunToken(mint) {
   const m = typeof mint === 'string' ? mint : mint.toString();
   const cached = PUMP_CHECK_CACHE.get(m);
   if (cached && Date.now() - cached.checkedAt < PUMP_CHECK_TTL_MS) {
     return cached.value;
   }
-  const value = await pumpfun.isPumpfunToken(m);
+  const isPF = await pumpfun.isPumpfunToken(m);
+  let value = isPF;
+  if (isPF) {
+    const isMayhem = await pumpfun.isMayhemModeToken(m);
+    if (isMayhem) {
+      // v0.8.6: mayhem mode rejected at V1 buy on-chain → fall back to Jupiter
+      value = false;
+    }
+  }
   PUMP_CHECK_CACHE.set(m, { value, checkedAt: Date.now() });
   return value;
 }

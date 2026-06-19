@@ -52,12 +52,11 @@ async function main() {
   console.log();
 
   // Expected route
-  // v0.8.6.1: mayhem-mode tokens ARE tradable on pump.fun direct (V2 instruction
-  // includes reserved fee recipients in additionalAccounts). The earlier guard
-  // that fell back to Jupiter for mayhem was overly conservative — verified by
-  // on-chain history of 7Zg4G...pump where mayhem=true still had successful V2
-  // buy/sell txs in the last 10 sigs.
-  const expectedRoute = isPF ? 'pumpfun' : 'jupiter';
+  // v0.8.6.2: mayhem-mode tokens fall back to Jupiter because V1 buy
+  // instruction (the only one on-chain verified for non-mayhem tokens)
+  // is rejected on-chain for mayhem tokens with NotAuthorized 6000.
+  // Real on-chain test (sig JVJnGbuvfgoDJA7DYEFNHVqz...) confirmed.
+  const expectedRoute = isPF && !isMayhem ? 'pumpfun' : 'jupiter';
   console.log(`[2] Router decision → expected route: ${expectedRoute}`);
   console.log();
 
