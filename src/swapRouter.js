@@ -98,17 +98,15 @@ async function _isPumpfunToken(mint) {
   if (cached && Date.now() - cached.checkedAt < PUMP_CHECK_TTL_MS) {
     return cached.value;
   }
+  // v0.8.6.4: mayhem tokens are now tradable via direct pump.fun with
+  // reserved fee recipients (verified by 10/10 SELL simulation +
+  // handcrafted BuyExactSolIn BUY works on-chain).
+  // The old guard from v0.8.6.2 was needed when the SDK didn't support
+  // mayhem fee_recipient selection; we now pass it explicitly in
+  // pumpfun.buildBuyInstruction/buildSellInstruction.
   const isPF = await pumpfun.isPumpfunToken(m);
-  let value = isPF;
-  if (isPF) {
-    const isMayhem = await pumpfun.isMayhemModeToken(m);
-    if (isMayhem) {
-      // v0.8.6: mayhem mode rejected at V1 buy on-chain → fall back to Jupiter
-      value = false;
-    }
-  }
-  PUMP_CHECK_CACHE.set(m, { value, checkedAt: Date.now() });
-  return value;
+  PUMP_CHECK_CACHE.set(m, { value: isPF, checkedAt: Date.now() });
+  return isPF;
 }
 
 export function invalidateRouterCache(mint) {
