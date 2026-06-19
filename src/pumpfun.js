@@ -74,6 +74,9 @@ const BC_LAYOUT = {
   complete: { offset: 48, size: 1 },
   // v0.8.0: creator Pubkey (32 bytes) at offset 49. Required for creator-vault PDA.
   creator: { offset: 49, size: 32 },
+  // v0.8.6.3: is_mayhem_mode (bool, 1 byte) at offset 81 (after 8 disc + 5×u64 + 1 bool + 32 creator).
+  // Required to pick the correct fee_recipient set for mayhem-mode tokens.
+  isMayhemMode: { offset: 81, size: 1 },
 };
 
 // v0.8.3: pump.fun May 2026 program upgrade renamed/added BuyV2 & SellV2 instructions.
@@ -159,6 +162,8 @@ export async function getBondingCurveState(mint) {
     complete: data[BC_LAYOUT.complete.offset] === 1,
     // v0.8.0: parse creator Pubkey for creator-vault PDA derivation.
     creator: new PublicKey(data.slice(BC_LAYOUT.creator.offset, BC_LAYOUT.creator.offset + 32)).toBase58(),
+    // v0.8.6.3: parse is_mayhem_mode for fee_recipient selection.
+    isMayhemMode: data[BC_LAYOUT.isMayhemMode.offset] === 1,
   };
   BC_CACHE.set(cacheKey, { state, cachedAt: Date.now() });
   return state;
@@ -304,6 +309,7 @@ export async function getBuyQuote({ solAmount, outputMint, slippageBps = 500 }) 
     _virtualSolReserves: state.virtualSolReserves.toString(),
     _virtualTokenReserves: state.virtualTokenReserves.toString(),
     _creator: state.creator,  // v0.8.4: needed for creator-vault PDA (BUG: missing in v0.8.0–v0.8.3 — caused Anchor 2006 ConstraintSeeds error on BuyV2)
+    _isMayhem: state.isMayhemMode,  // v0.8.6.3: needed to pick correct fee_recipient set
   };
 }
 
@@ -331,6 +337,7 @@ export async function getSellQuote({ tokenRawAmount, inputMint, slippageBps = 50
     _pumpfun: true,
     _minSolOutput: minSolOutput.toString(),
     _creator: state.creator,  // v0.8.0: needed for creator-vault PDA
+    _isMayhem: state.isMayhemMode,  // v0.8.6.3: needed to pick correct fee_recipient set
   };
 }
 
@@ -372,26 +379,61 @@ const FEE_RECIPIENTS = [
   'G5UZAVbAf46s7cKWoyKu8kYTip9DGTpbLZ2qa9Aq69dP',
 ].map((a) => new PublicKey(a));
 
+// v0.8.6.3: For MAYHEM-mode tokens, the on-chain program requires fee_recipient
+// to be from `reserved_fee_recipients` array (7 pubkeys) + `reserved_fee_recipient`
+// (single). Using `fee_recipients` for mayhem tokens triggers NotAuthorized 6000
+// at programs/pump/src/fee_recipient.rs:19. Verified on-chain 2026-06-19 23:00 GMT+8:
+// building buy with fee_recipient from FEE_RECIPIENTS for mayhem token
+// 7Zg4GGUE18sTBZg6t68gRcJEzWFdApXymHnyTg6Dpump fails with NotAuthorized 6000.
+const RESERVED_FEE_RECIPIENTS = [
+  '4budycTjhs9fD6xw62VBducVTNgMgJJ5BgtKq7mAZwn6',
+  '8SBKzEQU4nLSzcwF4a74F2iaUDQyTfjGndn6qUWBnrpR',
+  '4UQeTP1T39KZ9Sfxzo3WR5skgsaP6NZa87BAkuazLEKH',
+  '8sNeir4QsLsJdYpc9RZacohhK1Y5FLU3nC5LXgYB4aa6',
+  'Fh9HmeLNUMVCvejxCtCL2DbYaRyBFVJ5xrWkLnMH6fdk',
+  '463MEnMeGyJekNZFQSTUABBEbLnvMTALbT6ZmsxAbAdq',
+  '6AUH3WEHucYZyC61hqpqYUWVto5qA5hjHuNQ32GNnNxA',
+].map((a) => new PublicKey(a));
+const RESERVED_FEE_RECIPIENT = new PublicKey('GesfTA3X2arioaHp8bbKdjG9vJtskViWACZoYvxp4twS');  // single, from Global.reserved_fee_recipient
+
 // On-chain verified discriminators
 // v0.8.5 history:
 //   - BuyExactSolIn disc (3efc1d45aa6a74dc) from user-shared tx — FAILED (Fallback 101)
 //   - V1 'buy' disc (66063d12...) — WORKED on-chain for non-mayhem mints (2026-06-19 20:45 GMT+8)
 //   - V1 'sell' disc (33e685a4...) — FAILED (AccountOwnedByWrongProgram — V1 sell expects regular Token program mint, but V2 mints are Token-2022)
 //   - SellV2 disc (5df6823ce7e940b2) — TESTING (per IDL, but also failed earlier with NotAuthorized 6000 — may have been a mayhem-mode issue)
-const BUY_V1_DISC = Buffer.from([0x66, 0x06, 0x3d, 0x12, 0x01, 0xda, 0xeb, 0xea]);  // V1 'buy' — WORKS!
+// v0.8.6.3 (REVISED 2026-06-19 23:00 GMT+8): The on-chain working BUY
+// instruction is BuyExactSolIn with discriminator 38fc74089edfcd5f (= sha256
+// "global:BuyExactSolIn" first 8 bytes — the IDL-published disc). The earlier
+// "3efc1d45aa6a74dc" was an incorrect decoding of a user-shared tx. The V1
+// "buy" disc (66063d12...) was being used by the bot but is REJECTED on-chain
+// for mayhem-mode tokens (NotAuthorized 6000 at fee_recipient.rs:19).
+//
+// Blueprint user gave us (GTyGK...pump, on-chain verified slot 427262863):
+//   disc 38fc74089edfcd5f  →  "Instruction: BuyExactSolIn" → OK
+//   19 accounts including PUMP_FEE_PROGRAM (pfeeUxB6...) and bcAta as Token-2022 ATA
+//   trackVolume OptionBool = 1 (Some(true)) — needed for current program
+//   Use SDK IDL account layout, NOT custom 18-account legacy V1 layout
+const BUY_V1_DISC = Buffer.from([0x66, 0x06, 0x3d, 0x12, 0x01, 0xda, 0xeb, 0xea]);  // legacy V1 'buy' — works non-mayhem, REJECTED for mayhem
+const BUY_EXACT_SOL_IN_DISC = Buffer.from([0x38, 0xfc, 0x74, 0x08, 0x9e, 0xdf, 0xcd, 0x5f]);  // IDL BuyExactSolIn — VERIFIED on-chain for mayhem
 const SELL_V1_DISC = Buffer.from([0x33, 0xe6, 0x85, 0xa4, 0x01, 0x7f, 0x83, 0xad]);  // V1 'sell' — FAILED for Token-2022
 const SELL_V2_DISC = Buffer.from([0x5d, 0xf6, 0x82, 0x3c, 0xe7, 0xe9, 0x40, 0xb2]);  // V2 'sell' — TESTING
-const BUY_EXACT_SOL_IN_DISC = Buffer.from([0x3e, 0xfc, 0x1d, 0x45, 0xaa, 0x6a, 0x74, 0xdc]);  // legacy, FAILED
 
 // Pick a random fee recipient (matches pump.fun behavior: each tx uses one)
-function pickFeeRecipient() {
+// v0.8.6.3: For MAYHEM tokens, pick from RESERVED_FEE_RECIPIENTS (Global.reserved_fee_recipients).
+// For non-mayhem, pick from FEE_RECIPIENTS (Global.fee_recipients).
+function pickFeeRecipient(isMayhem = false) {
+  if (isMayhem) {
+    const all = [...RESERVED_FEE_RECIPIENTS, RESERVED_FEE_RECIPIENT];
+    return all[Math.floor(Math.random() * all.length)];
+  }
   return FEE_RECIPIENTS[Math.floor(Math.random() * FEE_RECIPIENTS.length)];
 }
 function pickBuybackRecipient() {
   return BUYBACK_FEE_RECIPIENTS[Math.floor(Math.random() * BUYBACK_FEE_RECIPIENTS.length)];
 }
 
-function buildBuyInstruction({ mint, user, tokenAmount, maxSolCost, creator }) {
+function buildBuyInstruction({ mint, user, tokenAmount, maxSolCost, creator, isMayhem = false }) {
   const m = typeof mint === 'string' ? new PublicKey(mint) : mint;
   const u = typeof user === 'string' ? new PublicKey(user) : user;
   const bc = findBondingCurve(m);
@@ -403,45 +445,53 @@ function buildBuyInstruction({ mint, user, tokenAmount, maxSolCost, creator }) {
   )[0];
   const creatorKey = creator ? new PublicKey(creator) : new PublicKey('11111111111111111111111111111111');
   const creatorVault = findCreatorVault(creatorKey);
-  const feeRecipient = pickFeeRecipient();
+  // v0.8.6.3: For mayhem-mode tokens, use RESERVED_FEE_RECIPIENTS (required by
+  // on-chain program). For non-mayhem, use regular FEE_RECIPIENTS.
+  const feeRecipient = pickFeeRecipient(isMayhem);
   const buybackRecipient = pickBuybackRecipient();
 
-  // Data layout (BuyExactSolIn): disc(8) + spendable_sol_in(u64) + min_tokens_out(u64) + trackVolume(OptionBool) = 8+8+8+1=25
-  // OptionBool: 0x00 = None, 0x01 + bool = Some(true/false). We use None (= 0x00) to match working tx.
+  // v0.8.6.3: Use BuyExactSolIn disc (38fc74089edfcd5f) which is verified
+  // on-chain for mayhem-mode tokens. Earlier V1 'buy' disc (66063d12...) is
+  // rejected for mayhem with NotAuthorized 6000. Blueprint on-chain verified:
+  //   sig 2uPG4WPRYkjo2RfLf5KM6jYqyhXZXCEx4H5GBFQpyXjXyeZSy86QYRREYebUk6ToHkk1Ga4Rxr1DSEzfQTtmKwEJ
+  //   mint GTyGKtvxDgMJuLwEPyniqMpL1nDgPHB1CbPDMECspump, slot 427262863
+  //
+  // Data layout (BuyExactSolIn per IDL): disc(8) + spendable_sol_in(u64) + min_tokens_out(u64) + trackVolume(OptionBool) = 25 bytes
+  // OptionBool: 0x00=None, 0x01 + bool=Some(true/false). Blueprint uses 0x01.
   const data = Buffer.alloc(8 + 8 + 8 + 1);
-  BUY_V1_DISC.copy(data, 0);  // v0.8.5: try V1 'buy' disc (legacy)
-  data.writeBigUInt64LE(BigInt(maxSolCost), 8);    // spendable_sol_in
-  data.writeBigUInt64LE(BigInt(tokenAmount), 16);  // min_tokens_out
-  data.writeUInt8(0, 24);                          // trackVolume = None
+  BUY_EXACT_SOL_IN_DISC.copy(data, 0);                 // v0.8.6.3: IDL BuyExactSolIn disc
+  data.writeBigUInt64LE(BigInt(maxSolCost), 8);        // spendable_sol_in (max SOL to spend)
+  data.writeBigUInt64LE(BigInt(tokenAmount), 16);      // min_tokens_out
+  data.writeUInt8(1, 24);                              // trackVolume = Some(true) [0x01] — per blueprint
 
-  // 18 accounts in EXACT order from on-chain working tx:
+  // 19-account layout per blueprint (verified on-chain for mayhem tokens):
   return new TransactionInstruction({
     programId: PUMP_FUN_PROGRAM_ID,
     keys: [
-      { pubkey: GLOBAL_PDA, isSigner: false, isWritable: false },                    // 0
-      { pubkey: feeRecipient, isSigner: false, isWritable: true },                   // 1 (rotating)
-      { pubkey: m, isSigner: false, isWritable: false },                             // 2
-      { pubkey: bc, isSigner: false, isWritable: true },                             // 3
-      { pubkey: bcAta, isSigner: false, isWritable: true },                          // 4 (BC's Token-2022 ATA)
-      { pubkey: userAta, isSigner: false, isWritable: true },                        // 5 (user's Token-2022 ATA)
-      { pubkey: u, isSigner: true, isWritable: true },                               // 6
-      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },       // 7
-      { pubkey: TOKEN_2022_PROGRAM_ID, isSigner: false, isWritable: false },         // 8
-      { pubkey: creatorVault, isSigner: false, isWritable: true },                   // 9
-      { pubkey: findEventAuthority(), isSigner: false, isWritable: false },          // 10
-      { pubkey: PUMP_FUN_PROGRAM_ID, isSigner: false, isWritable: false },           // 11
-      { pubkey: findGlobalVolumeAccumulator(), isSigner: false, isWritable: false },// 12
-      { pubkey: findUserVolumeAccumulator(u), isSigner: false, isWritable: true },  // 13
-      { pubkey: findFeeConfig(), isSigner: false, isWritable: false },              // 14
-      { pubkey: PUMP_FEE_PROGRAM_ID, isSigner: false, isWritable: false },          // 15
-      { pubkey: findBondingCurveV2(m), isSigner: false, isWritable: false },         // 16
-      { pubkey: buybackRecipient, isSigner: false, isWritable: true },              // 17 (rotating)
+      { pubkey: GLOBAL_PDA, isSigner: false, isWritable: false },                       // [0]  Global PDA
+      { pubkey: feeRecipient, isSigner: false, isWritable: true },                      // [1]  fee recipient (rotating)
+      { pubkey: m, isSigner: false, isWritable: false },                                // [2]  mint
+      { pubkey: bc, isSigner: false, isWritable: true },                                // [3]  bonding curve
+      { pubkey: bcAta, isSigner: false, isWritable: true },                             // [4]  BC's Token-2022 ATA
+      { pubkey: userAta, isSigner: false, isWritable: true },                           // [5]  user's Token-2022 ATA
+      { pubkey: u, isSigner: true, isWritable: true },                                  // [6]  user (signer)
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },          // [7]  system program
+      { pubkey: TOKEN_2022_PROGRAM_ID, isSigner: false, isWritable: false },            // [8]  token-2022 program
+      { pubkey: creatorVault, isSigner: false, isWritable: true },                      // [9]  creator vault
+      { pubkey: findEventAuthority(), isSigner: false, isWritable: false },             // [10] event authority
+      { pubkey: PUMP_FUN_PROGRAM_ID, isSigner: false, isWritable: false },              // [11] pump-fun program (CPI self)
+      { pubkey: findGlobalVolumeAccumulator(), isSigner: false, isWritable: false },    // [12] global vol acc
+      { pubkey: findUserVolumeAccumulator(u), isSigner: false, isWritable: true },      // [13] user vol acc
+      { pubkey: findFeeConfig(), isSigner: false, isWritable: false },                  // [14] fee config
+      { pubkey: PUMP_FEE_PROGRAM_ID, isSigner: false, isWritable: false },              // [15] pump fee program
+      { pubkey: findBondingCurveV2(m), isSigner: false, isWritable: false },            // [16] bonding-curve-v2 PDA (verified [bonding-curve-v2, mint] under PUMP)
+      { pubkey: buybackRecipient, isSigner: false, isWritable: true },                  // [17] buyback recipient (rotating)
     ],
     data,
   });
 }
 
-async function buildSellInstruction({ mint, user, tokenAmount, minSolOutput, creator }) {
+async function buildSellInstruction({ mint, user, tokenAmount, minSolOutput, creator, isMayhem = false }) {
   const m = typeof mint === 'string' ? new PublicKey(mint) : mint;
   const u = typeof user === 'string' ? new PublicKey(user) : user;
   // v0.8.5: Use SDK V2 sell (getSellV2InstructionRaw) — the V1 sell disc
@@ -451,12 +501,27 @@ async function buildSellInstruction({ mint, user, tokenAmount, minSolOutput, cre
   // (sold 1.1M tokens → 30 lamports SOL → all routed correctly)
   const { BN } = require('@coral-xyz/anchor');
   const creatorPk = creator ? new PublicKey(creator) : new PublicKey('11111111111111111111111111111111');
+  // v0.8.6.4: For MAYHEM tokens, SDK's default getStaticRandomFeeRecipient()
+  // picks from CURRENT_FEE_RECIPIENTS (regular) — V2 program rejects with
+  // NotAuthorized 6000 for mayhem tokens. Must explicitly pass reserved
+  // fee recipient.
+  //
+  // ASYMMETRY (verified by simulation 2026-06-19 23:30 GMT+8, mint 7Zg4G...pump):
+  //   - fee_recipient MUST be from RESERVED_FEE_RECIPIENTS (or single RESERVED_FEE_RECIPIENT)
+  //   - buyback_fee_recipient can be from CURRENT_BUYBACK_FEE_RECIPIENTS
+  //     (all 8 work for mayhem — verified by simulating each)
+  //   - Putting buyback in RESERVED_FEE_RECIPIENTS gives 6057 BuybackFeeRecipientNotAuthorized
+  //   - Putting fee in CURRENT_FEE_RECIPIENTS gives 6000 NotAuthorized
+  const feeRecipient = pickFeeRecipient(isMayhem);
+  const buybackFeeRecipient = BUYBACK_FEE_RECIPIENTS[Math.floor(Math.random() * BUYBACK_FEE_RECIPIENTS.length)];
   const ix = await _pumpSdkInstance.getSellV2InstructionRaw({
     user: u,
     mint: m,
     creator: creatorPk,
     amount: new BN(tokenAmount.toString()),
     quoteAmount: new BN(minSolOutput.toString()),
+    feeRecipient,
+    buybackFeeRecipient,
     tokenProgram: TOKEN_2022_PROGRAM_ID,
     quoteMint: new PublicKey(config.SOL_MINT),
     quoteTokenProgram: TOKEN_PROGRAM_ID,
@@ -476,7 +541,20 @@ export async function buildSwapTransaction({ quoteResponse, userPublicKey, side 
   // Get a fresh blockhash (processed commitment for speed)
   const { blockhash } = await conn.getLatestBlockhash('processed');
   const user = new PublicKey(userPublicKey);
-  const mint = new PublicKey(quoteResponse.outputMint || quoteResponse.inputMint);
+  // v0.8.6.4 (CRITICAL FIX): For SELL, inputMint=base_mint=MINT, outputMint=SOL.
+  // For BUY, inputMint=SOL, outputMint=base_mint=MINT.
+  // Bot's mint is always the BASE mint (pump.fun token), which is:
+  //   - BUY: outputMint
+  //   - SELL: inputMint
+  // The previous code `outputMint || inputMint` picked SOL for SELL — wrong!
+  // Result: buildSellInstruction received SOL as mint → SDK computed
+  //   bondingCurve = pda([bonding-curve, SOL], PUMP) = 6PiyjiA... (wrong!)
+  //   base_mint in tx = So1111... (SOL) instead of MINT
+  // On-chain fail: "AnchorError caused by account: bonding_curve. Error Code:
+  //   AccountOwnedByWrongProgram. Error Number: 3007"
+  // Verified via on-chain tx 5BX6jU2jqzebSfz3Jk3V31J127xynf7ZGei5NJarvqaWENetrmtcgqEiwBKT7Abb9PZWYGjuP4QGgKMZg8Qb9uy4
+  const baseMintStr = side === 'sell' ? quoteResponse.inputMint : quoteResponse.outputMint;
+  const mint = new PublicKey(baseMintStr);
   const lamports = await conn.getMinimumBalanceForRentExemption(165);  // 165 = account size
 
   let mainIx;
@@ -484,16 +562,20 @@ export async function buildSwapTransaction({ quoteResponse, userPublicKey, side 
   // The quote fetches bonding curve state which has the creator field; we
   // stash it as _creator so the builder can use it without a 2nd RPC call.
   const creator = quoteResponse._creator;
+  // v0.8.6.4: mayhem flag now used for BOTH buy and sell (was buy-only in v0.8.6.3).
+  // SELL needs reserved fee recipients for mayhem tokens, same as BUY.
+  const isMayhem = quoteResponse._isMayhem || false;
   if (side === 'buy') {
-    // v0.8.5: handcrafted BuyExactSolIn (disc 3efc1d45aa6a74dc) — on-chain verified
-    // v0.8.3 SDK BuyV2 was using wrong disc (b817ee6167c5d33d) which the on-chain
-    // program doesn't accept. See v0.8.5 block comment above for full forensic.
+    // v0.8.6.3: handcrafted BuyExactSolIn (disc 38fc74089edfcd5f) — on-chain verified
+    // v0.8.5: handcrafted V1 'buy' disc (66063d12...) — REJECTED for mayhem tokens
+    // Blueprint verified: sig 2uPG4WPRYkjo2RfLf5KM6jYqyhXZXCEx4H5GBFQpyXjXyeZSy86QYRREYebUk6ToHkk1Ga4Rxr1DSEzfQTtmKwEJ
     mainIx = buildBuyInstruction({
       mint,
       user,
       tokenAmount: quoteResponse.outAmount,
       maxSolCost: quoteResponse._maxSolCost,
       creator,
+      isMayhem,
     });
   } else if (side === 'sell') {
     // v0.8.5: SDK V2 sell — V1 sell fails for Token-2022 mints (3007
@@ -505,6 +587,7 @@ export async function buildSwapTransaction({ quoteResponse, userPublicKey, side 
       tokenAmount: quoteResponse.inAmount,
       minSolOutput: quoteResponse._minSolOutput,
       creator,
+      isMayhem,  // v0.8.6.4: needed to pick reserved fee recipients for mayhem tokens
     });
   } else {
     throw new Error(`pumpfun.buildSwapTransaction: side must be 'buy' or 'sell', got ${side}`);
