@@ -324,7 +324,7 @@ function isSell(tx, wallet) {
   );
   if (!sentToken) return null;
   if (sentToken.mint === WSOL_MINT) return null;
-  // Direct SOL receive
+  // Direct SOL receive (GMGN transparent route, pump.fun V1 with direct transfer)
   const directSol = natives.find(
     (t) => t.toUserAccount === wallet && t.amount > 0
   );
@@ -335,15 +335,68 @@ function isSell(tx, wallet) {
       tokenSent: sentToken.tokenAmount,
     };
   }
-  // Fallback: accountData shows negative net SOL change
+  // v0.8.7.1 (20 Jun 2026): three SOL-receipt paths for SELL detection.
+  // Path 2: nativeBalanceChange > 0 (pump.fun V1 direct, wallet gains SOL from sell).
+  //   Live failure: 6DVEt... SELL 5qgWr...pump sig 5LGS4d8... → netSol=+75,574 → missed.
+  //   Threshold 50,000 lamports (~$0.007) for direct SELL (early-token thin liquidity).
+  // Path 3: nativeBalanceChange < 0 (GMGN aggregator route, wallet loses SOL).
+  //   Threshold 500,000 lamports to filter tiny refunds.
   const acct = (tx.accountData || []).find((a) => a.account === wallet);
   const netSol = acct ? (acct.nativeBalanceChange || 0) : 0;
-  if (netSol >= 0) return null;
-  return {
-    mint: sentToken.mint,
-    solReceived: 0,
-    tokenSent: sentToken.tokenAmount,
-  };
+  if (netSol > 0 && netSol >= 50_000) {
+    return {
+      mint: sentToken.mint,
+      solReceived: netSol / 1e9,
+      tokenSent: sentToken.tokenAmount,
+    };
+  }
+  if (netSol < 0 && Math.abs(netSol) >= 500_000) {
+    return {
+      mint: sentToken.mint,
+      solReceived: 0,
+      tokenSent: sentToken.tokenAmount,
+    };
+  }
+  return null;
+}
+
+/**
+ * Decide if a tx is a BUY by `wallet`. Symmetric to isSell.
+ * v0.8.7 (20 Jun 2026): support GMGN / Jupiter / Pump.fun aggregator routes.
+ * User feedback: "teman ku trade pake gmgn gak ke track".
+ */
+function isBuy(tx, wallet) {
+  const transfers = tx.tokenTransfers || [];
+  const natives = tx.nativeTransfers || [];
+  const receivedToken = transfers.find(
+    (t) => t.toUserAccount === wallet && t.tokenAmount > 0
+  );
+  if (!receivedToken) return null;
+  if (receivedToken.mint === WSOL_MINT) return null;
+
+  // Path 1: direct SOL spend (most precise).
+  const directSol = natives.find(
+    (t) => t.fromUserAccount === wallet && t.amount > 0
+  );
+  if (directSol) {
+    return {
+      mint: receivedToken.mint,
+      solSpent: directSol.amount / 1e9,
+      tokenReceived: receivedToken.tokenAmount,
+    };
+  }
+
+  // Path 2: accountData shows negative net SOL change (GMGN aggregator).
+  const acct = (tx.accountData || []).find((a) => a.account === wallet);
+  const netSol = acct ? (acct.nativeBalanceChange || 0) : 0;
+  if (netSol < 0 && Math.abs(netSol) >= 500_000) {
+    return {
+      mint: receivedToken.mint,
+      solSpent: 0,  // unknown; executor uses fixed_buy_sol
+      tokenReceived: receivedToken.tokenAmount,
+    };
+  }
+  return null;
 }
 
 /**
@@ -377,6 +430,19 @@ function classifyTx(tx, wallet) {
         timestamp: tx.timestamp || Math.floor(Date.now() / 1000),
       };
     }
+  }
+  // v0.8.7: BUY_DETECTED — mirror-trade GMGN/Jupiter/Pump.fun aggregator buys.
+  const buy = isBuy(tx, wallet);
+  if (buy) {
+    return {
+      type: 'BUY_DETECTED',
+      wallet,
+      mint: buy.mint,
+      solSpent: buy.solSpent,
+      tokenReceived: buy.tokenReceived,
+      signature: tx.signature,
+      timestamp: tx.timestamp || Math.floor(Date.now() / 1000),
+    };
   }
   return null;
 }
