@@ -324,6 +324,38 @@ export async function executeSignal(event) {
     notifier.tradeFailed({ stage: 'BUY_QUOTE', mint, error: buyQuote?.error || 'no quote', chatId, solAmount }).catch(() => {});
     return;
   }
+
+  // v0.8.6.8: Dust check — verify wallet has enough SOL for the buy + fees +
+  // rent (ATA init ~0.002 SOL on Token-2022). Without this, bot submits a tx
+  // that pump.fun then bounces with "Transfer: insufficient lamports X, need Y"
+  // → custom program error 0x1. We lose 5000 lamports base fee per failed tx
+  // and spam the wallet owner with cryptic errors.
+  // Live failure: 2026-06-19 16:23:58Z mint EAV1y7w...pump, sig 3Ds9tNJ...
+  //   wallet=0.011314106 SOL, need 0.011358023 SOL (off 0.0000439 SOL).
+  if (!config.DRY_RUN) {
+    try {
+      const kp = getKeypairFor(chatId);
+      const walletBal = await connection.getBalance(kp.publicKey);
+      // Total cost: max_sol_cost (slippage upper bound) + 0.00203928 SOL buffer
+      // (5000 lamports base fee + 0.002 SOL rent for new ATA, slightly padded
+      // for priority fee headroom). 2_039_280 lamports.
+      const SOL_BUFFER_LAMPORTS = 2_039_280n;
+      const required = BigInt(buyQuote._maxSolCost) + SOL_BUFFER_LAMPORTS;
+      if (BigInt(walletBal) < required) {
+        const have = Number(walletBal) / 1e9;
+        const need = Number(required) / 1e9;
+        const reason = `insufficient lamports: wallet has ${have.toFixed(6)} SOL, need ${need.toFixed(6)} SOL (top up ${(need - have + 0.01).toFixed(4)} SOL)`;
+        logStep('BUY_DENIED_DUST', { mint, have, need });
+        signalsDb.log({ type: 'BUY_DENIED', wallet: dev, mint, data: { reason, stage: 'DUST_CHECK' } });
+        notifier.tradeFailed({ stage: 'BUY_DUST', mint, error: reason, chatId, solAmount }).catch(() => {});
+        return;
+      }
+    } catch (e) {
+      // Don't block the trade on RPC failure — log and continue. Worst case
+      // is the original 0x1 failure with clear log message.
+      logStep('BUY_DUST_CHECK_ERR', { error: e.message });
+    }
+  }
   const tokensExpected = Number(buyQuote.outAmount);
   logStep('BUY_ROUTE', { route: buyRoute, mint });
   logStep('BUY_QUOTE_OK', {
