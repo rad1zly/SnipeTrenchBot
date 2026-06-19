@@ -294,8 +294,23 @@ export async function getBuyQuote({ solAmount, outputMint, slippageBps = 500 }) 
   const { tokensOut, priceImpact, solAfterFee } = computeBuyQuote(
     state.virtualSolReserves, state.virtualTokenReserves, solLamports
   );
-  // max_sol_cost = solLamports * (10000 + slippageBps) / 10000
-  const maxSolCost = (solLamports * BigInt(10000 + slippageBps)) / 10000n;
+  // v0.8.6.9: max_sol_cost must cover SOL for tokens + on-chain fees + rent.
+  // Empirical observation from successful mayhem BUY (4pAGQJne slot 427530669):
+  //   spendable_sol_in = 5,250,000 lamports (0.005 SOL)
+  //   Total user spend = 9,423,480 lamports (1.795× spendable)
+  //   Breakdown: BC received 5.19M (minus 64K protocol fee), creator vault 2.07M,
+  //   protocol fee recipients 64K, fee config (rent?) 1.84M, tx fee 255K.
+  // pump.fun V2 + mayhem charges creator_fee (1-2% per IDL) + protocol_fee
+  // (1.5% per docs) + new account rent (~0.002 SOL). Total ≈ 1.3× of spendable.
+  // Old code: maxSolCost = solLamports * (1 + slippage) only — DID NOT include
+  // fees. On 0.01 SOL buy + 15% slippage → maxSolCost = 11.5M, but pump.fun
+  // wants to transfer 11.36M for the buy alone (post-fee deductions), leaving
+  // user short of additional ~300K for in-CPI small transfers.
+  // Live failure: 2026-06-19 16:23Z mint EAV1y7w...pump, sig 3Ds9tNJ...
+  //   "Transfer: insufficient lamports 11059106, need 11358023" → 0x1
+  const FEE_MULTIPLIER = 13000n; // 1.30× — covers ~13% of solLamports in fees + rent + slippage
+  const slippageNumerator = BigInt(10000 + slippageBps);
+  const maxSolCost = (solLamports * slippageNumerator * FEE_MULTIPLIER) / (10000n * 10000n);
   // v0.8.6.6: min_tokens_out = tokensOut * (10000 - slippageBps) / 10000
   // BuyExactSolIn on-chain REQUIRES min_tokens_out as slippage floor.
   // Old code: otherAmountThreshold = tokensOut (no slippage applied) →
