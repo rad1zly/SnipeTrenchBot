@@ -95,6 +95,20 @@ function isSell(tx, wallet) {
   // v0.7.2: filter wSOL wraps/unwraps — not a real sell, just SOL wrapping.
   if (sentToken.mint === config.WSOL_MINT) return null;
 
+  // v0.8.7.1 (20 Jun 2026): three SOL-receipt paths for SELL detection.
+  // Previously we required `nativeTransfers.toUserAccount === wallet`
+  // OR `nativeBalanceChange < 0` (the latter for GMGN aggregator route).
+  // But pump.fun V1 SELL txs can show:
+  //   - nativeTransfers only contains priority-fee outflows (no entry TO wallet)
+  //   - nativeBalanceChange is POSITIVE (the wallet received SOL from selling)
+  //   Example: 6DVEt... SELL 5qgWr...pump sig 5LGS4d8...
+  //     nativeTransfers: 2 entries (977 + 10000, both OUT from wallet)
+  //     accountData: nativeBalanceChange = +75574 (wallet GAINED SOL)
+  //   Old code returned null. New code accepts positive balance change
+  //   combined with token outflow as proof of a SELL.
+  const acct = (tx.accountData || []).find(a => a.account === wallet);
+  const netSol = acct ? (acct.nativeBalanceChange || 0) : 0;
+
   // Try direct SOL receive first (most precise).
   const directSol = natives.find(
     (t) => t.toUserAccount === wallet && t.amount > 0
@@ -107,23 +121,33 @@ function isSell(tx, wallet) {
     };
   }
 
-  // Fallback: GMGN/Jupiter-routed sells. Use accountData's nativeBalanceChange.
-  // If the wallet lost SOL (any negative amount), it's a sell. The "received"
-  // amount is the absolute loss minus any non-sell SOL outflows (priority
-  // fees, ATA rent) — but for now we log 0 if we can't determine the actual
-  // received amount, and let the executor quote the real output via Jupiter.
-  const acct = (tx.accountData || []).find(a => a.account === wallet);
-  const netSol = acct ? (acct.nativeBalanceChange || 0) : 0;
-  if (netSol >= 0) return null;  // no SOL loss → not a sell
-  // v0.8.7: filter tiny SOL movements (rent reclaim, priority fee refunds)
-  // that aren't real sells. Same threshold as isBuy.
-  if (Math.abs(netSol) < 500_000) return null;
+  // Path 2: nativeBalanceChange > 0 (pump.fun V1 direct, wallet gains SOL from sell).
+  // v0.8.7.1: lowered threshold to 50_000 lamports (~$0.007) for direct SELL.
+  // Why: pump.fun V1 SELL with 3,497 UI tokens yields only ~0.0001 SOL (=75,574
+  // lamports) of receive — below the old 500K threshold, so was missed.
+  // The token outflow is already strong signal of sell; small SOL amount is
+  // normal for early-token sells with thin liquidity.
+  if (netSol > 0 && netSol >= 50_000) {
+    return {
+      mint: sentToken.mint,
+      solReceived: netSol / config.LAMPORTS_PER_SOL,
+      tokenSent: sentToken.tokenAmount,
+    };
+  }
 
-  return {
-    mint: sentToken.mint,
-    solReceived: 0,  // unknown; executor will quote via Jupiter
-    tokenSent: sentToken.tokenAmount,
-  };
+  // Path 3: GMGN/Jupiter-routed sells. Wallet loses SOL during the tx because
+  // SOL is forwarded to an intermediate vault. Negative netSol indicates sell.
+  // Keep 500K threshold here because large negative delta could be the buy leg
+  // (router forwarded SOL out before receiving tokens back).
+  if (netSol < 0 && Math.abs(netSol) >= 500_000) {
+    return {
+      mint: sentToken.mint,
+      solReceived: 0,  // unknown; executor will quote via Jupiter
+      tokenSent: sentToken.tokenAmount,
+    };
+  }
+
+  return null;  // no significant SOL movement → not a sell
 }
 
 /**
