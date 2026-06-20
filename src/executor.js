@@ -135,7 +135,14 @@ async function submitSwapWithRetry({ quoteResponse, label, maxAttempts = 0, chat
     } catch (err) {
       lastErr = err;
       const msg = String(err.message || err);
-      const transient = /429|5\d\d|ETIMEDOUT|ECONNRESET|network|fetch failed|timeout/i.test(msg);
+      // v0.8.7.4: tightened transient regex. Old `/5\d\d/` matched any
+      // 3-digit number in the error message — including "5500" in
+      // "after 5500ms" or a position id like "5500XXX". That made the
+      // executor retry on non-transient "BUY tx NOT FOUND" errors and
+      // waste a second tx fee. New regex requires the 5xx to come from
+      // HTTP status code context (e.g. "status code 503", "Request failed
+      // with status code 5xx") or explicit network/timeout keywords.
+      const transient = /status code (?:5\d\d|429)|Too Many Requests|ETIMEDOUT|ECONNRESET|ENOTFOUND|EAI_AGAIN|fetch failed|network error|timeout exceeded|connection (?:reset|refused)|socket hang up/i.test(msg);
       if (!transient || i === attempts - 1) throw err;
       // Exponential-ish backoff: 500ms, 1500ms, 3000ms...
       const delay = 500 * Math.pow(3, i);
