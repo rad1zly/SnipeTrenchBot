@@ -252,29 +252,35 @@ async function submitSwap({ quoteResponse, label, chatId, route = 'jupiter', sid
 
 /**
  * Main entry point. Called by index.js for every event the monitor emits.
- * Acts on SELL_DETECTED (counter-trade: bot buys when dev sells) AND
- * BUY_DETECTED (mirror-trade: bot buys when dev buys). v0.8.7: also support
- * GMGN/Jupiter aggregator routes for both directions.
+ * Acts on SELL_DETECTED (counter-trade: bot buys when dev sells). The bot
+ * is a "reverse copy" bot — its job is to mirror a dev's exit, not their
+ * entries. BUY_DETECTED events are logged for observability but NOT acted
+ * on. (v0.8.7 had mistakenly added mirror-buy execution; reverted in
+ * v0.8.7.7 per user request: "harusnya kan namanya reverse copy ya
+ * tinggal sell detected aja dan rasio nya sesuai yaudah".)
  */
 export async function executeSignal(event) {
   if (event.type === 'TOKEN_CREATED') {
     recordTokenCreated(event);
     return;
   }
-  if (event.type !== 'SELL_DETECTED' && event.type !== 'BUY_DETECTED') return;
+  if (event.type === 'BUY_DETECTED') {
+    // v0.8.7.7: log but don't execute. This is a reverse-copy bot.
+    logStep('SIGNAL_IGNORED', {
+      dev: event.wallet,
+      mint: event.mint,
+      type: 'BUY_DETECTED',
+      reason: 'reverse-copy mode — only SELL_DETECTED triggers a trade',
+    });
+    return;
+  }
+  if (event.type !== 'SELL_DETECTED') return;
 
   const { wallet: dev, mint } = event;
-  const isMirror = event.type === 'BUY_DETECTED';
-  // v0.7.0: per-user keypair. chatId is set by the helius monitor from the
-  // watched_wallets row, identifying which Telegram subscriber added this
-  // dev wallet. The executor uses it to look up that user's trading wallet
-  // for the buy/sell leg, and to route notifier messages back to them only.
   const chatId = event.chatId;
 
-  // v0.7.0 (06-15): user override — any watched wallet sell/buy = trigger.
-  // Skip isRecentToken check; we don't care if it's our token, a recent
-  // launch, or a random token the wallet is dumping/loading.
-  logStep('SIGNAL_ACCEPTED', { dev, mint, mode: isMirror ? 'MIRROR_BUY' : 'COUNTER_BUY' });
+  // v0.7.0 (06-15): user override — any watched wallet sell = trigger.
+  logStep('SIGNAL_ACCEPTED', { dev, mint, mode: 'COUNTER_BUY' });
 
   // ---- Time window gate (UTC) ----
   if (!isWithinTradingHours()) {
