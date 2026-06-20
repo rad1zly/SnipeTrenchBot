@@ -37,6 +37,17 @@ import { passesFilters, activeFilters } from './filters.js';
 import { walletManager } from './walletManager.js';
 
 let connection = null;
+// v0.8.7.8: secondary Connection to public Solana RPC. Used for two things:
+// 1. Cross-checking ghost-sig patterns (Helius returns sig without
+//    broadcasting). If public RPC also has no status → true ghost.
+// 2. Resubmitting the SAME signed tx bytes via a different RPC node when
+//    Helius drops it. The tx is already signed; resubmitting via a healthy
+//    node often broadcasts it successfully.
+// Live failure 20 Jun 2026 10:50:23Z: Helius returned sig AyKqGVJD...
+// but never broadcast. Public RPC confirmed null. Without dual-RPC the
+// bot wasted 5.5s polling Helius for nothing.
+const PUBLIC_RPC_URL = 'https://api.mainnet-beta.solana.com';
+let publicConnection = null;
 // v0.7.0: per-user keypair cache. Keyed by chat_id. Loaded on first use,
 // evicted on error so the next attempt re-decrypts from DB. Plaintext never
 // leaves this Map; we don't share with the global module scope.
@@ -45,6 +56,7 @@ const tokenMintByDev = new Map(); // devWallet -> Map<mint, createdAt> most rece
 
 export function initExecutor() {
   connection = new Connection(config.SOLANA_RPC_URL, 'confirmed');
+  publicConnection = new Connection(PUBLIC_RPC_URL, 'confirmed');
   if (config.DRY_RUN) {
     console.log('[executor] DRY_RUN mode — no transactions will be signed');
   } else {
@@ -197,20 +209,24 @@ async function submitSwap({ quoteResponse, label, chatId, route = 'jupiter', sid
   // v0.8.0 (speed): poll for 'processed' (1 slot, ~400ms) instead of 'confirmed'.
   // 'processed' is enough for our 1s hold — if buy reorgs, sell won't fire.
   // Fallback: bump to 'confirmed' if 'processed' doesn't land in 1.5s.
-  // v0.8.3: searchTransactionHistory=true (was false) so we find old txs in
-  // the node's history cache — important for failed txs that drop out of
-  // the recent status cache quickly. Also widen the budget to 2.5s.
-  // v0.8.4 (CRITICAL): the v0.8.3 late check only threw on meta.err, NOT
-  // on getTransaction returning null. Bug observed 2026-06-19 12:17:43Z —
-  // tx sig 2M8zVDWa... never landed on-chain, but bot reported BUY_OK and
-  // proceeded to SELL phantom tokens → on-chain 3007. Now: getTransaction
-  // is retried multiple times; if still null after extended wait → throw
-  // (tx didn't reach the network / was dropped / RPC returned fake sig).
+  // v0.8.7.8: dual-RPC cross-check. After 1.2s of polling Helius with no
+  // status, ALSO poll the public Solana RPC. If BOTH return null, it's a
+  // ghost sig — try to RESUBMIT via public RPC (the tx is already signed;
+  // broadcasting from a different node often works). If resubmit succeeds,
+  // the public RPC will see status; otherwise abort. Live failure
+  // 20 Jun 2026 10:50:23Z: Helius returned sig AyKqGVJD... but never
+  // broadcast. Public RPC confirmed null. Resubmitting via public RPC
+  // usually lands the tx.
   const pollStart = Date.now();
   const POLL_BUDGET_MS = 2500;
+  const CROSSCHECK_AFTER_MS = 1200;  // first time we ask public RPC
   let status = null;
+  let crossChecked = false;
+  let resubmitted = false;
   while (Date.now() - pollStart < POLL_BUDGET_MS) {
-    const r = await connection.getSignatureStatuses([signature], { searchTransactionHistory: true });
+    // Use whichever connection has the freshest view.
+    const probeConn = resubmitted ? publicConnection : connection;
+    const r = await probeConn.getSignatureStatuses([signature], { searchTransactionHistory: true });
     status = r?.value?.[0];
     if (status) {
       if (status.err) {
@@ -218,6 +234,52 @@ async function submitSwap({ quoteResponse, label, chatId, route = 'jupiter', sid
       }
       if (status.confirmationStatus === 'processed' || status.confirmationStatus === 'confirmed' || status.confirmationStatus === 'finalized') {
         return { signature, simulated: false, landedIn: Date.now() - pollStart };
+      }
+    }
+    // v0.8.7.8: cross-check via public RPC if Helius still silent after CROSSCHECK_AFTER_MS
+    if (!crossChecked && !status && (Date.now() - pollStart) >= CROSSCHECK_AFTER_MS) {
+      crossChecked = true;
+      try {
+        const pubRes = await publicConnection.getSignatureStatuses([signature], { searchTransactionHistory: true });
+        const pubStatus = pubRes?.value?.[0];
+        if (pubStatus) {
+          if (pubStatus.err) {
+            throw new Error(`${label} tx failed on-chain (public RPC): ${JSON.stringify(pubStatus.err)}`);
+          }
+          if (pubStatus.confirmationStatus === 'processed' || pubStatus.confirmationStatus === 'confirmed' || pubStatus.confirmationStatus === 'finalized') {
+            console.log(`[executor] ${label} sig ${signature.slice(0,8)}... confirmed via public RPC after ${Date.now() - pollStart}ms (Helius was lagging)`);
+            return { signature, simulated: false, landedIn: Date.now() - pollStart };
+          }
+        }
+        // Both Helius AND public RPC still null after 1.2s — ghost sig.
+        // Try ONE resubmit via public RPC. The signed bytes are still
+        // valid; if Helius dropped the broadcast, public RPC will relay
+        // it to a different set of leaders.
+        if (!pubStatus && !resubmitted && raw) {
+          try {
+            const newSig = await publicConnection.sendRawTransaction(raw, {
+              skipPreflight: true,
+              maxRetries: 2,
+              preflightCommitment: 'processed',
+            });
+            resubmitted = true;
+            console.log(`[executor] ${label} resubmitted via public RPC (new sig ${newSig.slice(0,8)}...)`);
+            // The new submission may get a different sig. Keep polling the
+            // original sig (Solana dedupes — same tx = same sig).
+          } catch (resubErr) {
+            // Public RPC also rejected — likely the tx is genuinely
+            // undeliverable (bad blockhash, expired, etc.).
+            throw new Error(`${label} ghost sig detected AND public RPC resubmit failed: ${resubErr.message} (orig sig=${signature})`);
+          }
+        } else if (!pubStatus) {
+          throw new Error(`${label} tx NOT FOUND on public RPC after ${CROSSCHECK_AFTER_MS}ms — ghost sig from Helius (sig=${signature})`);
+        }
+      } catch (crossErr) {
+        // If the error is the ghost-sig abort we just threw, re-throw it.
+        if (crossErr.message?.includes('ghost sig') || crossErr.message?.includes('resubmit failed')) throw crossErr;
+        // Public RPC errored (rate limit, network) — don't abort, fall
+        // back to the normal polling + late-check path.
+        console.warn(`[executor] ${label} public RPC cross-check failed: ${crossErr.message}`);
       }
     }
     await new Promise(r => setTimeout(r, 50));
