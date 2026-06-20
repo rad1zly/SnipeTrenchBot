@@ -65,7 +65,7 @@ const CATALOG = [
   {
     key: 'pump_slippage_bps', type: 'number', category: 'trade',
     label: 'PUMP Slippage (bps)',
-    default: 1500,
+    default: 3000,    // v0.8.7.11: widened from 1500 for fast-moving curves
     min: 1,             // no upper bound
     parseUserInput: (t) => {
       const n = parseInt(t, 10);

@@ -561,10 +561,9 @@ export async function executeSignal(event) {
     }
   }
   // v0.8.6.7: pump.fun route needs wider slippage than Jupiter. Same logic
-  // as BUY: pass pump_slippage_bps (1500) so the sell floor protects against
-  // post-buy sandwich drops within 15%. Without this, bot would set
-  // min_sol_output very close to spot and reject 90% of sells when market
-  // moved 1% during the 1s hold window.
+  // as BUY: pass pump_slippage_bps (3000 = 30% default since v0.8.7.11) so
+  // the sell floor protects against post-buy sandwich drops. 30% gives
+  // headroom for fast-moving curves (dev dump, sandwich attack).
   const { quote: sellQuote, route: sellRoute } = await getSellQuote({ tokenRawAmount: tokensToSell, inputMint: mint, slippageBps: pumpSlippageBps });
   if (!sellQuote || sellQuote.error) {
     positionsDb.fail(positionId, `sell quote: ${sellQuote?.error || 'no quote'}`);
@@ -573,7 +572,19 @@ export async function executeSignal(event) {
     return;
   }
   const solExpected = Number(sellQuote.outAmount) / config.LAMPORTS_PER_SOL;
-  logStep('SELL_QUOTE_OK', { tokensIn: tokensToSell, solOut: solExpected });
+  // v0.8.7.11: skip SELL if price impact > 50%. Live failure 20 Jun 2026
+  // 11:22:48Z: dev's 2.6M token dump moved curve >15% in 1s, SELL failed
+  // with 6003 TooLittleSolReceived. With 30% slippage (v0.8.7.11 default)
+  // this should succeed. If still >50% impact, the market is too hostile —
+  // close position as FAILED, let user recover manually.
+  const priceImpactPct = Math.abs(parseFloat(sellQuote.priceImpactPct || 0));
+  if (priceImpactPct > 50) {
+    positionsDb.fail(positionId, `sell: price impact ${priceImpactPct.toFixed(2)}% exceeds 50% — skipping`);
+    logStep('SELL_SKIPPED_HIGH_IMPACT', { mint, priceImpactPct, solExpected });
+    notifier.tradeFailed({ stage: 'SELL', mint, error: `price impact ${priceImpactPct.toFixed(2)}% too high — manual recovery needed`, chatId, solAmount }).catch(() => {});
+    return;
+  }
+  logStep('SELL_QUOTE_OK', { tokensIn: tokensToSell, solOut: solExpected, priceImpactPct });
 
   let sellResult;
   try {
