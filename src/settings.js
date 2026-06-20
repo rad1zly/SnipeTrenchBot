@@ -65,7 +65,7 @@ const CATALOG = [
   {
     key: 'pump_slippage_bps', type: 'number', category: 'trade',
     label: 'PUMP Buy Slippage (bps)',
-    default: 1500,    // v0.8.7.13: reverted from 3000 — 15% is enough for buy. SELL needs wider (see pump_sell_slippage_bps).
+    default: 100,     // v0.8.7.14: tightened from 1500 (15%) → 100 (1%). User wants maxSolCost ≈ solAmount, not 1.15×.
     min: 1,             // no upper bound
     parseUserInput: (t) => {
       const n = parseInt(t, 10);

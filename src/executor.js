@@ -398,9 +398,16 @@ export async function executeSignal(event) {
   // Old code passed slippage_bps (5) to BOTH → 0.05% floor on pump.fun
   // trades → 6042 BuySlippageBelowMinTokensOut on every mayhem buy.
   // Live failure: 2026-06-19 16:07Z mint 4k3tYz...pump, sig 29o68pFW...
-  // v0.8.7.13: BUY uses pump_slippage_bps (15% default), SELL uses
-  // pump_sell_slippage_bps (30% default). BUY with 30% slippage caused
-  // 1.28–1.67× overspend on non-mayhem tokens.
+  // v0.8.7.13: BUY uses pump_slippage_bps, SELL uses pump_sell_slippage_bps.
+  // BUY with 30% slippage caused 1.28–1.67× overspend on non-mayhem tokens.
+  // v0.8.7.14: BUY slippage default 1500 → 100 (1%). User wants maxSolCost
+  // ≈ solAmount (not 1.15× or 1.30×). With 1% slippage + non-mayhem 1.0×
+  // fee mult: maxSolCost = 0.002 × 1.01 = 0.00202 SOL.
+  // Reference tx from another bot (5R2U8rFR...): BC received 0.001975 SOL
+  // for 0.002 SOL buy intent — confirms other bot uses maxSolCost ≈ 0.002.
+  // Trade-off: tighter slippage → BUY may fail (6042) if curve moves >1%
+  // adversely between quote and execute. Acceptable for copy-trade bot:
+  // failed BUY = no loss, overspend = lost SOL.
   const buySlippageBps = pumpSlippageBps;  // try pump.fun slippage first
   const { quote: buyQuote, route: buyRoute } = await getBuyQuote({ solAmount, outputMint: mint, slippageBps: buySlippageBps });
   if (!buyQuote || buyQuote.error) {
