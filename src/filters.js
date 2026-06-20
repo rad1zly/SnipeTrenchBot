@@ -197,20 +197,21 @@ async function checkMarketCap(mint) {
 // =============================================================================
 // token age check
 // =============================================================================
-// createdAt is in ms (from the TOKEN_CREATED event). Min/max are in minutes.
+// createdAt is in ms (from the TOKEN_CREATED event). Min/max are in seconds (v0.8.0).
+// Note: key name still has "_min" suffix for backward compat — but value is in seconds.
 // =============================================================================
 function checkTokenAge({ createdAt }) {
-  const minMin = settings.get('min_token_age_min');
-  const maxMin = settings.get('max_token_age_min');
+  const minSec = settings.get('min_token_age_min');
+  const maxSec = settings.get('max_token_age_min');
   if (!createdAt) return { passed: true, reason: 'no createdAt, skipping age check' };
-  const ageMin = (Date.now() - createdAt) / 60_000;
-  if (minMin !== null && ageMin < minMin) {
-    return { passed: false, reason: `token age ${ageMin.toFixed(1)}min < min ${minMin}min` };
+  const ageSec = (Date.now() - createdAt) / 1000;
+  if (minSec !== null && ageSec < minSec) {
+    return { passed: false, reason: `token age ${ageSec.toFixed(1)}s < min ${minSec}s` };
   }
-  if (maxMin !== null && ageMin > maxMin) {
-    return { passed: false, reason: `token age ${ageMin.toFixed(1)}min > max ${maxMin}min` };
+  if (maxSec !== null && ageSec > maxSec) {
+    return { passed: false, reason: `token age ${ageSec.toFixed(1)}s > max ${maxSec}s` };
   }
-  return { passed: true, reason: `token age ${ageMin.toFixed(1)}min within bounds` };
+  return { passed: true, reason: `token age ${ageSec.toFixed(1)}s within bounds` };
 }
 
 // =============================================================================
@@ -327,7 +328,7 @@ export async function passesFilters({ mint, dev, createdAt, programIds = [], sol
     checks.push({ name: 'mc', fn: () => checkMarketCap(mint) });
   }
   if (settings.get('min_token_age_min') !== null || settings.get('max_token_age_min') !== null) {
-    checks.push({ name: 'age', fn: checkTokenAge({ createdAt }) });
+    checks.push({ name: 'age', fn: () => checkTokenAge({ createdAt }) });
   }
   if (settings.get('exclude_internal') || settings.get('exclude_external')) {
     checks.push({ name: 'platform', fn: () => Promise.resolve(checkPlatformExclude({ programIds })) });

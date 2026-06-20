@@ -11,11 +11,25 @@
 // =============================================================================
 
 import config from './config.js';
-import { positionsDb, safetyDb } from './db.js';
+import { positionsDb, safetyDb, metaDb } from './db.js';
 import * as settings from './settings.js';
 
-// In-memory flags. Persisted to safety_log when changed.
-let manualPaused = process.env.START_PAUSED === 'true';
+// v0.8.7.4: pause state is PERSISTED to DB so it survives bot restarts.
+// Previously an in-memory `let manualPaused = ...` flag, which meant /pause
+// was lost on restart and bot would silently resume trading. User feedback
+// (20 Jun 2026): "jangan mereset settingan setiap user" — keep user-set
+// state across restarts.
+//
+// Read the persisted value at module load. Fall back to env var START_PAUSED
+// for fresh installs (default: false = trading active on first boot).
+function loadPauseState() {
+  const persisted = metaDb.get('paused');
+  if (persisted != null) {
+    return persisted === 'true' || persisted === '1';
+  }
+  return process.env.START_PAUSED === 'true';
+}
+let manualPaused = loadPauseState();
 let lastResetDate = null; // YYYY-MM-DD string of the day we last reset daily stats
 
 /**
@@ -139,14 +153,21 @@ export function guardTrade({ solAmount, mint = null }) {
 }
 
 /**
- * Pause / resume controls. These flip the in-memory flag, not a config var.
+ * Pause / resume controls. v0.8.7.4: state is persisted to `bot_meta.paused`
+ * so it survives bot restarts (previously in-memory only).
  */
 export function pause() {
   manualPaused = true;
+  // v0.8.7.4: persist to DB so state survives restart. Without this, a /pause
+  // command would be silently cleared by the next `systemctl restart` and
+  // bot would trade again — exactly the "settings reset on restart" pattern
+  // the user complained about.
+  metaDb.set('paused', 'true');
   safetyDb.log({ type: 'PAUSE', details: 'manual pause set via /pause' });
 }
 export function resume() {
   manualPaused = false;
+  metaDb.set('paused', 'false');
   safetyDb.log({ type: 'PAUSE', details: 'manual pause cleared via /resume' });
 }
 export function isPaused() {

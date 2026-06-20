@@ -76,8 +76,14 @@ function isTokenCreated(tx, wallet) {
 
 /**
  * Decide if a tx is a SELL by `wallet`.
- * Heuristic: wallet sends an SPL token (tokenAmount > 0 fromUserAccount = wallet)
- * AND receives native SOL in the same tx.
+ * Heuristic: wallet sends an SPL token (tokenAmount > 0, fromUserAccount = wallet)
+ * AND either receives native SOL directly OR has negative net SOL balance change.
+ *
+ * v0.8.0: GMGN / Jupiter / Pump.fun aggregators often route SOL through
+ * intermediate vaults, so nativeTransfers.toUserAccount !== wallet even for
+ * a confirmed sell. We accept either:
+ *   1) native SOL transferred directly to wallet, OR
+ *   2) wallet's net nativeBalanceChange < 0 (proof of SOL outflow to anywhere)
  */
 function isSell(tx, wallet) {
   const transfers = tx.tokenTransfers || [];
@@ -88,14 +94,112 @@ function isSell(tx, wallet) {
   if (!sentToken) return null;
   // v0.7.2: filter wSOL wraps/unwraps — not a real sell, just SOL wrapping.
   if (sentToken.mint === config.WSOL_MINT) return null;
-  const receivedSol = natives.find(
+
+  // v0.8.7.1 (20 Jun 2026): three SOL-receipt paths for SELL detection.
+  // Previously we required `nativeTransfers.toUserAccount === wallet`
+  // OR `nativeBalanceChange < 0` (the latter for GMGN aggregator route).
+  // But pump.fun V1 SELL txs can show:
+  //   - nativeTransfers only contains priority-fee outflows (no entry TO wallet)
+  //   - nativeBalanceChange is POSITIVE (the wallet received SOL from selling)
+  //   Example: 6DVEt... SELL 5qgWr...pump sig 5LGS4d8...
+  //     nativeTransfers: 2 entries (977 + 10000, both OUT from wallet)
+  //     accountData: nativeBalanceChange = +75574 (wallet GAINED SOL)
+  //   Old code returned null. New code accepts positive balance change
+  //   combined with token outflow as proof of a SELL.
+  const acct = (tx.accountData || []).find(a => a.account === wallet);
+  const netSol = acct ? (acct.nativeBalanceChange || 0) : 0;
+
+  // Try direct SOL receive first (most precise).
+  const directSol = natives.find(
     (t) => t.toUserAccount === wallet && t.amount > 0
   );
-  if (!receivedSol) return null;
+  if (directSol) {
+    return {
+      mint: sentToken.mint,
+      solReceived: directSol.amount / config.LAMPORTS_PER_SOL,
+      tokenSent: sentToken.tokenAmount,
+    };
+  }
+
+  // Path 2: nativeBalanceChange > 0 (pump.fun V1 direct, wallet gains SOL from sell).
+  // v0.8.7.1: lowered threshold to 50_000 lamports (~$0.007) for direct SELL.
+  // Why: pump.fun V1 SELL with 3,497 UI tokens yields only ~0.0001 SOL (=75,574
+  // lamports) of receive — below the old 500K threshold, so was missed.
+  // The token outflow is already strong signal of sell; small SOL amount is
+  // normal for early-token sells with thin liquidity.
+  if (netSol > 0 && netSol >= 50_000) {
+    return {
+      mint: sentToken.mint,
+      solReceived: netSol / config.LAMPORTS_PER_SOL,
+      tokenSent: sentToken.tokenAmount,
+    };
+  }
+
+  // Path 3: GMGN/Jupiter-routed sells. Wallet loses SOL during the tx because
+  // SOL is forwarded to an intermediate vault. Negative netSol indicates sell.
+  // Keep 500K threshold here because large negative delta could be the buy leg
+  // (router forwarded SOL out before receiving tokens back).
+  if (netSol < 0 && Math.abs(netSol) >= 500_000) {
+    return {
+      mint: sentToken.mint,
+      solReceived: 0,  // unknown; executor will quote via Jupiter
+      tokenSent: sentToken.tokenAmount,
+    };
+  }
+
+  return null;  // no significant SOL movement → not a sell
+}
+
+/**
+ * Decide if a tx is a BUY by `wallet`.
+ * Heuristic: wallet RECEIVES an SPL token (tokenAmount > 0, toUserAccount = wallet)
+ * AND either spent native SOL directly OR has negative net SOL balance change.
+ *
+ * v0.8.7 (20 Jun 2026): support GMGN / Jupiter / Pump.fun aggregator routes.
+ * Without this, bot only reacted to SELL_DETECTED (counter-trade strategy).
+ * User feedback: "teman ku trade pake gmgn gak ke track" — bot missed BUY
+ * signals from watched wallets when they used GMGN as frontend.
+ *
+ * Symmetric to isSell(): wallet receives token + wallet loses SOL.
+ */
+function isBuy(tx, wallet) {
+  const transfers = tx.tokenTransfers || [];
+  const natives = tx.nativeTransfers || [];
+  const receivedToken = transfers.find(
+    (t) => t.toUserAccount === wallet && t.tokenAmount > 0
+  );
+  if (!receivedToken) return null;
+  // Filter wSOL wraps/unwraps — not a real buy, just SOL wrapping.
+  if (receivedToken.mint === config.WSOL_MINT) return null;
+
+  // Try direct SOL spend first (most precise).
+  const directSol = natives.find(
+    (t) => t.fromUserAccount === wallet && t.amount > 0
+  );
+  if (directSol) {
+    return {
+      mint: receivedToken.mint,
+      solSpent: directSol.amount / config.LAMPORTS_PER_SOL,
+      tokenReceived: receivedToken.tokenAmount,
+    };
+  }
+
+  // Fallback: GMGN/Jupiter-routed buys. Use accountData's nativeBalanceChange.
+  // If the wallet lost SOL (any negative amount), it's a buy.
+  const acct = (tx.accountData || []).find(a => a.account === wallet);
+  const netSol = acct ? (acct.nativeBalanceChange || 0) : 0;
+  if (netSol >= 0) return null;  // no SOL loss → not a buy
+
+  // v0.8.7: minimum SOL loss threshold to filter out airdrops/transfers where
+  // SOL barely moves but tokens arrive. Without threshold, a 0.001 SOL change
+  // from rent reclaim would falsely trigger BUY. Threshold: ≥ 0.0005 SOL (500K
+  // lamports = $0.067) so legitimate buy intent is captured.
+  if (Math.abs(netSol) < 500_000) return null;
+
   return {
-    mint: sentToken.mint,
-    solReceived: receivedSol.amount / config.LAMPORTS_PER_SOL,
-    tokenSent: sentToken.tokenAmount,
+    mint: receivedToken.mint,
+    solSpent: 0,  // unknown; executor will use fixed_buy_sol
+    tokenReceived: receivedToken.tokenAmount,
   };
 }
 
@@ -126,6 +230,19 @@ function classifyTx(tx, wallet) {
       mint: sold.mint,
       solReceived: sold.solReceived,
       tokenSent: sold.tokenSent,
+      signature: sig,
+      timestamp: ts,
+    };
+  }
+  // Buy? v0.8.7 — detect GMGN/Jupiter/Pump.fun aggregator routes for BUY.
+  const bought = isBuy(tx, wallet);
+  if (bought) {
+    return {
+      type: 'BUY_DETECTED',
+      wallet,
+      mint: bought.mint,
+      solSpent: bought.solSpent,
+      tokenReceived: bought.tokenReceived,
       signature: sig,
       timestamp: ts,
     };
@@ -202,18 +319,19 @@ export class HeliusMonitor extends EventEmitter {
       seenSet.add(tx.signature);
       const event = classifyTx(tx, address);
       if (event) {
-        // v0.6.1: tag the event with the owning chat_id so notifier + executor
-        // can route to a single user (privacy in multi-user mode). If the
-        // wallet was added by multiple users, only the FIRST owner gets the
-        // signal — acceptable for v0.6.1; a fan-out mode can be added later.
-        const owner = walletsDb.get(address);
-        if (owner) event.chatId = owner.chat_id;
-        this.emit('event', event);
+        // v0.8.0: fan out to ALL owners of the wallet (was: only the first).
+        // Without fan-out, only the first owner of a shared watch wallet
+        // gets the signal — bad UX in multi-user mode.
+        const owners = walletsDb.listOwners(address);
+        for (const owner of owners) {
+          const ownerEvent = { ...event, chatId: owner.chat_id };
+          this.emit('event', ownerEvent);
+        }
         signalsDb.log({
           type: event.type,
           wallet: event.wallet,
           mint: event.mint,
-          data: event,
+          data: { ...event, ownerCount: owners.length },
         });
       }
       freshCount++;

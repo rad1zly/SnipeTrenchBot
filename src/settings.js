@@ -164,7 +164,8 @@ const CATALOG = [
     parseUserInput: (t) => /^(1|true|yes|on|y)$/i.test(t.trim()),
   },
   {
-    key: 'min_mc_usd', type: 'number', category: 'filters',
+    key: 'min_mc_usd', type: 'number', nullable: true,  // v0.8.0: '0'/'none' sets to null (disabled)
+    category: 'filters',
     label: 'Min MC (USD)',
     default: null,  // null = unlimited. User can type any positive number.
     min: 0,        // no upper bound — user can set "0.001" or "1000000000" if they want
@@ -177,7 +178,8 @@ const CATALOG = [
     },
   },
   {
-    key: 'max_mc_usd', type: 'number', category: 'filters',
+    key: 'max_mc_usd', type: 'number', nullable: true,  // v0.8.0: '0'/'none' sets to null (disabled)
+    category: 'filters',
     label: 'Max MC (USD)',
     default: null,
     min: 0,        // no upper bound
@@ -190,8 +192,9 @@ const CATALOG = [
     },
   },
   {
-    key: 'min_token_age_min', type: 'number', category: 'filters',
-    label: 'Min Token Age (min)',
+    key: 'min_token_age_min', type: 'number', nullable: true,  // v0.8.0: '0'/'none' sets to null (disabled)
+    category: 'filters',
+    label: 'Min Token Age (s)',  // v0.8.0: unit changed to seconds
     default: null,
     min: 0,        // no upper bound
     parseUserInput: (t) => {
@@ -203,8 +206,9 @@ const CATALOG = [
     },
   },
   {
-    key: 'max_token_age_min', type: 'number', category: 'filters',
-    label: 'Max Token Age (min)',
+    key: 'max_token_age_min', type: 'number', nullable: true,  // v0.8.0: '0'/'none' sets to null (disabled)
+    category: 'filters',
+    label: 'Max Token Age (s)',  // v0.8.0: unit changed to seconds
     default: null,
     min: 0,        // no upper bound
     parseUserInput: (t) => {
@@ -241,7 +245,8 @@ const CATALOG = [
 
   // ── Token ──────────────────────────────────────────────────────────────
   {
-    key: 'sol_spending_limit', type: 'number', category: 'token',
+    key: 'sol_spending_limit', type: 'number', nullable: true,  // v0.8.0: '0'/'none' sets to null (disabled)
+    category: 'token',
     label: 'SOL Spending Limit (daily)',
     default: null,
     min: 0,        // no upper bound — user can set "0.5" or "10000" if they want
@@ -451,6 +456,13 @@ export function formatValue(key) {
          'sol_spending_limit', 'buy_priority_fee_sol', 'buy_tip_sol'].includes(key)) {
       return 'Not Limited';
     }
+  }
+  // v0.8.0: token age displayed in seconds (with m:ss for >=60s)
+  if (setting.type === 'number' && (key === 'min_token_age_min' || key === 'max_token_age_min')) {
+    if (v < 60) return `${v}s`;
+    const m = Math.floor(v / 60);
+    const s = v % 60;
+    return s > 0 ? `${m}m ${s}s` : `${m}m`;
   }
   if (setting.type === 'number' && setting.key === 'slippage_bps') {
     return `${v} bps (${(v / 100).toFixed(1)}%)`;

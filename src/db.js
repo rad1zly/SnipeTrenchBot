@@ -307,6 +307,16 @@ export const walletsDb = {
       .prepare(`SELECT * FROM watched_wallets WHERE address = ? LIMIT 1`)
       .get(address);
   },
+  /**
+   * v0.8.0: list ALL owners of `address` (every user who added it).
+   * Used by the monitor/notifier to fan out signals to all watchers
+   * of the same wallet (was: only the first owner — privacy bug).
+   */
+  listOwners(address) {
+    return getDb()
+      .prepare(`SELECT * FROM watched_wallets WHERE address = ? ORDER BY added_at ASC`)
+      .all(address);
+  },
   touchAll() {
     return getDb()
       .prepare(`UPDATE watched_wallets SET last_checked = ?`)
