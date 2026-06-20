@@ -518,6 +518,16 @@ export async function executeSignal(event) {
   // 8,786,387,941 tokens. Bot then sold 5,891,200,819 leaving 2,895,187,122
   // (~2.9K) tokens stuck in the wallet as dust. Fetching the real balance
   // after BUY confirms avoids this completely.
+  //
+  // v0.8.7.9 also: NO ATA close. The bot does NOT close the user's ATA
+  // after SELL — that's intentional. Speed matters more than rent recovery
+  // (0.002 SOL). Closing the ATA adds an extra instruction which:
+  //   1. Adds ~2k compute units (~5-10ms in practice)
+  //   2. Can fail with InvalidAccountData on Token-2022 mints if the
+  //      close_authority doesn't match
+  //   3. May trigger unnecessary wallet UX (rent recovery tx in wallet UI)
+  // If the user wants to clean up ATAs later, they can do it manually via
+  // Phantom / Solflare. The bot never adds a close-ATA ix.
   let tokensToSell = tokensExpected;
   if (!config.DRY_RUN) {
     try {
