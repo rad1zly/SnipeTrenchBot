@@ -26,10 +26,10 @@
 import config, { validation } from './src/config.js';
 import { HeliusMonitor } from './src/heliusMonitor.js';
 import { HeliusWebSocketMonitor } from './src/heliusWebSocket.js';
-import { initExecutor, executeSignal, status as executorStatus } from './src/executor.js';
+import { initExecutor, executeSignal } from './src/executor.js';
 import { startTelegramBot, stopTelegramBot } from './src/telegramBot.js';
 import notifier from './src/notifier.js';
-import { getDb, walletsDb, subscribersDb } from './src/db.js';
+import { getDb, positionsDb } from './src/db.js';
 // v0.7.0: per-user trading wallets — walletManager is no longer used at
 // boot. Each subscriber sets their own via /start → 🔑 Wallet.
 
@@ -116,23 +116,41 @@ monitor.on('poll', (info) => {
 
 monitor.start();
 
-// 6. Send a startup notification (broadcast — system event).
-// v0.7.0: no longer broadcast a "Trading wallet" line. Each subscriber has
-// their own wallet and other subscribers must never see its address. The
-// bot-started message only announces the mode + subscriber count.
-setTimeout(() => {
-  notifier
-    .info(
-      [
-        '🟢 Bot started',
-        `Mode: ${config.DRY_RUN ? 'DRY_RUN' : 'LIVE'}`,
-        `Subscribers: ${subscribersDb.count()}`,
-        `Jupiter: ${config.JUPITER_API_URL}`,
-        'Tip: /start → 🔑 Wallet to set your own trading wallet, /start → 🎯 Copy Trade to tune filters.',
-      ].join('\n')
-    )
-    .catch((e) => console.error('[index] startup notify failed:', e.message));
-}, 1500);
+// v0.8.7.4: sweep stale OPEN positions on startup.
+// Positions in the DB with status=OPEN that are older than 10 minutes mean
+// the bot bought but never sold before a restart / crash. Live failure:
+// 2026-06-19 17:51:57 — bot replayed 7 events, opened 7 positions, then
+// got restarted mid-trade before the sell leg could complete for any of
+// them. Result: 1 position stuck in OPEN state (id=84, mint DNn3r78UrRVt)
+// for hours, polluting /positions output and giving a false sense that the
+// bot still holds those tokens. User feedback: "kalau bot restart jgn
+// dibikin auto retry ... kalo udh kelewat eventnya skip aja" — implies
+// we should NOT try to recover stale positions automatically either.
+// We just mark them FAILED with a clear reason so /positions reflects the
+// truth. Subscribers can see what happened via the fail_reason column.
+const STALE_THRESHOLD_MS = 10 * 60 * 1000; // 10 minutes
+try {
+  const now = Date.now();
+  const stale = positionsDb.openAll().filter((p) => now - p.created_at > STALE_THRESHOLD_MS);
+  if (stale.length > 0) {
+    console.log(`[index] sweeping ${stale.length} stale OPEN position(s) on startup`);
+    for (const p of stale) {
+      positionsDb.fail(p.id, `STALE_ON_RESTART: position opened at ${new Date(p.created_at).toISOString()}, bot restarted before sell leg completed`);
+      console.log(`[index]   marked stale: #${p.id} mint=${p.mint.slice(0,12)}... entry=${p.entry_sol} SOL`);
+    }
+  }
+} catch (e) {
+  console.error('[index] stale sweep failed:', e.message);
+}
+
+// 6. v0.8.7.4: REMOVED the startup broadcast ("🟢 Bot started...").
+//   Reason: bot restart triggers a flurry of replayed events AND a startup
+//   notification goes to every subscriber — combined, that's pure noise.
+//   User feedback (20 Jun 2026): "kalau bot restart jangan dikasi notif
+//   apa-apa karna berisik". Subscribers should check /status themselves
+//   if they want confirmation the bot is up. We still log to stdout so
+//   ops can see the boot completed.
+// setTimeout(() => { notifier.info(...) }, 1500);
 
 // 7. Graceful shutdown.
 function shutdown(signal) {

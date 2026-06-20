@@ -248,13 +248,28 @@ export class HeliusWebSocketMonitor extends EventEmitter {
       }
     }
     this.emit('status', `subscribed to ${this._subscriptions.size} wallet(s)`);
-    // v0.8.7.3: replay recent txs on startup to catch signals that fired
-    // while bot was offline (restart, deploy, network blip). Without this,
-    // any signal that happened during the downtime window is missed forever.
-    // Live failure: 2026-06-19 16:29-16:30 UTC — bot was restarting (v0.8.6.8
-    // deploy at 16:30:34) and missed rYn57 BUY `5F9GJw2t...` + SELL
-    // `4WFFkQ...` for `5GF4wYym...pump`.
-    this._replayRecentTxs().catch((err) => this.emit('error', err));
+    // v0.8.7.3 replay DISABLED in v0.8.7.4.
+    // On bot restart, the bot must NOT auto-buy events that fired while
+    // it was offline. Replay fired a flurry of buys at 2026-06-19 17:51:57
+    // (commit db04b7e) — 7 different mints got entered simultaneously, with
+    // no respect for pause state, no sell leg completion, and noisy Telegram
+    // notifications for each replayed event. User feedback (20 Jun 2026):
+    //   "kalo udh kelewat eventnya skip aja"  → skip past events entirely.
+    // The WSS `logsSubscribe` only streams events AFTER subscription, so any
+    // signal from the downtime window is naturally missed — and that's the
+    // desired behavior now. If a future use case needs selective replay
+    // (e.g. only events from the last 30 seconds during a WS blip), gate it
+    // on a user-controlled env var like `REPLAY_MAX_AGE_S=30`.
+    //
+    // v0.8.7.4: replay-on-startup is OFF by default. Use `REPLAY_MAX_AGE_S=N`
+    // to opt back in. -1 or unset = disabled (skip past events entirely).
+    const replayMaxAgeS = parseInt(process.env.REPLAY_MAX_AGE_S ?? '-1', 10);
+    if (replayMaxAgeS >= 0) {
+      this._replayMaxAgeMs = replayMaxAgeS * 1000;
+      this._replayRecentTxs().catch((err) => this.emit('error', err));
+    } else {
+      this.emit('status', 'replay disabled (set REPLAY_MAX_AGE_S=30 to enable with 30s window)');
+    }
   }
 
   /**
@@ -265,13 +280,27 @@ export class HeliusWebSocketMonitor extends EventEmitter {
    */
   async _replayRecentTxs() {
     const addresses = walletsDb.listAll();
+    const maxAgeMs = this._replayMaxAgeMs ?? 0;  // 0 = no age filter
     for (const address of addresses) {
       try {
         const url = `${HELIUS_HTTP_BASE}/v0/addresses/${address}/transactions?api-key=${config.HELIUS_API_KEY}&limit=${REPLAY_PER_WALLET}`;
         const res = await axios.get(url, { timeout: FETCH_TIMEOUT_MS });
         const txs = res.data || [];
-        this.emit('status', `replay: ${address.slice(0,8)}... ${txs.length} recent txs`);
+        this.emit('status', `replay: ${address.slice(0,8)}... ${txs.length} recent txs (maxAge=${maxAgeMs}ms)`);
         for (const tx of txs) {
+          // v0.8.7.4: age gate — skip events older than maxAgeMs. If maxAgeMs
+          // is 0 (REPLAY_MAX_AGE_S=0), no age filter is applied and EVERY event
+          // is replayed (v0.8.7.3 behavior). For the default opt-in case
+          // (REPLAY_MAX_AGE_S=30), only events from the last 30s are replayed.
+          // User feedback (20 Jun 2026): "kalo udh kelewat eventnya skip aja"
+          // → past events (older than the restart gap) should NOT trigger trades.
+          if (maxAgeMs > 0 && tx.timestamp) {
+            const ageMs = Date.now() - (tx.timestamp * 1000);
+            if (ageMs > maxAgeMs) {
+              console.log(`[monitor] (replay) skip old tx ${tx.signature.slice(0,8)}... (age=${Math.round(ageMs/1000)}s > ${maxAgeMs/1000}s)`);
+              continue;
+            }
+          }
           // Dedup via seen set
           if (seen(address).has(tx.signature)) continue;
           seen(address).add(tx.signature);
