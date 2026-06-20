@@ -18,7 +18,8 @@
 // submitted. The user sees exactly what would have happened.
 // =============================================================================
 
-import { Keypair, Connection, VersionedTransaction } from '@solana/web3.js';
+import { Keypair, Connection, VersionedTransaction, PublicKey } from '@solana/web3.js';
+import { getAssociatedTokenAddressSync, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from '@solana/spl-token';
 import config from './config.js';
 import { guardTrade } from './safety.js';
 import { positionsDb, signalsDb, walletsDb } from './db.js';
@@ -508,11 +509,47 @@ export async function executeSignal(event) {
   }
 
   // ----- SELL -----
-  // In dry-run, pretend we have the expected tokens. In live, we don't fetch
-  // the balance here to save an RPC call — we use the quote's outAmount as the
-  // sell amount. (For SPL tokens with decimals, the quote uses raw units too,
-  // so this is consistent.)
-  const tokensToSell = tokensExpected;
+  // v0.8.7.9: use ACTUAL on-chain token balance, not the BUY quote's
+  // tokensExpected. pump.fun bonding-curve buys move the spot price up as
+  // you buy, so the actual tokens received on-chain is HIGHER than the
+  // quote (which is computed at the spot price before your tx lands).
+  // Live failure 20 Jun 2026 18:13:13Z: bot bought mint 3RQiJ4hA... for
+  // 0.002 SOL, quote said 5,891,200,819 tokens but on-chain transfer was
+  // 8,786,387,941 tokens. Bot then sold 5,891,200,819 leaving 2,895,187,122
+  // (~2.9K) tokens stuck in the wallet as dust. Fetching the real balance
+  // after BUY confirms avoids this completely.
+  let tokensToSell = tokensExpected;
+  if (!config.DRY_RUN) {
+    try {
+      const kp = getKeypairFor(chatId);
+      // pump.fun may use Token-2022 OR Token program depending on mint age
+      // and V1/V2 program. Try both ATAs to find the right one.
+      let bal = null;
+      for (const programId of [TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID]) {
+        try {
+          const ata = getAssociatedTokenAddressSync(new PublicKey(mint), kp.publicKey, false, programId);
+          const r = await connection.getTokenAccountBalance(ata).catch(() => null);
+          if (r && r.value && Number(r.value.amount) > 0) {
+            bal = Number(r.value.amount);
+            break;
+          }
+        } catch (_) { /* try next program */ }
+      }
+      if (bal !== null && bal !== tokensExpected) {
+        logStep('SELL_BALANCE_CORRECTION', {
+          mint,
+          quotedTokens: tokensExpected,
+          actualTokens: bal,
+          deltaPct: (((bal - tokensExpected) / tokensExpected) * 100).toFixed(2),
+        });
+        tokensToSell = bal;
+      }
+    } catch (balErr) {
+      // Balance fetch failed — fall through to quoted amount. The bot will
+      // still sell what it quoted, just may leave dust.
+      console.warn(`[executor] SELL_BALANCE_FETCH_FAILED for ${mint.slice(0,12)}...: ${balErr.message}`);
+    }
+  }
   // v0.8.6.7: pump.fun route needs wider slippage than Jupiter. Same logic
   // as BUY: pass pump_slippage_bps (1500) so the sell floor protects against
   // post-buy sandwich drops within 15%. Without this, bot would set
