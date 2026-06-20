@@ -308,9 +308,26 @@ export async function getBuyQuote({ solAmount, outputMint, slippageBps = 500 }) 
   // user short of additional ~300K for in-CPI small transfers.
   // Live failure: 2026-06-19 16:23Z mint EAV1y7w...pump, sig 3Ds9tNJ...
   //   "Transfer: insufficient lamports 11059106, need 11358023" → 0x1
-  const FEE_MULTIPLIER = 13000n; // 1.30× — covers ~13% of solLamports in fees + rent + slippage
+  //
+  // v0.8.7.12: BUG FIX — the 1.30× multiplier applies to MAYHEM tokens only.
+  // For non-mayhem tokens (regular pump.fun V2), there's no creator fee on buy
+  // (only on sell), so the 1.30× multiplier was massive overkill — it made
+  // the bot send 0.00338 SOL to bonding curve for a 0.002 SOL buy request.
+  // Live failure: 2026-06-20 11:43:21Z mint 3RQiJ4hA...pump, sig 4rkTRZDT...
+  //   User asked for 0.002 SOL buy → bot sent 0.003338 SOL to bonding curve
+  //   (1.67× intended). Cause: maxSolCost = solLamports * 1.30 * 1.30 = 1.69×.
+  //   Pump.fun bonding curve math: for tokensOut=5.86M (the quote) the user
+  //   only needs to spend 0.002 SOL — but the on-chain BuyExactSolIn computes
+  //   tokens_out from CURRENT curve state (which moved favorably by execute
+  //   time), so it consumed maxSolCost. Net effect: user overpaid 0.0013 SOL.
+  // For non-mayhem: maxSolCost = solLamports * (1 + slippageBps/10000) only.
+  //   No fee buffer because protocol fee (1%) is deducted from solLamports
+  //   internally, and ATA rent is paid SEPARATELY (not via maxSolCost).
+  // For mayhem: maxSolCost = solLamports * 1.30 * (1 + slippageBps/10000)
+  //   because mayhem charges creator_fee + protocol_fee + rent in one bundle.
   const slippageNumerator = BigInt(10000 + slippageBps);
-  const maxSolCost = (solLamports * slippageNumerator * FEE_MULTIPLIER) / (10000n * 10000n);
+  const feeMultiplier = state.isMayhemMode ? 13000n : 10000n;  // v0.8.7.12: 1.0× for non-mayhem, 1.30× for mayhem
+  const maxSolCost = (solLamports * slippageNumerator * feeMultiplier) / (10000n * 10000n);
   // v0.8.6.6: min_tokens_out = tokensOut * (10000 - slippageBps) / 10000
   // BuyExactSolIn on-chain REQUIRES min_tokens_out as slippage floor.
   // Old code: otherAmountThreshold = tokensOut (no slippage applied) →
