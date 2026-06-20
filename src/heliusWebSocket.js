@@ -76,6 +76,10 @@ export class HeliusWebSocketMonitor extends EventEmitter {
       clearInterval(this._refreshTimer);
       this._refreshTimer = null;
     }
+    if (this._pingTimer) {
+      clearInterval(this._pingTimer);
+      this._pingTimer = null;
+    }
     if (this._ws) {
       try { this._ws.close(); } catch (e) { /* ignore */ }
       this._ws = null;
@@ -98,10 +102,26 @@ export class HeliusWebSocketMonitor extends EventEmitter {
       this.emit('status', 'connected');
       // Re-subscribe to all known wallets
       this._resubscribeAll().catch((err) => this.emit('error', err));
-      // v0.8.0: start periodic wallet-list refresh so users can add wallets
-      // via Telegram /start → 🔑 Wallet without restarting the bot.
+      // v0.8.0: periodic wallet-list refresh.
       if (!this._refreshTimer) {
         this._refreshTimer = setInterval(() => this._refreshWalletList().catch(() => {}), 30_000);
+      }
+      // v0.8.7.6: keep-alive ping every 30s. The `ws` library does NOT
+      // auto-ping; without client pings, Helius closes idle connections
+      // every ~60s with code 1001, losing notifications during the gap.
+      // Live failure (20 Jun 2026 10:11:51Z): SELL_DETECTED for mint
+      // 2L5aojM2AH on wallet 4WNTHXRM happened 4s after BUY_DETECTED at
+      // 10:11:49 UTC. The bot reconnected between the two events and
+      // missed the SELL entirely (replay is disabled per user request
+      // "kalo udh kelewat eventnya skip aja"). The `ws` library
+      // auto-handles incoming pong frames; we just need to send pings.
+      if (!this._pingTimer) {
+        this._pingTimer = setInterval(() => {
+          if (this._ready && this._ws && this._ws.readyState === 1 /* OPEN */) {
+            try { this._ws.ping(); }
+            catch (e) { /* swallow; close handler will reconnect */ }
+          }
+        }, 30_000);
       }
     });
 
@@ -192,7 +212,13 @@ export class HeliusWebSocketMonitor extends EventEmitter {
     this._pendingFetches.add(signature);
     try {
       const tx = await fetchTx(signature);
-      if (!tx) return;
+      if (!tx) {
+        // v0.8.7.6: log dropped signals so we can detect recurring gaps.
+        // Previously this was silent — bot appeared healthy even when
+        // signals were being lost.
+        console.log(`[monitor] fetchTx returned null after retries for ${signature.slice(0,16)}... (dropped)`);
+        return;
+      }
       // For each watched wallet mentioned in this tx, check + emit
       const addresses = walletsDb.listAll();
       for (const address of addresses) {
@@ -375,15 +401,33 @@ export class HeliusWebSocketMonitor extends EventEmitter {
 // Tx fetch + classification (reused from heliusMonitor.js pattern)
 // -----------------------------------------------------------------------------
 
-async function fetchTx(signature) {
+// v0.8.7.6: fetchTx now retries up to 3 times on empty response. Helius's
+// enhanced per-sig indexer occasionally returns [] for very recent pump.fun
+// txs (indexing lag < 1s after the WSS notification fires). Without retries,
+// the bot silently drops the signal. Live failure (20 Jun 2026 10:11:51Z):
+// SELL_DETECTED on 2L5aojM2AH was lost because fetchTx returned null right
+// after the WSS notification. Retrying 3x with 300ms backoff catches most
+// transient indexing gaps without meaningfully impacting overall latency
+// (worst case: 0+300+600 = 900ms extra before classifying).
+async function fetchTx(signature, attempt = 1) {
   try {
     const res = await axios.post(
       `${HELIUS_HTTP_BASE}/v0/transactions/?api-key=${config.HELIUS_API_KEY}`,
       { transactions: [signature] },
       { timeout: FETCH_TIMEOUT_MS }
     );
-    return res.data?.[0] || null;
+    const tx = res.data?.[0] || null;
+    if (tx) return tx;
+    if (attempt < 3) {
+      await new Promise((r) => setTimeout(r, 300 * attempt));
+      return fetchTx(signature, attempt + 1);
+    }
+    return null;
   } catch (err) {
+    if (attempt < 3 && /5\d\d|429|ETIMEDOUT|ECONNRESET|fetch failed|network/i.test(err.message || '')) {
+      await new Promise((r) => setTimeout(r, 300 * attempt));
+      return fetchTx(signature, attempt + 1);
+    }
     throw new Error(`fetchTx ${signature} failed: ${err.message}`);
   }
 }
