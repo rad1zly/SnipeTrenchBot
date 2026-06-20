@@ -26,6 +26,7 @@ import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 const pumpSdk = require('@pump-fun/pump-sdk');
 import config from './config.js';
+import * as settings from './settings.js';  // v0.8.7.16: per-user priority fee
 
 // Pump.fun program constants (from on-chain IDL)
 export const PUMP_FUN_PROGRAM_ID = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
@@ -575,7 +576,7 @@ async function buildSellInstruction({ mint, user, tokenAmount, minSolOutput, cre
  * @param {string|PublicKey} args.userPublicKey
  * @param {string} args.side  - 'buy' or 'sell'
  */
-export async function buildSwapTransaction({ quoteResponse, userPublicKey, side }) {
+export async function buildSwapTransaction({ quoteResponse, userPublicKey, side, chatId = null }) {
   const conn = getConnection();
   // Get a fresh blockhash (processed commitment for speed)
   const { blockhash } = await conn.getLatestBlockhash('processed');
@@ -639,14 +640,41 @@ export async function buildSwapTransaction({ quoteResponse, userPublicKey, side 
   // create_associated_token_account instruction in the same way. For BUY we
   // need to prepend createATA, but for SELL the ATA is guaranteed to exist.
   // Skip the pre-ix for SELL.
-  // ComputeBudget: set high priority
-  const computePriceIx = ComputeBudgetProgram.setComputeUnitPrice({
-    microLamports: 1_000_000,  // 1M micro-lamports = 0.001 SOL base price
-  });
+  // ComputeBudget: priority fee from per-user setting.
+  // v0.8.7.16 (CRITICAL FIX): user reported Solscan showing 0.00025 SOL
+  // priority fee while their `buy_priority_fee_sol` was set to 0.00001.
+  // Root cause: this code path was hardcoded to `microLamports: 1_000_000`
+  // which, combined with `units: 250_000`, yields a 0.00025 SOL fee
+  // regardless of the user setting. The Jupiter route already honors
+  // `buy_priority_fee_sol` (jupiterMetis.js), but the pump.fun direct
+  // route silently ignored it.
+  //
+  // Conversion: priority_fee_sol = microLamports × CU / 1e6
+  //   → microLamports = priority_fee_sol × 1e6 / CU
+  // Default CU = 250_000. We pin the CU for the math to be exact.
+  // Fall back to 0 (no priority) if no setting is provided.
+  const COMPUTE_UNITS = 250_000;
+  const pfSolLamports = (() => {
+    if (chatId == null) return 0;
+    try {
+      const v = settings.get('buy_priority_fee_sol', chatId);
+      return Math.floor(Number(v) * 1e9);
+    } catch {
+      return 0;
+    }
+  })();
+  // microLamports must be > 0 to set the ix; if 0, skip the ix entirely
+  // (no ComputeBudget instruction = no priority fee at all).
   const computeLimitIx = ComputeBudgetProgram.setComputeUnitLimit({
-    units: 250_000,  // plenty for 1 swap
+    units: COMPUTE_UNITS,
   });
-  const instructions = [computePriceIx, computeLimitIx];
+  const instructions = [computeLimitIx];
+  if (pfSolLamports > 0) {
+    // microLamports = lamports × 1e6 / CU
+    const microLamports = Math.max(1, Math.floor((pfSolLamports * 1_000_000) / COMPUTE_UNITS));
+    const computePriceIx = ComputeBudgetProgram.setComputeUnitPrice({ microLamports });
+    instructions.push(computePriceIx);
+  }
   if (side === 'buy') {
     // v0.8.4: pre-create the user's base token ATA. The V2 program expects
     // `associated_base_user` to be ALREADY INITIALIZED before the buy runs.

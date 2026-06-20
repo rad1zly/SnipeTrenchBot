@@ -78,7 +78,9 @@ export async function getSellQuote({ tokenRawAmount, inputMint, slippageBps = 50
  */
 export async function buildSwapTransaction({ quoteResponse, userPublicKey, route, side, chatId = null }) {
   if (route === 'pumpfun') {
-    return pumpfun.buildSwapTransaction({ quoteResponse, userPublicKey, side });
+    // v0.8.7.16: pass chatId so pump.fun route honors per-user
+    // buy_priority_fee_sol. Previously hardcoded to 0.00025 SOL.
+    return pumpfun.buildSwapTransaction({ quoteResponse, userPublicKey, side, chatId });
   }
   return jupiter.buildSwapTransaction({ quoteResponse, userPublicKey, chatId });
 }
