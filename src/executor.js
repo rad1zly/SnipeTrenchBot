@@ -376,6 +376,7 @@ export async function executeSignal(event) {
   const solAmount = settings.get('fixed_buy_sol');
   const slippageBps = settings.get('slippage_bps');
   const pumpSlippageBps = settings.get('pump_slippage_bps');
+  const pumpSellSlippageBps = settings.get('pump_sell_slippage_bps');  // v0.8.7.13: separate from buy
   const holdMs = settings.get('hold_ms');
   const autoSell = settings.get('auto_sell');
   const autoRetry = settings.get('auto_retry');
@@ -392,10 +393,14 @@ export async function executeSignal(event) {
   // tokens) need wider tolerance than Jupiter — Jupiter aggregates many LPs,
   // but pump.fun bonding curve is single-source with high sandwich exposure.
   //   - Jupiter route: use slippage_bps (default 5 bps = 0.05%, tight)
-  //   - pump.fun route: use pump_slippage_bps (default 1500 bps = 15%, wide)
+  //   - pump.fun BUY: use pump_slippage_bps (default 1500 bps = 15%, wide)
+  //   - pump.fun SELL: use pump_sell_slippage_bps (default 3000 bps = 30%, very wide)
   // Old code passed slippage_bps (5) to BOTH → 0.05% floor on pump.fun
   // trades → 6042 BuySlippageBelowMinTokensOut on every mayhem buy.
   // Live failure: 2026-06-19 16:07Z mint 4k3tYz...pump, sig 29o68pFW...
+  // v0.8.7.13: BUY uses pump_slippage_bps (15% default), SELL uses
+  // pump_sell_slippage_bps (30% default). BUY with 30% slippage caused
+  // 1.28–1.67× overspend on non-mayhem tokens.
   const buySlippageBps = pumpSlippageBps;  // try pump.fun slippage first
   const { quote: buyQuote, route: buyRoute } = await getBuyQuote({ solAmount, outputMint: mint, slippageBps: buySlippageBps });
   if (!buyQuote || buyQuote.error) {
@@ -561,10 +566,20 @@ export async function executeSignal(event) {
     }
   }
   // v0.8.6.7: pump.fun route needs wider slippage than Jupiter. Same logic
-  // as BUY: pass pump_slippage_bps (3000 = 30% default since v0.8.7.11) so
-  // the sell floor protects against post-buy sandwich drops. 30% gives
+  // as BUY: pass pump_sell_slippage_bps (3000 = 30% default since v0.8.7.11)
+  // so the sell floor protects against post-buy sandwich drops. 30% gives
   // headroom for fast-moving curves (dev dump, sandwich attack).
-  const { quote: sellQuote, route: sellRoute } = await getSellQuote({ tokenRawAmount: tokensToSell, inputMint: mint, slippageBps: pumpSlippageBps });
+  // v0.8.7.13: separated from pump_slippage_bps (used by BUY). SELL needs
+  // wider slippage than BUY because:
+  //   - BUY: user knows the price they're paying; if curve moves adversely,
+  //     user pays more. We want tight slippage to fail fast.
+  //   - SELL: user is exiting; any price is OK. Curve moving adversely is
+  //     expected after a 1s hold. Wide slippage ensures the SELL lands.
+  // Live failure: 2026-06-20 12:52:02Z, mint 3RQiJ4hA..., sig 2Rne662Y...
+  //   30% BUY slippage caused 0.002567 SOL spend for 0.002 SOL intent (1.28×).
+  //   With 15% BUY slippage + non-mayhem 1.0× fee mult, max spend = 0.0023 SOL
+  //   — much closer to intent.
+  const { quote: sellQuote, route: sellRoute } = await getSellQuote({ tokenRawAmount: tokensToSell, inputMint: mint, slippageBps: pumpSellSlippageBps });
   if (!sellQuote || sellQuote.error) {
     positionsDb.fail(positionId, `sell quote: ${sellQuote?.error || 'no quote'}`);
     logStep('SELL_QUOTE_FAILED', { error: sellQuote?.error });

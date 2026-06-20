@@ -64,9 +64,20 @@ const CATALOG = [
   },
   {
     key: 'pump_slippage_bps', type: 'number', category: 'trade',
-    label: 'PUMP Slippage (bps)',
-    default: 3000,    // v0.8.7.11: widened from 1500 for fast-moving curves
+    label: 'PUMP Buy Slippage (bps)',
+    default: 1500,    // v0.8.7.13: reverted from 3000 — 15% is enough for buy. SELL needs wider (see pump_sell_slippage_bps).
     min: 1,             // no upper bound
+    parseUserInput: (t) => {
+      const n = parseInt(t, 10);
+      if (Number.isNaN(n) || n < 1) return null;
+      return n;
+    },
+  },
+  {
+    key: 'pump_sell_slippage_bps', type: 'number', category: 'trade',
+    label: 'PUMP Sell Slippage (bps)',
+    default: 3000,    // v0.8.7.11: widened from 1500 for fast-moving SELLs (dev dump, sandwich)
+    min: 1,
     parseUserInput: (t) => {
       const n = parseInt(t, 10);
       if (Number.isNaN(n) || n < 1) return null;
