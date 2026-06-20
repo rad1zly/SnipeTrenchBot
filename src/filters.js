@@ -153,7 +153,7 @@ async function checkUnburned(mint) {
 // at a given moment). If either Jupiter call fails we PASS — same pattern
 // as every other filter: a transient API hiccup must not block trades.
 // =============================================================================
-async function checkMarketCap(mint) {
+async function checkMarketCap(mint, chatId) {
   return cached(mint, async () => {
     try {
       // Get supply from mint account
@@ -179,8 +179,8 @@ async function checkMarketCap(mint) {
         return { passed: true, reason: `MC check skipped: SOL price unavailable (${priceErr.message})` };
       }
       const mcUsd = mcSol * solPriceUsd;
-      const minMc = settings.get('min_mc_usd');
-      const maxMc = settings.get('max_mc_usd');
+      const minMc = settings.get('min_mc_usd', chatId);
+      const maxMc = settings.get('max_mc_usd', chatId);
       if (minMc !== null && mcUsd < minMc) {
         return { passed: false, reason: `MC $${mcUsd.toFixed(2)} < min $${minMc}` };
       }
@@ -200,9 +200,9 @@ async function checkMarketCap(mint) {
 // createdAt is in ms (from the TOKEN_CREATED event). Min/max are in seconds (v0.8.0).
 // Note: key name still has "_min" suffix for backward compat — but value is in seconds.
 // =============================================================================
-function checkTokenAge({ createdAt }) {
-  const minSec = settings.get('min_token_age_min');
-  const maxSec = settings.get('max_token_age_min');
+function checkTokenAge({ createdAt }, chatId) {
+  const minSec = settings.get('min_token_age_min', chatId);
+  const maxSec = settings.get('max_token_age_min', chatId);
   if (!createdAt) return { passed: true, reason: 'no createdAt, skipping age check' };
   const ageSec = (Date.now() - createdAt) / 1000;
   if (minSec !== null && ageSec < minSec) {
@@ -222,9 +222,9 @@ function checkTokenAge({ createdAt }) {
 // a hint from the executor — pass `event.programIds` if available. Otherwise
 // the filter is a no-op.
 // =============================================================================
-function checkPlatformExclude({ programIds = [] }) {
-  const excludeInternal = settings.get('exclude_internal');
-  const excludeExternal = settings.get('exclude_external');
+function checkPlatformExclude({ programIds = [] }, chatId) {
+  const excludeInternal = settings.get('exclude_internal', chatId);
+  const excludeExternal = settings.get('exclude_external', chatId);
   if (programIds.length === 0) {
     return { passed: true, reason: 'no programIds in event, skipping platform check' };
   }
@@ -260,11 +260,11 @@ function checkPlatformExclude({ programIds = [] }) {
 // opposite intent ("only copy small sells, not full dumps"), but the current
 // `min_sell_ratio` is the more common defensive filter.
 // =============================================================================
-async function checkSellRatio({ dev, mint, soldAmount }) {
+async function checkSellRatio({ dev, mint, soldAmount }, chatId) {
   if (!dev || !mint || !soldAmount || soldAmount <= 0) {
     return { passed: true, reason: 'sell ratio skipped: missing dev/mint/soldAmount' };
   }
-  const minRatio = settings.get('min_sell_ratio');
+  const minRatio = settings.get('min_sell_ratio', chatId);
   if (minRatio === null || minRatio === undefined) {
     return { passed: true, reason: 'sell ratio filter off' };
   }
@@ -320,23 +320,28 @@ async function checkSellRatio({ dev, mint, soldAmount }) {
 // =============================================================================
 // master entry: returns { passed, reason }
 // =============================================================================
-export async function passesFilters({ mint, dev, createdAt, programIds = [], soldAmount = null }) {
+/**
+ * v0.8.7.15: chatId is REQUIRED. Each subscriber has their own filter
+ * settings — user A's "unrenounced_only=true" doesn't apply to user B.
+ */
+export async function passesFilters({ chatId, mint, dev, createdAt, programIds = [], soldAmount = null }) {
+  if (chatId == null) throw new Error('passesFilters: chatId is required (per-user isolation since v0.8.7.15)');
   const checks = [];
-  if (settings.get('unrenounced_only')) checks.push({ name: 'unrenounced', fn: () => checkUnrenounced(mint) });
-  if (settings.get('unburned_only')) checks.push({ name: 'unburned', fn: () => checkUnburned(mint) });
-  if (settings.get('min_mc_usd') !== null || settings.get('max_mc_usd') !== null) {
-    checks.push({ name: 'mc', fn: () => checkMarketCap(mint) });
+  if (settings.get('unrenounced_only', chatId)) checks.push({ name: 'unrenounced', fn: () => checkUnrenounced(mint) });
+  if (settings.get('unburned_only', chatId)) checks.push({ name: 'unburned', fn: () => checkUnburned(mint) });
+  if (settings.get('min_mc_usd', chatId) !== null || settings.get('max_mc_usd', chatId) !== null) {
+    checks.push({ name: 'mc', fn: () => checkMarketCap(mint, chatId) });
   }
-  if (settings.get('min_token_age_min') !== null || settings.get('max_token_age_min') !== null) {
-    checks.push({ name: 'age', fn: () => checkTokenAge({ createdAt }) });
+  if (settings.get('min_token_age_min', chatId) !== null || settings.get('max_token_age_min', chatId) !== null) {
+    checks.push({ name: 'age', fn: () => checkTokenAge({ createdAt }, chatId) });
   }
-  if (settings.get('exclude_internal') || settings.get('exclude_external')) {
-    checks.push({ name: 'platform', fn: () => Promise.resolve(checkPlatformExclude({ programIds })) });
+  if (settings.get('exclude_internal', chatId) || settings.get('exclude_external', chatId)) {
+    checks.push({ name: 'platform', fn: () => Promise.resolve(checkPlatformExclude({ programIds }, chatId)) });
   }
   // v0.8.0: sell ratio. Only runs if min_sell_ratio is set AND we have a
   // soldAmount (i.e. a SELL_DETECTED event; the monitor always provides one).
-  if (settings.get('min_sell_ratio') != null && soldAmount != null) {
-    checks.push({ name: 'sell_ratio', fn: () => checkSellRatio({ dev, mint, soldAmount }) });
+  if (settings.get('min_sell_ratio', chatId) != null && soldAmount != null) {
+    checks.push({ name: 'sell_ratio', fn: () => checkSellRatio({ dev, mint, soldAmount }, chatId) });
   }
   for (const c of checks) {
     let r;
@@ -355,17 +360,19 @@ export async function passesFilters({ mint, dev, createdAt, programIds = [], sol
 }
 
 // Helper for /status or debugging: list which filters are active.
-export function activeFilters() {
+// v0.8.7.15: per-user. Pass chatId to scope filters to one subscriber.
+export function activeFilters(chatId) {
+  if (chatId == null) throw new Error('activeFilters: chatId is required');
   return {
-    unrenounced_only: settings.get('unrenounced_only'),
-    unburned_only: settings.get('unburned_only'),
-    min_mc_usd: settings.get('min_mc_usd'),
-    max_mc_usd: settings.get('max_mc_usd'),
-    min_token_age_min: settings.get('min_token_age_min'),
-    max_token_age_min: settings.get('max_token_age_min'),
-    exclude_internal: settings.get('exclude_internal'),
-    exclude_external: settings.get('exclude_external'),
-    min_sell_ratio: settings.get('min_sell_ratio'),
+    unrenounced_only: settings.get('unrenounced_only', chatId),
+    unburned_only: settings.get('unburned_only', chatId),
+    min_mc_usd: settings.get('min_mc_usd', chatId),
+    max_mc_usd: settings.get('max_mc_usd', chatId),
+    min_token_age_min: settings.get('min_token_age_min', chatId),
+    max_token_age_min: settings.get('max_token_age_min', chatId),
+    exclude_internal: settings.get('exclude_internal', chatId),
+    exclude_external: settings.get('exclude_external', chatId),
+    min_sell_ratio: settings.get('min_sell_ratio', chatId),
   };
 }
 

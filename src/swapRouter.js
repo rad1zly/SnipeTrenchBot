@@ -18,9 +18,11 @@ const PUMP_CHECK_TTL_MS = 30_000;  // recheck every 30s in case of graduation
 
 /**
  * Get buy quote. Auto-routes to pump.fun if available, else Jupiter.
+ * v0.8.7.15: chatId threaded through so Jupiter-route uses per-user settings
+ * (anti_mev, buy_priority_fee_sol). pump.fun route doesn't need it.
  * @returns {Promise<{quote, route: 'pumpfun' | 'jupiter'}>}
  */
-export async function getBuyQuote({ solAmount, outputMint, slippageBps = 500 }) {
+export async function getBuyQuote({ solAmount, outputMint, slippageBps = 500, chatId = null }) {
   const isPF = await _isPumpfunToken(outputMint);
   if (isPF) {
     try {
@@ -37,7 +39,7 @@ export async function getBuyQuote({ solAmount, outputMint, slippageBps = 500 }) 
       console.warn(`[swapRouter] pumpfun getBuyQuote failed for ${outputMint.toString()}: ${e.message}; falling back to jupiter`);
     }
   }
-  const quote = await jupiter.getBuyQuote({ solAmount, outputMint, slippageBps });
+  const quote = await jupiter.getBuyQuote({ solAmount, outputMint, slippageBps, chatId });
   if (!quote || !quote.outAmount) {
     throw new Error(
       `no quote available for ${outputMint.toString()} (route=${isPF ? 'pumpfun-fallback' : 'jupiter'}); ` +
@@ -47,7 +49,7 @@ export async function getBuyQuote({ solAmount, outputMint, slippageBps = 500 }) 
   return { quote, route: 'jupiter' };
 }
 
-export async function getSellQuote({ tokenRawAmount, inputMint, slippageBps = 500 }) {
+export async function getSellQuote({ tokenRawAmount, inputMint, slippageBps = 500, chatId = null }) {
   const isPF = await _isPumpfunToken(inputMint);
   if (isPF) {
     try {
@@ -60,7 +62,7 @@ export async function getSellQuote({ tokenRawAmount, inputMint, slippageBps = 50
       console.warn(`[swapRouter] pumpfun getSellQuote failed for ${inputMint.toString()}: ${e.message}; falling back to jupiter`);
     }
   }
-  const quote = await jupiter.getSellQuote({ tokenRawAmount, inputMint, slippageBps });
+  const quote = await jupiter.getSellQuote({ tokenRawAmount, inputMint, slippageBps, chatId });
   if (!quote || !quote.outAmount) {
     throw new Error(
       `no sell quote available for ${inputMint.toString()} (route=${isPF ? 'pumpfun-fallback' : 'jupiter'})`
@@ -74,11 +76,11 @@ export async function getSellQuote({ tokenRawAmount, inputMint, slippageBps = 50
  * For Jupiter, signature matches jupiterMetis.buildSwapTransaction exactly.
  * For pump.fun, we need the side ('buy' or 'sell') — derive from quote shape.
  */
-export async function buildSwapTransaction({ quoteResponse, userPublicKey, route, side }) {
+export async function buildSwapTransaction({ quoteResponse, userPublicKey, route, side, chatId = null }) {
   if (route === 'pumpfun') {
     return pumpfun.buildSwapTransaction({ quoteResponse, userPublicKey, side });
   }
-  return jupiter.buildSwapTransaction({ quoteResponse, userPublicKey });
+  return jupiter.buildSwapTransaction({ quoteResponse, userPublicKey, chatId });
 }
 
 // Internal: cached "is pump.fun token" check

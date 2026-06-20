@@ -111,9 +111,9 @@ function logStep(label, data) {
 // Returns true if current UTC time is between start_time and end_time.
 // Handles wrap-around (e.g. 22:00 → 06:00 = active overnight).
 // =============================================================================
-function isWithinTradingHours() {
-  const start = settings.get('start_time') || '00:00';
-  const end = settings.get('end_time') || '23:59';
+function isWithinTradingHours(chatId) {
+  const start = settings.get('start_time', chatId) || '00:00';
+  const end = settings.get('end_time', chatId) || '23:59';
   const now = new Date();
   const curMin = now.getUTCHours() * 60 + now.getUTCMinutes();
   const [sh, sm] = start.split(':').map(Number);
@@ -183,13 +183,13 @@ async function submitSwap({ quoteResponse, label, chatId, route = 'jupiter', sid
     );
   }
   // v0.8.2: pass route + side so the right builder is used.
-  // Before this, route was undefined and swapRouter always fell through to
-  // Jupiter, even for pump.fun pre-graduation tokens (→ Helius 422).
+  // v0.8.7.15: pass chatId for per-user Jupiter-route settings (anti_mev, priority fee).
   const txB64 = await buildSwapTransaction({
     quoteResponse,
     userPublicKey: kp.publicKey.toBase58(),
     route,
     side,
+    chatId,
   });
   if (!txB64) throw new Error(`buildSwapTransaction returned null for ${label}`);
   const tx = VersionedTransaction.deserialize(Buffer.from(txB64, 'base64'));
@@ -346,20 +346,22 @@ export async function executeSignal(event) {
   logStep('SIGNAL_ACCEPTED', { dev, mint, mode: 'COUNTER_BUY' });
 
   // ---- Time window gate (UTC) ----
-  if (!isWithinTradingHours()) {
+  if (!isWithinTradingHours(chatId)) {
     logStep('SKIP_OUTSIDE_HOURS', {
       dev,
       mint,
       now: new Date().toISOString().slice(11, 16),
-      window: `${settings.get('start_time')}-${settings.get('end_time')} UTC`,
+      window: `${settings.get('start_time', chatId)}-${settings.get('end_time', chatId)} UTC`,
     });
     signalsDb.log({ type: 'OUT_OF_HOURS', wallet: dev, mint, data: { event } });
     return;
   }
 
   // ---- Filter gate (opt-in on-chain checks) ----
+  // v0.8.7.15: pass chatId so filters are scoped to this user.
   const createdAt = tokenMintByDev.get(dev)?.get(mint);
   const filterResult = await passesFilters({
+    chatId,
     mint,
     dev,
     createdAt,
@@ -372,16 +374,20 @@ export async function executeSignal(event) {
     return;
   }
 
-  // ---- Read trade params from settings (mutable at runtime) ----
-  const solAmount = settings.get('fixed_buy_sol');
-  const slippageBps = settings.get('slippage_bps');
-  const pumpSlippageBps = settings.get('pump_slippage_bps');
-  const pumpSellSlippageBps = settings.get('pump_sell_slippage_bps');  // v0.8.7.13: separate from buy
-  const holdMs = settings.get('hold_ms');
-  const autoSell = settings.get('auto_sell');
-  const autoRetry = settings.get('auto_retry');
+  // ---- Read trade params from THIS USER's settings (mutable at runtime) ----
+  // v0.8.7.15: chatId is REQUIRED for all settings reads. Each subscriber has
+  // their own config — user A's fixed_buy_sol no longer leaks to user B.
+  const solAmount = settings.get('fixed_buy_sol', chatId);
+  const slippageBps = settings.get('slippage_bps', chatId);
+  const pumpSlippageBps = settings.get('pump_slippage_bps', chatId);
+  const pumpSellSlippageBps = settings.get('pump_sell_slippage_bps', chatId);  // v0.8.7.13: separate from buy
+  const holdMs = settings.get('hold_ms', chatId);
+  const autoSell = settings.get('auto_sell', chatId);
+  const autoRetry = settings.get('auto_retry', chatId);
 
-  const guard = guardTrade({ solAmount, mint });
+  // v0.8.7.15: pass chatId to guardTrade so cap checks (per-trade cap, daily
+  // spend cap, buy-limit-per-token, manual pause) are per-user.
+  const guard = guardTrade({ chatId, solAmount, mint });
   if (!guard.allowed) {
     logStep('TRADE_DENIED', { reason: guard.reason });
     signalsDb.log({ type: 'BUY_DENIED', wallet: dev, mint, data: { reason: guard.reason } });
@@ -409,7 +415,7 @@ export async function executeSignal(event) {
   // adversely between quote and execute. Acceptable for copy-trade bot:
   // failed BUY = no loss, overspend = lost SOL.
   const buySlippageBps = pumpSlippageBps;  // try pump.fun slippage first
-  const { quote: buyQuote, route: buyRoute } = await getBuyQuote({ solAmount, outputMint: mint, slippageBps: buySlippageBps });
+  const { quote: buyQuote, route: buyRoute } = await getBuyQuote({ solAmount, outputMint: mint, slippageBps: buySlippageBps, chatId });
   if (!buyQuote || buyQuote.error) {
     logStep('BUY_QUOTE_FAILED', { error: buyQuote?.error });
     notifier.tradeFailed({ stage: 'BUY_QUOTE', mint, error: buyQuote?.error || 'no quote', chatId, solAmount }).catch(() => {});
@@ -459,7 +465,10 @@ export async function executeSignal(event) {
   });
 
   // Open position row FIRST, then submit, then update on success.
+  // v0.8.7.15: pass chatId so the position is owned by THIS user. Each
+  // subscriber's positions are isolated, enabling per-user daily spend caps.
   const posRes = positionsDb.open({
+    chatId,
     mint,
     devWallet: dev,
     entrySig: null, // filled below
@@ -586,7 +595,7 @@ export async function executeSignal(event) {
   //   30% BUY slippage caused 0.002567 SOL spend for 0.002 SOL intent (1.28×).
   //   With 15% BUY slippage + non-mayhem 1.0× fee mult, max spend = 0.0023 SOL
   //   — much closer to intent.
-  const { quote: sellQuote, route: sellRoute } = await getSellQuote({ tokenRawAmount: tokensToSell, inputMint: mint, slippageBps: pumpSellSlippageBps });
+  const { quote: sellQuote, route: sellRoute } = await getSellQuote({ tokenRawAmount: tokensToSell, inputMint: mint, slippageBps: pumpSellSlippageBps, chatId });
   if (!sellQuote || sellQuote.error) {
     positionsDb.fail(positionId, `sell quote: ${sellQuote?.error || 'no quote'}`);
     logStep('SELL_QUOTE_FAILED', { error: sellQuote?.error });
@@ -654,8 +663,10 @@ export function status(chatId = null) {
       : 'NOT SET — /start → 🔑 Wallet',
     rpc: config.SOLANA_RPC_URL,
     jupiterUrl: config.JUPITER_API_URL,
-    effectiveJupiterUrl: effectiveJupiterUrl(),
+    // v0.8.7.15: per-user.anti_mev controls Jupiter URL. Pass chatId.
+    effectiveJupiterUrl: chatId != null ? effectiveJupiterUrl(chatId) : config.JUPITER_API_URL,
     trackedMints: Array.from(tokenMintByDev.values()).reduce((a, m) => a + m.size, 0),
-    activeFilters: activeFilters(),
+    // v0.8.7.15: per-user active filters. chatId may be null for global status.
+    activeFilters: chatId != null ? activeFilters(chatId) : null,
   };
 }

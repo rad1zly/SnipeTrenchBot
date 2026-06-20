@@ -98,6 +98,9 @@ function initSchema(d) {
       fail_reason  TEXT,
       created_at   INTEGER NOT NULL
     );
+    -- v0.8.7.15: chat_id is added via ALTER TABLE in the migration block
+    -- below (so existing tables can be upgraded). The CREATE INDEX for
+    -- chat_id is also added there, AFTER the ALTER TABLE runs.
     CREATE INDEX IF NOT EXISTS idx_positions_mint ON positions(mint);
     CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
     CREATE INDEX IF NOT EXISTS idx_positions_dev ON positions(dev_wallet);
@@ -130,11 +133,23 @@ function initSchema(d) {
     );
 
     -- v0.2.0: runtime-mutable settings (DB-backed, override .env)
+    -- v0.8.7.15: deprecated. Migrated to user_settings(chat_id, key) below.
     CREATE TABLE IF NOT EXISTS settings (
       key        TEXT PRIMARY KEY,
       value      TEXT NOT NULL,
       updated_at INTEGER NOT NULL
     );
+
+    -- v0.8.7.15: per-user settings. Replaces the global settings table so
+    -- changing fixed_buy_sol for one subscriber doesn't affect others.
+    CREATE TABLE IF NOT EXISTS user_settings (
+      chat_id    INTEGER NOT NULL,
+      key        TEXT    NOT NULL,
+      value      TEXT    NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (chat_id, key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_user_settings_chat ON user_settings(chat_id);
 
     -- Multi-user support: anyone who /start'd becomes a subscriber.
     -- The notifier broadcasts to all subscribers. No owner restriction.
@@ -174,6 +189,24 @@ function initSchema(d) {
   }
   if (!posCols.includes('hold_ms')) {
     d.exec(`ALTER TABLE positions ADD COLUMN hold_ms INTEGER;`);
+  }
+  // v0.8.7.15: add chat_id column for per-user position isolation.
+  // Existing rows get NULL chat_id (legacy pre-isolation data). The
+  // global aggregate queries still work; per-user queries just skip them.
+  if (!posCols.includes('chat_id')) {
+    d.exec(`ALTER TABLE positions ADD COLUMN chat_id INTEGER;`);
+    // For single-user setups (one bot owner watching one wallet), backfill
+    // existing rows to the owner's chat_id. Multi-user setups will have
+    // NULL chat_id on legacy positions — that's OK, they're historical.
+    const subs = d.prepare(`SELECT chat_id FROM subscribers`).all();
+    if (subs.length === 1) {
+      d.prepare(`UPDATE positions SET chat_id = ? WHERE chat_id IS NULL`).run(subs[0].chat_id);
+      console.log(`[db] v0.8.7.15: backfilled positions.chat_id for single-user setup (chat_id=${subs[0].chat_id})`);
+    }
+    // Add the index AFTER the column exists (CREATE INDEX above only ran
+    // for fresh installs where chat_id was in the CREATE TABLE; for
+    // upgrades we need to add it here).
+    d.exec(`CREATE INDEX IF NOT EXISTS idx_positions_chat ON positions(chat_id);`);
   }
 
   // ---------------------------------------------------------------------------
@@ -253,6 +286,89 @@ function initSchema(d) {
         '[db] legacy wallet row had no set_by_chat_id — wallet dropped. ' +
           'Re-add it via /start → 🔑 Wallet.'
       );
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // v0.8.7.15 migration: per-user settings + per-user pause.
+  //
+  // Background: v0.2.0 stored all settings in a single global `settings` table
+  // (key, value). v0.7.0 added `subscribers` and per-user wallet, but settings
+  // were still global — so /pause from any user paused for everyone, and
+  // setting fixed_buy_sol from user A changed it for user B too.
+  //
+  // Fix: new `user_settings(chat_id, key, value)` table. On first boot with
+  // the new code, we copy every row of the legacy `settings` table into
+  // user_settings for each existing subscriber. Each user starts with the
+  // same baseline, but from there they can diverge.
+  //
+  // Pause state: was `bot_meta.paused` (global). Migrated to a special
+  // user_settings row with key='_pause' for unified handling.
+  //
+  // Idempotency: marked complete via bot_meta._settings_migrated_v2 = 'true'.
+  // Re-runs are no-ops.
+  // ---------------------------------------------------------------------------
+  const migrationDone = d
+    .prepare(`SELECT value FROM bot_meta WHERE key = '_settings_migrated_v2'`)
+    .get();
+  if (!migrationDone) {
+    const subscribers = d.prepare(`SELECT chat_id FROM subscribers`).all();
+    const legacyRows = d
+      .prepare(`SELECT key, value, updated_at FROM settings`)
+      .all();
+    const now = Date.now();
+
+    if (subscribers.length === 0) {
+      // No subscribers yet — migration is a no-op. Mark complete so we don't
+      // re-check on every boot. New subscribers will get default settings.
+      d.prepare(
+        `INSERT OR REPLACE INTO bot_meta (key, value, updated_at) VALUES ('_settings_migrated_v2', 'true', ?)`
+      ).run(now);
+      console.log(
+        '[db] v0.8.7.15 settings migration: 0 subscribers — skipping (defaults will apply to future users).'
+      );
+    } else {
+      const insert = d.prepare(
+        `INSERT OR IGNORE INTO user_settings (chat_id, key, value, updated_at) VALUES (?, ?, ?, ?)`
+      );
+      let totalCopies = 0;
+      const tx = d.transaction((subs, rows, ts) => {
+        for (const sub of subs) {
+          for (const row of rows) {
+            insert.run(sub.chat_id, row.key, row.value, ts);
+            totalCopies++;
+          }
+        }
+      });
+      tx(subscribers, legacyRows, now);
+
+      // Migrate global pause state. v0.8.7.15 fix: the global pause was
+      // a BUG (user A pressing /pause paused everyone). On migration, we
+      // DON'T propagate the global pause state — each subscriber starts
+      // UNPAUSED, which matches the original intent ("I want to pause MY
+      // own bot, not everyone else's"). If a user genuinely wants to be
+      // paused, they can /pause after the migration runs.
+      //
+      // Legacy bot_meta.paused row is left in place for forensic purposes.
+      // Note: encode boolean as JSON 'false' string (matches userSettingsDb.set
+      // which JSON.stringify()s the value before INSERT).
+      for (const sub of subscribers) {
+        insert.run(sub.chat_id, '_pause', 'false', now);
+      }
+
+      d.prepare(
+        `INSERT OR REPLACE INTO bot_meta (key, value, updated_at) VALUES ('_settings_migrated_v2', 'true', ?)`
+      ).run(now);
+
+      console.log(
+        `[db] v0.8.7.15 settings migration: ${legacyRows.length} keys × ${subscribers.length} subscribers = ${totalCopies} rows copied to user_settings. ` +
+          `Global pause was a bug — all subscribers default to UNPAUSED.`
+      );
+
+      // Keep legacy `settings` rows around for read-only fallback during the
+      // transition period (v0.8.7.15+ reads user_settings first). Do NOT drop
+      // — if something reads `settings` directly (custom scripts, debugging),
+      // the data is still there. Future major version can drop it.
     }
   }
 }
@@ -380,14 +496,20 @@ export const walletsDb = {
 // positions
 // =============================================================================
 export const positionsDb = {
-  open({ mint, devWallet, entrySig, entrySol, entryTokens = null }) {
+  /**
+   * Open a new position. v0.8.7.15: chatId is REQUIRED so each user's
+   * positions are isolated. Trades are tied to the Telegram user who set
+   * up the watchlist (and whose wallet is being debited).
+   */
+  open({ chatId, mint, devWallet, entrySig, entrySol, entryTokens = null }) {
+    if (chatId == null) throw new Error('positionsDb.open: chatId is required');
     const now = Date.now();
     return getDb()
       .prepare(`
-        INSERT INTO positions (mint, dev_wallet, entry_sig, entry_time, entry_sol, entry_tokens, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, 'OPEN', ?)
+        INSERT INTO positions (chat_id, mint, dev_wallet, entry_sig, entry_time, entry_sol, entry_tokens, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', ?)
       `)
-      .run(mint, devWallet, entrySig, now, entrySol, entryTokens, now);
+      .run(chatId, mint, devWallet, entrySig, now, entrySol, entryTokens, now);
   },
   close(id, { exitSig, exitSol, pnlSol, pnlPercent = null, holdMs = null }) {
     return getDb()
@@ -409,42 +531,87 @@ export const positionsDb = {
   byId(id) {
     return getDb().prepare(`SELECT * FROM positions WHERE id = ?`).get(id);
   },
-  openForMint(mint) {
-    return getDb().prepare(`SELECT * FROM positions WHERE mint = ? AND status = 'OPEN'`).all(mint);
-  },
-  openForDev(devWallet) {
+  openForMint(mint, chatId) {
+    // v0.8.7.15: per-user. Each subscriber's open positions on this mint are
+    // counted independently, so user A's buys don't cap user B's buys.
+    // chatId is REQUIRED.
+    if (chatId == null) throw new Error('positionsDb.openForMint: chatId is required');
     return getDb()
-      .prepare(`SELECT * FROM positions WHERE dev_wallet = ? AND status = 'OPEN'`)
-      .all(devWallet);
+      .prepare(`SELECT * FROM positions WHERE mint = ? AND status = 'OPEN' AND chat_id = ?`)
+      .all(mint, chatId);
   },
-  openAll() {
-    return getDb().prepare(`SELECT * FROM positions WHERE status = 'OPEN' ORDER BY entry_time DESC`).all();
-  },
-  recent(limit = 20) {
+  openForDev(devWallet, chatId = null) {
+    // v0.8.7.15: optional chatId for per-user filtering. If null, returns all
+    // open positions for that dev wallet across all users (used by monitors).
+    if (chatId == null) {
+      return getDb()
+        .prepare(`SELECT * FROM positions WHERE dev_wallet = ? AND status = 'OPEN'`)
+        .all(devWallet);
+    }
     return getDb()
-      .prepare(`SELECT * FROM positions ORDER BY created_at DESC LIMIT ?`)
-      .all(limit);
+      .prepare(`SELECT * FROM positions WHERE dev_wallet = ? AND status = 'OPEN' AND chat_id = ?`)
+      .all(devWallet, chatId);
   },
-  realizedPnlSince(sinceMs) {
+  openAll(chatId = null) {
+    // v0.8.7.15: optional chatId. Default (null) = all users (used by
+    // monitor / cleanup jobs). Per-user view filters to one subscriber.
+    if (chatId == null) {
+      return getDb().prepare(`SELECT * FROM positions WHERE status = 'OPEN' ORDER BY entry_time DESC`).all();
+    }
+    return getDb()
+      .prepare(`SELECT * FROM positions WHERE status = 'OPEN' AND chat_id = ? ORDER BY entry_time DESC`)
+      .all(chatId);
+  },
+  recent(limit = 20, chatId = null) {
+    // v0.8.7.15: optional chatId for per-user history.
+    if (chatId == null) {
+      return getDb()
+        .prepare(`SELECT * FROM positions ORDER BY created_at DESC LIMIT ?`)
+        .all(limit);
+    }
+    return getDb()
+      .prepare(`SELECT * FROM positions WHERE chat_id = ? ORDER BY created_at DESC LIMIT ?`)
+      .all(chatId, limit);
+  },
+  realizedPnlSince(sinceMs, chatId = null) {
+    // v0.8.7.15: optional chatId for per-user daily PnL. Default (null) =
+    // global aggregate across all users.
+    if (chatId == null) {
+      const row = getDb()
+        .prepare(`
+          SELECT COALESCE(SUM(pnl_sol), 0) as total,
+                 COUNT(*) as n
+          FROM positions
+          WHERE status = 'CLOSED' AND exit_time >= ?
+        `)
+        .get(sinceMs);
+      return { total: row.total, count: row.n };
+    }
     const row = getDb()
       .prepare(`
         SELECT COALESCE(SUM(pnl_sol), 0) as total,
                COUNT(*) as n
         FROM positions
-        WHERE status = 'CLOSED' AND exit_time >= ?
+        WHERE status = 'CLOSED' AND chat_id = ? AND exit_time >= ?
       `)
-      .get(sinceMs);
+      .get(chatId, sinceMs);
     return { total: row.total, count: row.n };
   },
-  spentSince(sinceMs) {
+  /**
+   * Total SOL spent on entry for positions opened by one user since `sinceMs`.
+   * v0.8.7.15: per-user. Each subscriber's daily cap is enforced independently.
+   * chatId is REQUIRED — global "today spent" is the leak we're fixing.
+   */
+  spentSince(chatId, sinceMs) {
+    if (chatId == null) throw new Error('positionsDb.spentSince: chatId is required');
     const row = getDb()
       .prepare(`
         SELECT COALESCE(SUM(entry_sol), 0) as total,
                COUNT(*) as n
         FROM positions
-        WHERE created_at >= ?
+        WHERE chat_id = ? AND created_at >= ?
       `)
-      .get(sinceMs);
+      .get(chatId, sinceMs);
     return row.total || 0;
   },
 
@@ -662,6 +829,74 @@ export const settingsDb = {
   },
   count() {
     return getDb().prepare(`SELECT COUNT(*) as c FROM settings`).get().c;
+  },
+};
+
+// =============================================================================
+// user_settings (v0.8.7.15: per-Telegram-subscriber settings)
+//
+// Replaces `settingsDb` for all production code. Each user has their own
+// copy of every setting, so changes from one subscriber don't leak to others.
+// chat_id is REQUIRED for all read/write operations — the API will throw if
+// it's missing, since "global settings" is the bug we're fixing, not a
+// supported mode.
+// =============================================================================
+export const userSettingsDb = {
+  /** Get one setting for one user. Returns {value, updated_at} or null. */
+  get(chatId, key) {
+    if (chatId == null) throw new Error('userSettingsDb.get: chatId is required (per-user isolation)');
+    if (key == null) throw new Error('userSettingsDb.get: key is required');
+    const row = getDb()
+      .prepare(`SELECT value, updated_at FROM user_settings WHERE chat_id = ? AND key = ?`)
+      .get(chatId, key);
+    if (!row) return null;
+    try {
+      return { value: JSON.parse(row.value), updated_at: row.updated_at };
+    } catch {
+      return { value: row.value, updated_at: row.updated_at };
+    }
+  },
+  /** Upsert one setting for one user. */
+  set(chatId, key, value) {
+    if (chatId == null) throw new Error('userSettingsDb.set: chatId is required');
+    if (key == null) throw new Error('userSettingsDb.set: key is required');
+    const encoded = JSON.stringify(value);
+    return getDb()
+      .prepare(`
+        INSERT INTO user_settings (chat_id, key, value, updated_at) VALUES (?, ?, ?, ?)
+        ON CONFLICT(chat_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+      `)
+      .run(chatId, key, encoded, Date.now());
+  },
+  /** Delete one setting for one user (resets to env/default). */
+  delete(chatId, key) {
+    if (chatId == null) throw new Error('userSettingsDb.delete: chatId is required');
+    if (key == null) throw new Error('userSettingsDb.delete: key is required');
+    return getDb()
+      .prepare(`DELETE FROM user_settings WHERE chat_id = ? AND key = ?`)
+      .run(chatId, key).changes;
+  },
+  /** All settings for one user as a key→{value,updated_at} object. */
+  all(chatId) {
+    if (chatId == null) throw new Error('userSettingsDb.all: chatId is required');
+    const rows = getDb()
+      .prepare(`SELECT key, value, updated_at FROM user_settings WHERE chat_id = ? ORDER BY key`)
+      .all(chatId);
+    const result = {};
+    for (const row of rows) {
+      try {
+        result[row.key] = { value: JSON.parse(row.value), updated_at: row.updated_at };
+      } catch {
+        result[row.key] = { value: row.value, updated_at: row.updated_at };
+      }
+    }
+    return result;
+  },
+  /** Count distinct users with at least one setting. */
+  userCount() {
+    return getDb()
+      .prepare(`SELECT COUNT(DISTINCT chat_id) as c FROM user_settings`)
+      .get().c;
   },
 };
 

@@ -10,7 +10,7 @@
 // (getBool/getNumber/getString) at trade time so a change is live immediately.
 // =============================================================================
 
-import { settingsDb, positionsDb } from './db.js';
+import { userSettingsDb, positionsDb } from './db.js';
 
 // -----------------------------------------------------------------------------
 // Catalog — every mutable setting, in the order the menus display them.
@@ -364,12 +364,24 @@ export function byCategory(cat) {
 
 /**
  * Resolve the current effective value for a setting.
- * Priority: DB > env > default. Type is coerced to the catalog type.
+ * Priority: DB (per-user) > env > default. Type is coerced to the catalog type.
+ *
+ * v0.8.7.15: chatId is REQUIRED. Each subscriber has their own setting row.
+ * Old global `settings` table is deprecated; we read from user_settings only.
  */
-export function get(key) {
+export function get(key, chatId) {
   const setting = BY_KEY[key];
   if (!setting) return null;
-  const row = settingsDb.get(key);
+  if (chatId == null) {
+    // v0.8.7.15: per-user isolation is the default. Passing no chatId used
+    // to mean "read the global setting" — that's exactly the leak we just
+    // fixed. Refuse loudly rather than silently fall back to global.
+    throw new Error(
+      `settings.get('${key}'): chatId is required (per-user isolation since v0.8.7.15). ` +
+      `Pass ctx.chat.id from Telegram handlers, or event.chatId from executor.`
+    );
+  }
+  const row = userSettingsDb.get(chatId, key);
   if (row && row.value != null) {
     // `null` in JSON → user explicitly cleared; fall through to env/default
     if (row.value !== null) return coerceByType(setting, row.value);
@@ -380,34 +392,46 @@ export function get(key) {
 }
 
 /** Typed convenience: get a bool with a fallback. */
-export function getBool(key, fallback = false) {
-  const v = get(key);
+export function getBool(key, chatId, fallback = false) {
+  if (chatId == null) throw new Error(`settings.getBool('${key}'): chatId is required`);
+  const v = get(key, chatId);
   if (v == null) return fallback;
   return Boolean(v);
 }
 
 /** Typed convenience: get a number with a fallback. */
-export function getNumber(key, fallback = 0) {
-  const v = get(key);
+export function getNumber(key, chatId, fallback = 0) {
+  if (chatId == null) throw new Error(`settings.getNumber('${key}'): chatId is required`);
+  const v = get(key, chatId);
   if (v == null) return fallback;
   const n = Number(v);
   return Number.isNaN(n) ? fallback : n;
 }
 
 /** Typed convenience: get a string with a fallback. */
-export function getString(key, fallback = '') {
-  const v = get(key);
+export function getString(key, chatId, fallback = '') {
+  if (chatId == null) throw new Error(`settings.getString('${key}'): chatId is required`);
+  const v = get(key, chatId);
   if (v == null) return fallback;
   return String(v);
 }
 
-/** Set a setting in the DB. value is whatever the catalog type accepts. */
-export function set(key, value) {
+/**
+ * Set a setting in the DB for one user. value is whatever the catalog type accepts.
+ *
+ * v0.8.7.15: chatId is REQUIRED. Each user's settings live in their own row.
+ */
+export function set(key, value, chatId) {
   const setting = BY_KEY[key];
   if (!setting) throw new Error(`Unknown setting: ${key}`);
+  if (chatId == null) {
+    throw new Error(
+      `settings.set('${key}', ...): chatId is required (per-user isolation since v0.8.7.15).`
+    );
+  }
   if (value == null) {
     // null = "Not Limited" for some, or "default" for others. Store as null.
-    settingsDb.set(key, null);
+    userSettingsDb.set(chatId, key, null);
     return;
   }
   // For bool: accept true/false directly
@@ -424,24 +448,27 @@ export function set(key, value) {
     if (setting.max != null && n > setting.max) {
       throw new Error(`Setting ${key} must be <= ${setting.max}, got ${n}`);
     }
-    settingsDb.set(key, n);
+    userSettingsDb.set(chatId, key, n);
   } else if (setting.type === 'bool') {
-    settingsDb.set(key, Boolean(value));
+    userSettingsDb.set(chatId, key, Boolean(value));
   } else {
-    settingsDb.set(key, String(value));
+    userSettingsDb.set(chatId, key, String(value));
   }
 }
 
-/** Reset a setting to its env/default. Removes the DB row. */
-export function reset(key) {
+/** Reset a setting to its env/default for one user. Removes the DB row. */
+export function reset(key, chatId) {
   if (!BY_KEY[key]) return false;
-  settingsDb.delete(key);
-  return true;
+  if (chatId == null) throw new Error(`settings.reset('${key}'): chatId is required`);
+  return userSettingsDb.delete(chatId, key) > 0;
 }
 
-/** Reset all settings. */
-export function resetAll() {
-  for (const s of CATALOG) settingsDb.delete(s.key);
+/** Reset ALL settings for one user (each user resets their own). */
+export function resetAll(chatId) {
+  if (chatId == null) throw new Error('settings.resetAll: chatId is required');
+  let n = 0;
+  for (const s of CATALOG) n += userSettingsDb.delete(chatId, s.key);
+  return n;
 }
 
 // -----------------------------------------------------------------------------
@@ -449,10 +476,11 @@ export function resetAll() {
 // -----------------------------------------------------------------------------
 
 /** Format a setting's current value for menu display. */
-export function formatValue(key) {
+export function formatValue(key, chatId) {
+  if (chatId == null) throw new Error(`settings.formatValue('${key}'): chatId is required`);
   const setting = BY_KEY[key];
   if (!setting) return '?';
-  const v = get(key);
+  const v = get(key, chatId);
 
   if (setting.type === 'bool') {
     // TradeWiz-style: ✅ Yes (green) when ON, 🟠 No (orange) when OFF
@@ -498,25 +526,30 @@ export function formatValue(key) {
   return String(v);
 }
 
-/** Format a "source" tag: shows whether value comes from DB, env, or default. */
-export function formatSource(key) {
+/**
+ * Format a "source" tag: shows whether value comes from per-user DB, env, or default.
+ * v0.8.7.15: reads user_settings, not the deprecated global settings table.
+ */
+export function formatSource(key, chatId) {
+  if (chatId == null) throw new Error(`settings.formatSource('${key}'): chatId is required`);
   const setting = BY_KEY[key];
   if (!setting) return '';
-  const row = settingsDb.get(key);
+  const row = userSettingsDb.get(chatId, key);
   if (row && row.value != null) return '🟢 DB';
   if (setting.env && process.env[setting.env]) return '🟡 env';
   return '⚪ default';
 }
 
 /** For toggling a bool via the menu. Returns the new value. */
-export function toggle(key) {
+export function toggle(key, chatId) {
+  if (chatId == null) throw new Error(`settings.toggle('${key}'): chatId is required`);
   const setting = BY_KEY[key];
   if (!setting) throw new Error(`Unknown setting: ${key}`);
   if (setting.type !== 'bool') {
     throw new Error(`Setting ${key} is not a bool — use set() instead`);
   }
-  const newValue = !getBool(key);
-  set(key, newValue);
+  const newValue = !getBool(key, chatId);
+  set(key, newValue, chatId);
   return newValue;
 }
 
@@ -527,10 +560,13 @@ export function toggle(key) {
 /**
  * Returns true if the current UTC time is within the active trading window.
  * Handles wrap-around: e.g. start=22:00 end=06:00 means 22:00-23:59 + 00:00-06:00.
+ *
+ * v0.8.7.15: per-user. Each subscriber has their own active-hours window.
  */
-export function isInTimeWindow() {
-  const start = getString('start_time', '00:00');
-  const end = getString('end_time', '23:59');
+export function isInTimeWindow(chatId) {
+  if (chatId == null) throw new Error('settings.isInTimeWindow: chatId is required');
+  const start = getString('start_time', chatId, '00:00');
+  const end = getString('end_time', chatId, '23:59');
   if (start === '00:00' && end === '23:59') return true; // full active
 
   const now = new Date();
@@ -545,11 +581,16 @@ export function isInTimeWindow() {
 /**
  * Total SOL spent on entries (open + closed) since the start of the UTC day.
  * Used by the daily-spend-cap safety check.
+ *
+ * v0.8.7.15: per-user. Each subscriber has their own daily-spend tally
+ * (their own positions table rows). The aggregate is computed across all
+ * positions with chat_id = this user.
  */
-export function spentSolToday() {
+export function spentSolToday(chatId) {
+  if (chatId == null) throw new Error('settings.spentSolToday: chatId is required (per-user isolation since v0.8.7.15)');
   const since = (() => {
     const now = new Date();
     return Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
   })();
-  return positionsDb.spentSince(since);
+  return positionsDb.spentSince(since, chatId);
 }

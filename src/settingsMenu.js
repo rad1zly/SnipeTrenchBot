@@ -115,7 +115,12 @@ function describeRange(setting) {
  * Build the full flat settings text. Every setting is on one screen,
  * grouped into category sections. Pairs (Max/Min) sit on the same row.
  */
-function buildFlatText() {
+/**
+ * Build the trade settings menu text for ONE user.
+ * v0.8.7.15: chatId REQUIRED — each subscriber sees their own values.
+ */
+function buildFlatText(chatId) {
+  if (chatId == null) throw new Error('settingsMenu.buildFlatText: chatId is required');
   const lines = [
     '<b>🎯 Copy Trade Settings</b>',
     '',
@@ -142,14 +147,14 @@ function buildFlatText() {
           SEEN.add(s.key);
           SEEN.add(pairKey);
           lines.push(
-            `• <b>${s.label}</b>: ${formatValue(s.key)}  ${formatSource(s.key)}` +
-            `    ·    <b>${pairSetting.label}</b>: ${formatValue(pairKey)}  ${formatSource(pairKey)}`
+            `• <b>${s.label}</b>: ${formatValue(s.key, chatId)}  ${formatSource(s.key, chatId)}` +
+            `    ·    <b>${pairSetting.label}</b>: ${formatValue(pairKey, chatId)}  ${formatSource(pairKey, chatId)}`
           );
           continue;
         }
       }
       SEEN.add(s.key);
-      lines.push(`• <b>${s.label}</b>: ${formatValue(s.key)}  ${formatSource(s.key)}`);
+      lines.push(`• <b>${s.label}</b>: ${formatValue(s.key, chatId)}  ${formatSource(s.key, chatId)}`);
     }
     lines.push('');
   }
@@ -216,9 +221,12 @@ function settingButton(s) {
 /**
  * Render the flat Copy Trade settings screen. Replaces the old category
  * sub-menu flow. Edit text in place (no new message per tap).
+ * v0.8.7.15: chatId is REQUIRED — the menu shows this user's values.
  */
 async function renderFlat(ctx) {
-  const text = buildFlatText();
+  const chatId = ctx.chat?.id;
+  if (chatId == null) throw new Error('settingsMenu.renderFlat: ctx.chat.id is required');
+  const text = buildFlatText(chatId);
   const kb = buildFlatKeyboard();
   try {
     await ctx.editMessageText(text, {
@@ -241,6 +249,11 @@ async function renderFlat(ctx) {
  * Handle `set:toggle:KEY` and `set:edit:KEY` callbacks. Returns true if handled.
  */
 export async function handleSetCallback(ctx, action, key) {
+  const chatId = ctx.chat?.id;
+  if (chatId == null) {
+    await ctx.answerCbQuery('No chat context');
+    return true;
+  }
   const setting = getCatalogEntry(key);
   if (!setting) {
     await ctx.answerCbQuery('Unknown setting');
@@ -252,7 +265,8 @@ export async function handleSetCallback(ctx, action, key) {
       await ctx.answerCbQuery('Not a toggle');
       return true;
     }
-    const newVal = toggle(key);
+    // v0.8.7.15: per-user. Toggle THIS USER's setting only.
+    const newVal = toggle(key, chatId);
     await ctx.answerCbQuery(`${setting.label}: ${newVal ? 'ON' : 'OFF'}`);
     await renderFlat(ctx);
     return true;
@@ -268,7 +282,7 @@ export async function handleSetCallback(ctx, action, key) {
     const text = [
       `<b>${setting.label}</b>`,
       '',
-      `Current: <b>${formatValue(key)}</b>  ${formatSource(key)}`,
+      `Current: <b>${formatValue(key, chatId)}</b>  ${formatSource(key, chatId)}`,
       `Type: <b>${setting.type}</b>`,
       `Range: ${describeRange(setting)}`,
       '',
@@ -291,8 +305,9 @@ export async function handleSetCallback(ctx, action, key) {
  */
 // v0.8.0: extract re-render logic to a helper, used by both the success path
 // and the nullable "set to null" path.
+// v0.8.7.15: chatId threaded through to scope the rebuilt menu to one user.
 async function rerenderSettingsMenu(ctx, chatId, menuMessageId) {
-  const text = buildFlatText();
+  const text = buildFlatText(chatId);
   const kb = buildFlatKeyboard();
   if (menuMessageId) {
     try {
@@ -340,10 +355,11 @@ export async function handlePendingText(ctx) {
     // The parser returns null when user types '0', 'none', 'off', or empty.
     if (setting.nullable) {
       try {
-        set(pending.key, null);
+        // v0.8.7.15: per-user. set() with THIS USER's chatId.
+        set(pending.key, null, chatId);
         clearPending(chatId);
         await ctx.reply(
-          `✅ <b>${setting.label}</b> set to <b>Not Limited</b>  ${formatSource(pending.key)}`,
+          `✅ <b>${setting.label}</b> set to <b>Not Limited</b>  ${formatSource(pending.key, chatId)}`,
           { parse_mode: 'HTML' }
         );
         return await rerenderSettingsMenu(ctx, chatId, pending.menuMessageId);
@@ -360,10 +376,10 @@ export async function handlePendingText(ctx) {
   }
 
   try {
-    set(pending.key, parsed);
+    set(pending.key, parsed, chatId);
     clearPending(chatId);
     await ctx.reply(
-      `✅ <b>${setting.label}</b> set to <b>${formatValue(pending.key)}</b>  ${formatSource(pending.key)}`,
+      `✅ <b>${setting.label}</b> set to <b>${formatValue(pending.key, chatId)}</b>  ${formatSource(pending.key, chatId)}`,
       { parse_mode: 'HTML' }
     );
     return await rerenderSettingsMenu(ctx, chatId, pending.menuMessageId);

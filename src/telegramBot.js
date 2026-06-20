@@ -54,7 +54,7 @@ const BOT_COMMANDS = [
 
 import { Telegraf, Markup } from 'telegraf';
 import config from './config.js';
-import { walletsDb, positionsDb, subscribersDb, settingsDb } from './db.js';
+import { walletsDb, positionsDb, subscribersDb } from './db.js';
 import { pause, resume, isPaused, snapshot as safetySnapshot } from './safety.js';
 import { status as executorStatus, evictKeypair } from './executor.js';
 import { walletManager, fetchBalanceSnapshot } from './walletManager.js';
@@ -166,8 +166,10 @@ function bulkAddResultMessage(added, skipped) {
 // doesn't get a wall of new messages.
 
 function buildMainText(chatId) {
-  const e = executorStatus();
-  const s = safetySnapshot();
+  const e = executorStatus(chatId);
+  // v0.8.7.15: pass chatId so /status shows THIS USER's settings + pause state,
+  // not a global aggregate. Per-user isolation.
+  const s = safetySnapshot(chatId);
   const w = walletManager.getStatus(chatId);
   // v0.6.1: per-user counts. Total copies & wallets are scoped to the
   // calling user; subscriber count stays global (system-level stat).
@@ -180,14 +182,14 @@ function buildMainText(chatId) {
     `Wallet:    ${w.set ? `<code>${shortAddr(w.address)}</code> (...${w.last4})` : '<i>not set</i>'}`,
     `Wallets: ${myWallets}  |  Copies: ${myCopies}  |  Positions: ${s.openPositionCount}  |  Subs: ${subscribersDb.count()}`,
   ];
-  if (isPaused()) lines.push('', '⏸ <b>PAUSED</b>');
+  if (isPaused(chatId)) lines.push('', '⏸ <b>PAUSED</b>');
   if (!w.set) lines.push('', '⚠️ <b>No trading wallet</b> — tap 🔑 Wallet to set one.');
   lines.push('', 'Tap a button below.');
   return lines.join('\n');
 }
 
 function mainMenu(chatId) {
-  const running = !isPaused();
+  const running = !isPaused(chatId);
   // v0.6.1: button label uses the calling user's wallet count, not the
   // global table size. Falls back to 0 when chatId is unknown (e.g. legacy
   // callers).
@@ -374,8 +376,10 @@ function buildWalletsText(chatId) {
   );
 }
 
-function buildPositionsText() {
-  const open = positionsDb.openAll();
+function buildPositionsText(chatId) {
+  // v0.8.7.15: per-user. Each subscriber sees their own open positions,
+  // not a global aggregate.
+  const open = positionsDb.openAll(chatId);
   if (open.length === 0) return '💼 <b>Open positions</b>\n\nNone right now.';
   const lines = open.map(
     (p) =>
@@ -384,8 +388,10 @@ function buildPositionsText() {
   return `<b>💼 Open positions (${open.length}):</b>\n\n${lines.join('\n')}`;
 }
 
-function buildSafetyText() {
-  const s = safetySnapshot();
+function buildSafetyText(chatId) {
+  // v0.8.7.15: per-user. Each subscriber sees their own caps, pause state,
+  // and settings — not a global aggregate.
+  const s = safetySnapshot(chatId);
   return [
     '<b>🛟 Safety config</b>',
     '',
@@ -595,17 +601,19 @@ export function startTelegramBot({ onPause: pauseCb, onResume: resumeCb } = {}) 
           }
         );
       } else if (data === 'cmd:positions') {
-        await renderScreen(ctx, buildPositionsText(), commandBackMenu());
+        await renderScreen(ctx, buildPositionsText(ctx.chat.id), commandBackMenu());
       } else if (data === 'cmd:safety') {
-        await renderScreen(ctx, buildSafetyText(), commandBackMenu());
+        await renderScreen(ctx, buildSafetyText(ctx.chat.id), commandBackMenu());
       } else if (data === 'cmd:help') {
         await renderScreen(ctx, buildHelpText(), commandBackMenu());
       } else if (data === 'cmd:toggle_pause') {
-        if (isPaused()) {
-          resume();
+        // v0.8.7.15: per-user pause. Only this chat_id is toggled; other
+        // subscribers' bots are unaffected.
+        if (isPaused(ctx.chat.id)) {
+          resume(ctx.chat.id);
           onResume?.();
         } else {
-          pause();
+          pause(ctx.chat.id);
           onPause?.();
         }
         await renderScreen(ctx, buildMainText(ctx.chat.id), mainMenu(ctx.chat.id));
@@ -741,8 +749,9 @@ export function startTelegramBot({ onPause: pauseCb, onResume: resumeCb } = {}) 
   // ---- /copytrade (alias: /settings) — flat single-screen settings menu ----
   bot.command(['copytrade', 'settings'], async (ctx) => {
     // Send as a new message (not edit). /copytrade is a fresh command.
+    // v0.8.7.15: pass chatId so the menu shows THIS USER's values.
     try {
-      await ctx.replyWithHTML(sm.buildFlatText(), sm.buildFlatKeyboard());
+      await ctx.replyWithHTML(sm.buildFlatText(ctx.chat.id), sm.buildFlatKeyboard());
     } catch (e) {
       // Fallback if the text is empty for any reason
       await ctx.reply('❌ Could not render settings menu. Try /menu → 🎯 Copy Trade.');
@@ -751,16 +760,18 @@ export function startTelegramBot({ onPause: pauseCb, onResume: resumeCb } = {}) 
 
   // ---- /pause ----
   bot.command('pause', (ctx) => {
-    pause();
+    // v0.8.7.15: per-user pause. Only this chat_id is paused; other
+    // subscribers' bots keep trading independently.
+    pause(ctx.chat.id);
     onPause?.();
-    ctx.reply('⏸  Trading paused. New signals will be logged but not traded.');
+    ctx.reply('⏸  Trading paused for your account. New signals will be logged but not traded.');
   });
 
   // ---- /resume ----
   bot.command('resume', (ctx) => {
-    resume();
+    resume(ctx.chat.id);
     onResume?.();
-    ctx.reply('▶️  Trading resumed.');
+    ctx.reply('▶️  Trading resumed for your account.');
   });
 
   // ---- /status ----
@@ -834,7 +845,8 @@ export function startTelegramBot({ onPause: pauseCb, onResume: resumeCb } = {}) 
 
   // ---- /positions ----
   bot.command('positions', (ctx) => {
-    const open = positionsDb.openAll();
+    // v0.8.7.15: per-user. Each subscriber sees their own open positions.
+    const open = positionsDb.openAll(ctx.chat.id);
     if (open.length === 0) return ctx.reply('No open positions.');
     const lines = open.map(
       (p) =>
@@ -847,7 +859,9 @@ export function startTelegramBot({ onPause: pauseCb, onResume: resumeCb } = {}) 
   bot.command('recent', (ctx) => {
     const parts = ctx.message.text.trim().split(/\s+/);
     const n = Math.max(1, Math.min(50, parseInt(parts[1], 10) || 10));
-    const list = positionsDb.recent(n);
+    // v0.8.7.15: per-user. Each subscriber sees their own trade history,
+    // not a global aggregate.
+    const list = positionsDb.recent(n, ctx.chat.id);
     if (list.length === 0) return ctx.reply('No closed positions yet.');
     const lines = list.map((p) => {
       const pnlStr = p.pnl_sol != null ? `${p.pnl_sol >= 0 ? '+' : ''}${p.pnl_sol.toFixed(4)} SOL` : '—';
@@ -859,7 +873,8 @@ export function startTelegramBot({ onPause: pauseCb, onResume: resumeCb } = {}) 
 
   // ---- /safety ----
   bot.command('safety', (ctx) => {
-    const s = safetySnapshot();
+    // v0.8.7.15: per-user. Show THIS USER's caps/pause, not global aggregate.
+    const s = safetySnapshot(ctx.chat.id);
     ctx.reply(
       [
         '<b>Safety config</b>',
