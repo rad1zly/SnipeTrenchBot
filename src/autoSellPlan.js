@@ -177,6 +177,11 @@ export function applyTierChange(key, slot, action, inputText, stored) {
   if (!row) return { ok: false, msg: `Unknown slot: ${slot}` };
 
   const obj = { ...stored };
+  // v0.8.8 (experimental) M1.12b: action 'edit_sell' updates the sell_pct of
+  // an existing tier/singleton without touching the trigger field.
+  if (action === 'edit_sell') {
+    return editSellPct(key, row, inputText, obj);
+  }
   if (key === 'tp_sl_plan') {
     if (row.kind === 'tier') {
       obj.tiers = Array.isArray(obj.tiers) ? [...obj.tiers] : [];
@@ -256,6 +261,51 @@ export function applyTierChange(key, slot, action, inputText, stored) {
   }
 
   return { ok: false, msg: 'Unhandled action' };
+}
+
+function editSellPct(key, row, inputText, obj) {
+  const n = parseNumber(inputText, { min: 1, max: 100 });
+  if (n == null) return { ok: false, msg: 'Sell % must be 1-100.' };
+  if (key === 'tp_sl_plan') {
+    if (row.kind === 'tier') {
+      if (!Array.isArray(obj.tiers) || !obj.tiers[row.tierIndex] || obj.tiers[row.tierIndex].tp_pct == null) {
+        return { ok: false, msg: `${row.label} belum diset. Tap ✏️ ${row.label} dulu untuk set trigger %.` };
+      }
+      obj.tiers = [...obj.tiers];
+      obj.tiers[row.tierIndex] = { ...obj.tiers[row.tierIndex], sell_pct: n };
+      return commitTierChange(key, obj, `${row.label} sell % set to ${n}%`);
+    }
+    if (row.field === 'sl_pct') {
+      if (obj.sl_pct == null) return { ok: false, msg: 'SL belum diset. Tap ✏️ SL dulu.' };
+      obj.sl_sell_pct = n;
+      return commitTierChange(key, obj, `SL sell % set to ${n}%`);
+    }
+  }
+  if (key === 'trailing_stop') {
+    if (obj.act_pct == null && obj.trail_pct == null) {
+      return { ok: false, msg: 'Trailing belum diset. Tap + Activate atau + Trail dulu.' };
+    }
+    obj.sell_pct = n;
+    return commitTierChange(key, obj, `Trailing sell % set to ${n}%`);
+  }
+  if (key === 'dev_sell_trigger') {
+    if (obj.sell_pct == null && obj.mode == null) {
+      return { ok: false, msg: 'Dev-sell trigger belum diset. Tap + Mode dulu.' };
+    }
+    obj.sell_pct = n;
+    return commitTierChange(key, obj, `Dev-sell exit ${n}% of position`);
+  }
+  if (key === 'time_sell_plan') {
+    if (row.kind === 'timeTier') {
+      if (!Array.isArray(obj.tiers) || !obj.tiers[row.tierIndex] || obj.tiers[row.tierIndex].after_s == null) {
+        return { ok: false, msg: `${row.label} belum diset. Tap ✏️ ${row.label} dulu.` };
+      }
+      obj.tiers = [...obj.tiers];
+      obj.tiers[row.tierIndex] = { ...obj.tiers[row.tierIndex], sell_pct: n };
+      return commitTierChange(key, obj, `${row.label} sell % set to ${n}%`);
+    }
+  }
+  return { ok: false, msg: 'Sell % not editable for this row.' };
 }
 
 function commitTierChange(key, obj, msg) {

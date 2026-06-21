@@ -470,11 +470,19 @@ async function renderAutoSellSubmenu(ctx, key, chatId) {
     if (filled) {
       const valueLabel = slotValueLabel(key, row, stored);
       lines.push(`  • <b>${row.label}</b>: ${valueLabel}`);
-      // row button: edit (entire row) + remove (×)
-      buttons.push([
-        Markup.button.callback(`✏️ ${row.label} (${valueLabel})`, `autosell:add:${key}:${row.id}`),
-        Markup.button.callback(`×`, `autosell:remove:${key}:${row.id}`),
-      ]);
+      // Row buttons:
+      //   [✏️ edit trigger %]   [💰 sell %]   [×]
+      // The first always edits the *trigger* (% for tp/sl/trail/act/mode/after_s).
+      // The second edits *sell_pct* for tiers that have one (tp tier, time tier, trailing, dev sell).
+      const sellPctEditBtn = canEditSellPct(key, row)
+        ? Markup.button.callback(`💰 ${row.kind === 'tier' ? 'sell' : 'sell'} %`, `autosell:add:${key}:${row.id}__sell`)
+        : null;
+      const row_buttons = [
+        Markup.button.callback(`✏️ ${row.label}`, `autosell:add:${key}:${row.id}`),
+      ];
+      if (sellPctEditBtn) row_buttons.push(sellPctEditBtn);
+      row_buttons.push(Markup.button.callback(`×`, `autosell:remove:${key}:${row.id}`));
+      buttons.push(row_buttons);
     } else {
       lines.push(`  <i>${row.addLabel} — tap to set</i>`);
       buttons.push([
@@ -501,6 +509,22 @@ function isSlotFilled(key, row, stored) {
   if (key === 'dev_sell_trigger') return stored[row.field] != null;
   if (key === 'time_sell_plan') {
     if (row.kind === 'timeTier') return Array.isArray(stored.tiers) && stored.tiers[row.tierIndex]?.after_s != null;
+  }
+  return false;
+}
+
+/** Returns true if this row exposes an editable sell_pct alongside the trigger field. */
+function canEditSellPct(key, row) {
+  if (key === 'tp_sl_plan') {
+    if (row.kind === 'tier') return true;       // TP tiers: tp_pct + sell_pct
+    if (row.kind === 'singleton' && row.field === 'sl_pct') return true;  // SL: sl_pct + sl_sell_pct
+  }
+  if (key === 'trailing_stop') return true;     // act/trail + sell_pct (one shared)
+  if (key === 'dev_sell_trigger') {
+    return row.field === 'sell_pct';            // only the sell_pct row itself
+  }
+  if (key === 'time_sell_plan') {
+    if (row.kind === 'timeTier') return true;   // after_s + sell_pct
   }
   return false;
 }
@@ -545,13 +569,19 @@ export async function handleAutoSellAdd(ctx, key, slot) {
   const row = layout.rows.find((r) => r.id === slot);
   if (!row) { await ctx.answerCbQuery('Unknown slot'); return true; }
 
+  // The callback data encodes whether we're editing the trigger field or the
+  // sell_pct. Suffix "__sell" → edit sell_pct; otherwise → edit trigger.
+  const editingSellPct = slot.endsWith('__sell');
+  const baseSlot = editingSellPct ? slot.slice(0, -'__sell'.length) : slot;
+  const baseRow = layout.rows.find((r) => r.id === baseSlot) || row;
   // v0.8.8 (experimental): route through the existing pending-edit flow.
-  // We piggyback on setPending(ctx.chat.id, key, menuMessageId) but store the
-  // slot ID as a special key prefix so handlePendingText knows to call
-  // applyTierChange instead of the generic number parser.
-  setPending(ctx.chat.id, `__autosell:${key}:${slot}`, ctx.callbackQuery?.message?.message_id ?? null);
-
-  const prompt = buildSlotPrompt(key, row);
+  // Pending key encodes (key, slot, field) so handlePendingText knows what to mutate.
+  setPending(
+    ctx.chat.id,
+    `__autosell:${key}:${baseSlot}:${editingSellPct ? 'sell' : 'trigger'}`,
+    ctx.callbackQuery?.message?.message_id ?? null
+  );
+  const prompt = buildSlotPrompt(key, baseRow, editingSellPct);
   await ctx.reply(prompt, {
     parse_mode: 'HTML',
     reply_markup: { force_reply: true, selective: true },
@@ -601,10 +631,15 @@ async function renderAutoSellSubmenuEdit(ctx, key, chatId, menuMessageId) {
     if (filled) {
       const valueLabel = slotValueLabel(key, row, stored);
       lines.push(`  • <b>${row.label}</b>: ${valueLabel}`);
-      buttons.push([
-        Markup.button.callback(`✏️ ${row.label} (${valueLabel})`, `autosell:add:${key}:${row.id}`),
-        Markup.button.callback(`×`, `autosell:remove:${key}:${row.id}`),
-      ]);
+      const sellPctEditBtn = canEditSellPct(key, row)
+        ? Markup.button.callback(`💰 sell %`, `autosell:add:${key}:${row.id}__sell`)
+        : null;
+      const row_buttons = [
+        Markup.button.callback(`✏️ ${row.label}`, `autosell:add:${key}:${row.id}`),
+      ];
+      if (sellPctEditBtn) row_buttons.push(sellPctEditBtn);
+      row_buttons.push(Markup.button.callback(`×`, `autosell:remove:${key}:${row.id}`));
+      buttons.push(row_buttons);
     } else {
       lines.push(`  <i>${row.addLabel} — tap to set</i>`);
       buttons.push([Markup.button.callback(row.addLabel, `autosell:add:${key}:${row.id}`)]);
@@ -624,7 +659,40 @@ async function renderAutoSellSubmenuEdit(ctx, key, chatId, menuMessageId) {
   }
 }
 
-function buildSlotPrompt(key, row) {
+function buildSlotPrompt(key, row, editingSellPct = false) {
+  // When editingSellPct=true, we want the prompt to ask for the sell percentage
+  // for this tier/singleton, NOT the trigger %.
+  if (editingSellPct) {
+    if (key === 'tp_sl_plan' && row.kind === 'tier') {
+      return [
+        `<b>${row.label} — jual berapa % posisi saat trigger?</b>`,
+        '',
+        'Kirim ANGKA 1-100 (misal: 30 = jual 30% dari posisi kamu saat TP tercapai).',
+        'Range: 1-100. /cancel untuk batal.',
+      ].join('\n');
+    }
+    if (key === 'tp_sl_plan' && row.field === 'sl_pct') {
+      return [
+        '<b>SL — jual berapa % posisi saat SL triggered?</b>',
+        '',
+        'Kirim ANGKA 1-100 (default 100 = jual semua). /cancel untuk batal.',
+      ].join('\n');
+    }
+    if (key === 'trailing_stop') {
+      return [
+        '<b>Trailing Stop — jual berapa % posisi saat trigger?</b>',
+        '',
+        'Kirim ANGKA 1-100 (default 100 = jual semua). /cancel untuk batal.',
+      ].join('\n');
+    }
+    if (key === 'time_sell_plan' && row.kind === 'timeTier') {
+      return [
+        `<b>${row.label} — jual berapa % posisi setelah ${row.label}?</b>`,
+        '',
+        'Kirim ANGKA 1-100. /cancel untuk batal.',
+      ].join('\n');
+    }
+  }
   if (key === 'tp_sl_plan') {
     if (row.kind === 'tier') {
       return [
@@ -665,13 +733,18 @@ function buildSlotPrompt(key, row) {
 
 /** Hook into handlePendingText: if pending.key starts with __autosell:, parse via applyTierChange. */
 export function handleAutoSellPending(pendingKey, inputText, chatId) {
-  // pending.key = '__autosell:KEY:SLOT'
-  const m = pendingKey.match(/^__autosell:([^:]+):(.+)$/);
+  // pending.key format options:
+  //   '__autosell:KEY:SLOT'         — edit the trigger field (legacy)
+  //   '__autosell:KEY:SLOT:trigger' — edit trigger field
+  //   '__autosell:KEY:SLOT:sell'    — edit sell_pct only
+  const m = pendingKey.match(/^__autosell:([^:]+):([^:]+)(?::(trigger|sell))?$/);
   if (!m) return null;
   const key = m[1];
   const slot = m[2];
+  const field = m[3] || 'trigger';   // default to trigger edit
+  const action = field === 'sell' ? 'edit_sell' : 'add';
   const stored = parseStored(get(key, chatId));
-  const r = applyTierChange(key, slot, 'add', inputText, stored);
+  const r = applyTierChange(key, slot, action, inputText, stored);
   if (!r.ok) return { ok: false, msg: r.msg };
   return { ok: true, key, json: r.json, msg: r.msg };
 }
