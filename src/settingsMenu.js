@@ -590,6 +590,20 @@ export function applyAutoSellQuick(key, inputText, stored) {
   const trimmed = (inputText || '').trim();
   if (!trimmed) return { ok: false, msg: 'Empty input.' };
 
+  // Count how many TP slots will be filled after this update.
+  // Used to set default sell_pct: 100% kalau cuma 1 tier, 50% kalau multi.
+  function countFinalTps(parsed) {
+    let n = 0;
+    for (let i = 1; i <= 3; i++) {
+      const k = `tp${i}`;
+      if (k in parsed) {
+        const v = String(parsed[k] || '').trim();
+        if (v !== '' && v !== '0') n += 1;
+      }
+    }
+    return n;
+  }
+
   let parsed = {};
   const looksLikeKv = trimmed.includes('=');
   if (!looksLikeKv) {
@@ -681,8 +695,12 @@ export function applyAutoSellQuick(key, inputText, stored) {
         errors.push(`TP${i} harus angka positif (contoh: 50). Got: "${v}"`);
         continue;
       }
-      obj.tiers[i - 1] = { tp_pct: n, sell_pct: obj.tiers[i - 1]?.sell_pct ?? 50 };
-      changes.push(`TP${i} = +${n}%`);
+      // Default sell_pct: 100% kalau ini tier SATU-SATUNYA TP di plan,
+      // 50% kalau ada tier lain (biar gak keluar semua di TP1).
+      const finalTierCount = countFinalTps(parsed);
+      const defaultSell = finalTierCount === 1 ? 100 : 50;
+      obj.tiers[i - 1] = { tp_pct: n, sell_pct: obj.tiers[i - 1]?.sell_pct ?? defaultSell };
+      changes.push(`TP${i} = +${n}% (sell ${obj.tiers[i - 1].sell_pct}%)`);
     }
     if ('sl' in parsed) {
       const v = String(parsed.sl).trim();

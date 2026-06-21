@@ -192,7 +192,10 @@ export function applyTierChange(key, slot, action, inputText, stored) {
       }
       const n = parseNumber(inputText, { min: 1, max: 100000 });
       if (n == null) return { ok: false, msg: 'Invalid number. Send like: 50 (or +50).' };
-      obj.tiers[idx] = { tp_pct: n, sell_pct: obj.tiers[idx]?.sell_pct ?? DEFAULTS.tier_sell_pct_default };
+      // Default sell_pct: 100% kalau cuma 1 tier di plan ini, 50% kalau multi.
+      // (Multi-tier default 50% biar gak exit semua di tier pertama.)
+      const defaultSell = (Array.isArray(obj.tiers) && obj.tiers.filter((t) => t && t.tp_pct != null).length === 0) ? 100 : 50;
+      obj.tiers[idx] = { tp_pct: n, sell_pct: obj.tiers[idx]?.sell_pct ?? defaultSell };
       return commitTierChange(key, obj, `${row.label} set to +${n}% (sell ${obj.tiers[idx].sell_pct}%)`);
     }
     if (row.kind === 'singleton' && row.field === 'sl_pct') {
