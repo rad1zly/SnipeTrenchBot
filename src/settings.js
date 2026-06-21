@@ -171,7 +171,7 @@ const CATALOG = [
   // (= feature disabled). Setting a value like `{"enabled":true,...}` activates
   // the feature. See parseUserInput for schema validation.
   {
-    key: 'tp_sl_plan', type: 'text', nullable: true, category: 'auto-sell',
+    key: 'tp_sl_plan', type: 'text', nullable: true, category: 'trade',
     label: 'TP/SL Plan (JSON)',
     default: null,  // null = disabled. Format: {"enabled":true,"tiers":[{"tp_pct":50,"sell_pct":50},...],"sl_pct":-30,"sl_sell_pct":100}
     parseUserInput: (t) => {
@@ -194,7 +194,7 @@ const CATALOG = [
     },
   },
   {
-    key: 'trailing_stop', type: 'text', nullable: true, category: 'auto-sell',
+    key: 'trailing_stop', type: 'text', nullable: true, category: 'trade',
     label: 'Trailing Stop (JSON)',
     default: null,  // null = disabled. Format: {"enabled":true,"act_pct":20,"trail_pct":10,"sell_pct":100}
     parseUserInput: (t) => {
@@ -211,7 +211,7 @@ const CATALOG = [
     },
   },
   {
-    key: 'dev_sell_trigger', type: 'text', nullable: true, category: 'auto-sell',
+    key: 'dev_sell_trigger', type: 'text', nullable: true, category: 'trade',
     label: 'Dev Sell Trigger (JSON)',
     default: null,  // null = disabled. Format: {"enabled":true,"mode":"any_amount"|"whole_amount","sell_pct":100}
     parseUserInput: (t) => {
@@ -227,7 +227,7 @@ const CATALOG = [
     },
   },
   {
-    key: 'time_sell_plan', type: 'text', nullable: true, category: 'auto-sell',
+    key: 'time_sell_plan', type: 'text', nullable: true, category: 'trade',
     label: 'Time Sell Plan (JSON)',
     default: null,  // null = disabled. Format: {"enabled":true,"tiers":[{"after_s":30,"sell_pct":50},{"after_s":60,"sell_pct":100}]}
     parseUserInput: (t) => {
@@ -248,7 +248,7 @@ const CATALOG = [
     },
   },
   {
-    key: 'sl_pct', type: 'number', nullable: true, category: 'auto-sell',
+    key: 'sl_pct', type: 'number', nullable: true, category: 'trade',
     label: 'Stop Loss % (negative)',
     default: null,  // null = disabled. E.g. -30 = sell all at -30% from entry.
     min: -100, max: -1,
@@ -635,47 +635,7 @@ export function formatValue(key, chatId) {
   if (setting.type === 'text' && (v == null || v === '')) {
     return '—';
   }
-  // v0.8.8 (experimental): pretty-print auto-sell JSON so the menu shows
-  // "TP1 +50% / 50%   TP2 +100% / 50%   SL -30%" instead of a raw JSON blob.
-  // This is just display — the stored value is still the JSON string that
-  // the executor (M2) will parse.
-  if (setting.type === 'text' && setting.category === 'auto-sell' && v) {
-    return formatAutoSellPretty(setting.key, v);
-  }
   return String(v);
-}
-
-/**
- * Pretty-print a single auto-sell setting for the menu. Falls back to a
- * compact JSON preview if the parser can't read the stored value (e.g. a
- * legacy value from before the schema was tightened).
- */
-function formatAutoSellPretty(key, raw) {
-  let obj;
-  try { obj = JSON.parse(raw); } catch { return '(invalid JSON)'; }
-  const fmtPct = (n) => (n > 0 ? `+${n}%` : `${n}%`);
-  if (key === 'tp_sl_plan') {
-    if (!obj.tiers && obj.sl_pct == null) return '—';
-    const parts = [];
-    if (obj.tiers && obj.tiers.length) {
-      parts.push(obj.tiers.map((t, i) => `TP${i + 1} ${fmtPct(t.tp_pct)}/${t.sell_pct}%`).join(' '));
-    }
-    if (obj.sl_pct != null) parts.push(`SL ${fmtPct(obj.sl_pct)}/${obj.sl_sell_pct ?? 100}%`);
-    return parts.join('  ') || '—';
-  }
-  if (key === 'trailing_stop') {
-    return `act ${fmtPct(obj.act_pct)} / trail ${fmtPct(obj.trail_pct)} / sell ${obj.sell_pct ?? 100}%`;
-  }
-  if (key === 'dev_sell_trigger') {
-    const m = obj.mode || 'any_amount';
-    return `mode ${m}, sell ${obj.sell_pct ?? 100}%`;
-  }
-  if (key === 'time_sell_plan') {
-    if (!obj.tiers || !obj.tiers.length) return '—';
-    return obj.tiers.map((t) => `${t.after_s}s/${t.sell_pct}%`).join('  ');
-  }
-  // Generic fallback
-  return JSON.stringify(obj);
 }
 
 /**
