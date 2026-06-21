@@ -341,57 +341,59 @@ export async function executeSignal(event) {
     recordTokenCreated(event);
     return;
   }
-  // v0.8.8 (experimental) M3.1: copy_mode decides which event types
-  // actually trigger a trade. 'reverse' (default) keeps the existing
-  // behaviour — only SELL_DETECTED triggers a buy. 'mirror' inverts
-  // that — only BUY_DETECTED triggers a buy. 'off' disables all
-  // event-driven trades (filters still apply for token_created
-  // tracking but nothing actually buys).
-  const copyMode = settings.get('copy_mode', event.chatId) ?? 'reverse';
+  // v0.8.8 (experimental) M3.1b: copy_mode is now PER-WALLET, not
+  // per-user. The Helius monitor emits one event per (wallet, owner)
+  // pair, so each event already carries the chatId of the user who
+  // watches this specific wallet. The copy_mode for THIS event is
+  // looked up from watched_wallets row matching (chatId, address).
+  // This lets user A watch wallet X in reverse mode and wallet Y in
+  // mirror mode at the same time.
+  const { wallet: dev, mint } = event;
+  const chatId = event.chatId;
+  const walletCfg = walletsDb.getCopyConfig({ chatId, address: dev }) || { copy_mode: 'reverse', copy_ratio: 100 };
+  const copyMode = walletCfg.copy_mode || 'reverse';
+  const copyRatio = Number(walletCfg.copy_ratio) || 100;
 
   if (event.type === 'BUY_DETECTED') {
     if (copyMode === 'mirror') {
-      // v0.8.8 M3.1: mirror mode — fall through to the same BUY
+      // v0.8.8 M3.1b: mirror mode — fall through to the same BUY
       // execution path used by reverse-copy's SELL_DETECTED branch,
       // but flag the trigger type in the log.
       logStep('SIGNAL_ACCEPTED', {
-        dev: event.wallet,
-        mint: event.mint,
+        dev, mint,
         mode: 'MIRROR_BUY',
         copyMode,
+        copyRatio,
       });
-      return _executeBuy(event);
+      return _executeBuy(event, { copyMode, copyRatio });
     }
     // 'off' or 'reverse': BUY_DETECTED is logged but doesn't trade.
     logStep('SIGNAL_IGNORED', {
-      dev: event.wallet,
-      mint: event.mint,
+      dev, mint,
       type: 'BUY_DETECTED',
-      reason: `copy_mode=${copyMode} — only ${copyMode === 'reverse' ? 'SELL_DETECTED' : 'nothing'} triggers a trade`,
+      reason: `wallet.copy_mode=${copyMode} — only ${copyMode === 'reverse' ? 'SELL_DETECTED' : 'nothing'} triggers a trade`,
     });
     return;
   }
   if (event.type !== 'SELL_DETECTED') return;
 
-  const { wallet: dev, mint } = event;
-  const chatId = event.chatId;
-
   // v0.7.0 (06-15): user override — any watched wallet sell = trigger.
-  // v0.8.8 M3.1: only execute if copy_mode is 'reverse' (default) or
-  // 'mirror' (SELL_DETECTED is informational in mirror mode but doesn't
-  // fire a buy — mirror mode only buys on BUY_DETECTED, see above).
+  // v0.8.8 M3.1b: copy_mode is per-wallet. Only execute if THIS wallet's
+  // mode is 'reverse' (default) or 'mirror' (SELL_DETECTED is
+  // informational in mirror mode but doesn't fire a buy — mirror mode
+  // only buys on BUY_DETECTED, see above).
   if (copyMode === 'off') {
-    logStep('SIGNAL_IGNORED', { dev, mint, type: 'SELL_DETECTED', reason: 'copy_mode=off' });
+    logStep('SIGNAL_IGNORED', { dev, mint, type: 'SELL_DETECTED', reason: 'wallet.copy_mode=off' });
     return;
   }
   if (copyMode === 'mirror') {
     // Mirror mode: dev SELL is informational only.
-    logStep('SIGNAL_IGNORED', { dev, mint, type: 'SELL_DETECTED', reason: 'copy_mode=mirror — only BUY_DETECTED triggers' });
+    logStep('SIGNAL_IGNORED', { dev, mint, type: 'SELL_DETECTED', reason: 'wallet.copy_mode=mirror — only BUY_DETECTED triggers' });
     return;
   }
-  logStep('SIGNAL_ACCEPTED', { dev, mint, mode: 'COUNTER_BUY', copyMode });
+  logStep('SIGNAL_ACCEPTED', { dev, mint, mode: 'COUNTER_BUY', copyMode, copyRatio });
 
-  return _executeBuy(event);
+  return _executeBuy(event, { copyMode, copyRatio });
 }
 
 /**
@@ -400,8 +402,12 @@ export async function executeSignal(event) {
  * (BUY_DETECTED → follow-buy) modes. The caller (executeSignal)
  * has already logged the SIGNAL_ACCEPTED / IGNORED decision and
  * validated the copy_mode. This function does the actual trade.
+ *
+ * M3.1b: now accepts { copyMode, copyRatio } from the per-wallet config
+ * (looked up in executeSignal). copyRatio is used to size the buy in
+ * mirror mode (dev's solSpent * copyRatio / 100).
  */
-async function _executeBuy(event) {
+async function _executeBuy(event, { copyMode, copyRatio } = {}) {
   const { wallet: dev, mint } = event;
   const chatId = event.chatId;
 
@@ -437,12 +443,12 @@ async function _executeBuy(event) {
   // ---- Read trade params from THIS USER's settings (mutable at runtime) ----
   // v0.8.7.15: chatId is REQUIRED for all settings reads. Each subscriber has
   // their own config — user A's fixed_buy_sol no longer leaks to user B.
-  // v0.8.8 (experimental) M3.3: copy_ratio. If the event carries a
-  // dev solSpent (mirror mode, BUY_DETECTED) we apply the ratio so the
-  // bot spends (dev_solSpent * copy_ratio / 100). In reverse mode
-  // (default) we use fixed_buy_sol as-is — the dev's sell amount isn't
-  // relevant.
-  const copyRatio = settings.get('copy_ratio', chatId) ?? 100;
+  // v0.8.8 (experimental) M3.3 + M3.1b: copy_ratio. The ratio is now
+  // PER-WALLET (looked up in executeSignal, threaded in as the
+  // `copyRatio` param). In mirror mode the bot spends
+  // (dev's solSpent * copyRatio / 100) instead of fixed_buy_sol. In
+  // reverse mode the ratio is informational (we still use fixed_buy_sol
+  // — the dev's sell amount is the trigger, not a size reference).
   const fixedBuy = settings.get('fixed_buy_sol', chatId);
   let solAmount;
   if (event.type === 'BUY_DETECTED' && typeof event.solSpent === 'number' && event.solSpent > 0) {

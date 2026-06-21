@@ -74,16 +74,23 @@ function initSchema(d) {
   // v0.8.8 (experimental): per-wallet signal filters. min/max buy range +
   // max sell age. Default NULL/0 = no filter. Idempotent ALTER (PRAGMA check
   // before ADD). Backfill via DEFAULT NULL so existing rows keep working.
+  // v0.8.8 (experimental) M3.1b: per-wallet copy mode + ratio. Each watched
+  // wallet has its own copy_mode ('off' | 'reverse' | 'mirror', default
+  // 'reverse' to preserve existing behaviour) and copy_ratio (1-100%,
+  // default 100). NULL means "use user default" but for now the user
+  // default IS the per-wallet value, so the column is just TEXT/INTEGER.
   const wwCols = new Set(
     d.prepare(`PRAGMA table_info(watched_wallets)`).all().map((c) => c.name)
   );
-  for (const [col, type] of [
-    ['min_buy_sol',   'REAL'],
-    ['max_buy_sol',   'REAL'],
-    ['max_sell_age_s','INTEGER'],
+  for (const [col, type, dflt] of [
+    ['min_buy_sol',    'REAL',    null],
+    ['max_buy_sol',    'REAL',    null],
+    ['max_sell_age_s', 'INTEGER', null],
+    ['copy_mode',      'TEXT',    "'reverse'"],
+    ['copy_ratio',     'INTEGER', '100'],
   ]) {
     if (!wwCols.has(col)) {
-      d.exec(`ALTER TABLE watched_wallets ADD COLUMN ${col} ${type} DEFAULT NULL`);
+      d.exec(`ALTER TABLE watched_wallets ADD COLUMN ${col} ${type} DEFAULT ${dflt === null ? 'NULL' : dflt}`);
     }
   }
 
@@ -509,6 +516,29 @@ export const walletsDb = {
     return getDb()
       .prepare(`UPDATE watched_wallets SET last_copy_at = ? WHERE address = ?`)
       .run(ts, address).changes;
+  },
+  // v0.8.8 (experimental) M3.1b: per-wallet copy config. Each user can
+  // configure a watched wallet independently — wallet A can be in
+  // reverse-copy mode while wallet B is in mirror-copy mode, all
+  // under the same user. Per-user (chat_id) check so user A can't
+  // reconfigure user B's wallet.
+  setCopyConfig({ chatId, address, copyMode, copyRatio }) {
+    if (chatId == null) throw new Error('walletsDb.setCopyConfig: chatId is required');
+    const sets = [];
+    const vals = [];
+    if (copyMode != null) { sets.push('copy_mode = ?'); vals.push(copyMode); }
+    if (copyRatio != null) { sets.push('copy_ratio = ?'); vals.push(copyRatio); }
+    if (sets.length === 0) return 0;
+    vals.push(chatId, address);
+    return getDb()
+      .prepare(`UPDATE watched_wallets SET ${sets.join(', ')} WHERE chat_id = ? AND address = ?`)
+      .run(...vals).changes;
+  },
+  getCopyConfig({ chatId, address }) {
+    if (chatId == null) throw new Error('walletsDb.getCopyConfig: chatId is required');
+    return getDb()
+      .prepare(`SELECT copy_mode, copy_ratio FROM watched_wallets WHERE chat_id = ? AND address = ?`)
+      .get(chatId, address);
   },
   // Returns { copy_count, last_copy_at } for one wallet, or null if not found.
   getStats(address) {

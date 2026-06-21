@@ -233,10 +233,76 @@ function mainMenu(chatId) {
 
 // Inline keyboard for the Wallets screen. Tap "➕ Add Wallet" → bot enters
 // pending-add mode (waits for next text message = wallet address).
-const walletsMenu = () => Markup.inlineKeyboard([
-  [Markup.button.callback('➕ Add Wallet', 'cmd:wallet_add')],
-  [Markup.button.callback('« Back to Main', 'menu:main')],
-]);
+const walletsMenu = (chatId) => {
+  // v0.8.8 (experimental) M3.1b: list each wallet with a "config" button
+  // that opens a per-wallet sub-menu for copy mode + ratio. The sub-menu
+  // itself is rendered by walletCopyMenu() and dispatched via
+  // 'wallet:copy:<address>'.
+  const rows = [];
+  if (chatId != null) {
+    const list = walletsDb.list(chatId);
+    for (const w of list) {
+      const mode = w.copy_mode || 'reverse';
+      const ratio = w.copy_ratio != null ? w.copy_ratio : 100;
+      const icon = mode === 'mirror' ? '🟢' : mode === 'reverse' ? '🟠' : '⚪';
+      const short = `${w.address.slice(0, 4)}…${w.address.slice(-4)}`;
+      const label = w.label ? `${w.label} (${short})` : short;
+      rows.push([Markup.button.callback(`${icon} ${label} · ${mode} · ${ratio}%`, `wallet:copy:${w.address}`)]);
+    }
+  }
+  rows.push([Markup.button.callback('➕ Add Wallet', 'cmd:wallet_add')]);
+  rows.push([Markup.button.callback('« Back to Main', 'menu:main')]);
+  return Markup.inlineKeyboard(rows);
+};
+
+function walletCopyMenu(chatId, address) {
+  // v0.8.8 (experimental) M3.1b: per-wallet copy config sub-menu. Shows
+  // current mode + ratio and lets the user flip mode or change ratio.
+  // The full ratio input is delegated to a "Set ratio" prompt so we
+  // don't have to ship a numeric keyboard for every (1-100) value.
+  const w = walletsDb.getCopyConfig({ chatId, address });
+  if (!w) {
+    return Markup.inlineKeyboard([[Markup.button.callback('« Back', 'cmd:wallets')]]);
+  }
+  const mode = w.copy_mode || 'reverse';
+  const ratio = w.copy_ratio != null ? w.copy_ratio : 100;
+  const short = `${address.slice(0, 4)}…${address.slice(-4)}`;
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback(`${mode === 'reverse' ? '🟠' : '⚪'} Reverse`, `wallet:mode:${address}:reverse`),
+      Markup.button.callback(`${mode === 'mirror' ? '🟢' : '⚪'} Mirror`, `wallet:mode:${address}:mirror`),
+      Markup.button.callback(`${mode === 'off' ? '⚫' : '⚪'} Off`, `wallet:mode:${address}:off`),
+    ],
+    [
+      Markup.button.callback(`🎯 Set ratio (${ratio}%)`, `wallet:ratio:${address}`),
+    ],
+    [Markup.button.callback('« Back to Wallets', 'cmd:wallets')],
+  ]);
+}
+
+function walletCopyText(chatId, address) {
+  // v0.8.8 (experimental) M3.1b: per-wallet config text. Shows the
+  // current copy mode + ratio and a one-liner explainer of what each
+  // mode does. Used by the wallet:copy:<addr> callback and after any
+  // mode/ratio update.
+  const w = walletsDb.getCopyConfig({ chatId, address });
+  if (!w) return 'Wallet not found.';
+  const mode = w.copy_mode || 'reverse';
+  const ratio = w.copy_ratio != null ? w.copy_ratio : 100;
+  const explain = {
+    reverse: '🟠 <b>Reverse</b> — buy when this dev SELLS (front-run exit).',
+    mirror:  '🟢 <b>Mirror</b> — buy when this dev BUYS (follow entry).',
+    off:     '⚪ <b>Off</b> — track signals but don\u2019t auto-trade this wallet.',
+  };
+  return [
+    `🎯 <b>Wallet copy config</b>`,
+    `<code>${address}</code>`,
+    '',
+    explain[mode],
+    '',
+    `Ratio: <b>${ratio}%</b>  (mirror: bot spends ${ratio}% of dev's SOL)`,
+  ].join('\n');
+}
 
 function settingsMenu() {
   // v0.5.2: this is now a flat single-screen view. Kept as a thin alias
@@ -336,10 +402,11 @@ function shortMint(m) {
 function buildStatsText(chatId) {
   const w = positionsDb.winStats(chatId);
   const g = positionsDb.winStats(null);
-  // v0.8.8 (experimental) M3.5: include copy mode + ratio so the user
-  // knows which signal type is currently triggering trades for them.
-  const copyMode = settings.get('copy_mode', chatId) ?? 'reverse';
-  const copyRatio = settings.get('copy_ratio', chatId) ?? 100;
+  // v0.8.8 (experimental) M3.5 + M3.1b: copy mode + ratio are now
+  // PER-WALLET (stored in watched_wallets). Show each wallet's mode
+  // + ratio inline so the user can see at a glance which signal
+  // type triggers trades for each watched wallet.
+  const walletList = walletsDb.list(chatId);
   const section = (label, s) => {
     if (s.totalClosed === 0) {
       return `\n<b>${label}</b>\n  no closed trades yet`;
@@ -359,35 +426,53 @@ function buildStatsText(chatId) {
         : []),
     ].join('\n');
   };
+  const modeIcon = (m) => m === 'mirror' ? '🟢' : m === 'reverse' ? '🟠' : '⚪';
+  const modeLabel = (m) => m === 'mirror' ? 'Mirror' : m === 'reverse' ? 'Reverse' : 'Off';
+  const walletLines = walletList.length === 0
+    ? '  (no watched wallets — use /addwallet or /wallets)'
+    : walletList.map((w) => {
+        const mode = w.copy_mode || 'reverse';
+        const ratio = w.copy_ratio != null ? w.copy_ratio : 100;
+        const short = `${w.address.slice(0, 4)}…${w.address.slice(-4)}`;
+        return `  ${modeIcon(mode)} <code>${short}</code> · <b>${modeLabel(mode)}</b> · ${ratio}%`;
+      });
   return [
     '<b>📈 Stats</b>',
-    `  copy mode:  <b>${copyMode === 'mirror' ? '🟢 Mirror' : copyMode === 'reverse' ? '🟠 Reverse' : '⚪ Off'}</b>  (${copyMode === 'mirror' ? 'BUY_DETECTED → buy' : copyMode === 'reverse' ? 'SELL_DETECTED → buy' : 'no auto trades'})`,
-    `  copy ratio: <b>${copyRatio}%</b>  (mirror mode: bot spends ${copyRatio}% of dev's SOL)`,
+    `\n<b>Per-wallet copy config (${walletList.length}):</b>`,
+    walletLines.join('\n'),
     section('Your watchlist', w),
     section('Global (all users)', g),
     '',
     '<i>Use /recent 10 to see the last 10 closed trades in detail.</i>',
+    '<i>Tap a wallet in /wallets to change its copy mode/ratio.</i>',
   ].join('\n');
 }
 
 function buildWalletsText(chatId) {
   // v0.6.1: per-user list. Users can only see their own wallets.
+  // v0.8.8 (experimental) M3.1b: each wallet now shows its copy mode
+  // and ratio, and tapping the wallet shows a per-wallet config menu.
   const list = walletsDb.list(chatId);
   if (list.length === 0) {
     return '💼 <b>Wallets</b>\n\nEmpty. Tap <b>➕ Add Wallet</b> below, or send <code>/addwallet &lt;address&gt; [label]</code>.';
   }
   const totalCopies = walletsDb.totalCopies(chatId);
+  const modeIcon = (m) => m === 'mirror' ? '🟢' : m === 'reverse' ? '🟠' : '⚪';
+  const modeLabel = (m) => m === 'mirror' ? 'Mirror' : m === 'reverse' ? 'Reverse' : 'Off';
   const lines = list.map((w) => {
     const lastCopy = w.last_copy_at > 0
       ? `\n  copies: <b>${w.copy_count}</b> · last: ${new Date(w.last_copy_at).toISOString().slice(0, 16).replace('T', ' ')}Z`
       : `\n  copies: <b>${w.copy_count}</b>`;
-    return `• <code>${w.address}</code>${w.label ? ` — ${w.label}` : ''}\n  added ${new Date(w.added_at).toISOString().slice(0, 10)}` + lastCopy;
+    const mode = w.copy_mode || 'reverse';
+    const ratio = w.copy_ratio != null ? w.copy_ratio : 100;
+    return `• <code>${w.address}</code>${w.label ? ` — ${w.label}` : ''}\n  ${modeIcon(mode)} ${modeLabel(mode)} · ${ratio}%` +
+      `\n  added ${new Date(w.added_at).toISOString().slice(0, 10)}` + lastCopy;
   });
   return (
     `💼 <b>Wallets (${list.length}):</b>\n` +
     `<i>Total copies: <b>${totalCopies}</b></i>\n\n` +
     `${lines.join('\n')}\n\n` +
-    `<i>Tap <b>➕ Add Wallet</b> to add, or /removewallet &lt;address&gt; to remove.</i>`
+    `<i>Tap a wallet button below to change its copy mode/ratio.</i>`
   );
 }
 
@@ -583,11 +668,27 @@ function startSingleBot(token, { onPause: pauseCb, onResume: resumeCb } = {}) {
   const pendingAddWallet = new Map();
   const ADD_WALLET_TTL_MS = 5 * 60 * 1000; // 5 min
 
+  // v0.8.8 (experimental) M3.1b: pending per-wallet copy ratio input.
+  // User tapped "Set ratio" on a wallet's config sub-menu; the next text
+  // message becomes the new ratio. chatId → { address, startedAt }
+  const pendingWalletRatio = new Map();
+  const WALLET_RATIO_TTL_MS = 5 * 60 * 1000;
+
   function isPendingAdd(chatId) {
     const p = pendingAddWallet.get(chatId);
     if (!p) return null;
     if (Date.now() - p.startedAt > ADD_WALLET_TTL_MS) {
       pendingAddWallet.delete(chatId);
+      return null;
+    }
+    return p;
+  }
+
+  function isPendingWalletRatio(chatId) {
+    const p = pendingWalletRatio.get(chatId);
+    if (!p) return null;
+    if (Date.now() - p.startedAt > WALLET_RATIO_TTL_MS) {
+      pendingWalletRatio.delete(chatId);
       return null;
     }
     return p;
@@ -710,7 +811,52 @@ function startSingleBot(token, { onPause: pauseCb, onResume: resumeCb } = {}) {
           await ctx.telegram.editMessageText(ctx.chat.id, loading.message_id, undefined, `❌ Failed: ${e.message || e}`);
         }
       } else if (data === 'cmd:wallets' || data === 'cmd:watchlist') {
-        await renderScreen(ctx, buildWalletsText(ctx.chat.id), walletsMenu());
+        await renderScreen(ctx, buildWalletsText(ctx.chat.id), walletsMenu(ctx.chat.id));
+      } else if (data.startsWith('wallet:copy:')) {
+        // v0.8.8 (experimental) M3.1b: per-wallet copy config sub-menu.
+        const addr = data.slice('wallet:copy:'.length);
+        const w = walletsDb.getCopyConfig({ chatId: ctx.chat.id, address: addr });
+        if (!w) {
+          await ctx.answerCbQuery('Wallet not found');
+          return;
+        }
+        await ctx.answerCbQuery();
+        await ctx.replyWithHTML(walletCopyText(ctx.chat.id, addr), walletCopyMenu(ctx.chat.id, addr));
+      } else if (data.startsWith('wallet:mode:')) {
+        // v0.8.8 M3.1b: switch this wallet's copy mode. Format:
+        //   wallet:mode:<address>:<reverse|mirror|off>
+        const rest = data.slice('wallet:mode:'.length);
+        const lastColon = rest.lastIndexOf(':');
+        if (lastColon < 0) {
+          await ctx.answerCbQuery('Bad request');
+          return;
+        }
+        const addr = rest.slice(0, lastColon);
+        const mode = rest.slice(lastColon + 1);
+        if (!['off', 'reverse', 'mirror'].includes(mode)) {
+          await ctx.answerCbQuery('Bad mode');
+          return;
+        }
+        walletsDb.setCopyConfig({ chatId: ctx.chat.id, address: addr, copyMode: mode });
+        await ctx.answerCbQuery(`Set to ${mode}`);
+        await ctx.replyWithHTML(walletCopyText(ctx.chat.id, addr), walletCopyMenu(ctx.chat.id, addr));
+      } else if (data.startsWith('wallet:ratio:')) {
+        // v0.8.8 M3.1b: enter pending-ratio input. Next text message
+        // from this user becomes the new ratio for this wallet.
+        const addr = data.slice('wallet:ratio:'.length);
+        pendingWalletRatio.set(ctx.chat.id, { address: addr, startedAt: Date.now() });
+        await ctx.answerCbQuery();
+        await ctx.reply(
+          `🎯 <b>Set Copy Ratio</b>\n\n` +
+          `Wallet: <code>${addr}</code>\n\n` +
+          `Send a number 1-100. The bot will spend this % of the dev's SOL when mirror mode is on.\n\n` +
+          `Example: <code>10</code> = bot spends 10% of dev's SOL.\n\n` +
+          `Or /cancel to abort.`,
+          {
+            parse_mode: 'HTML',
+            reply_markup: { force_reply: true, selective: true },
+          }
+        );
       } else if (data === 'cmd:wallet_add') {
         // Enter pending-add mode. Next text message from this chat will be
         // parsed as: <address> [label]. 5-minute TTL.
@@ -857,12 +1003,12 @@ function startSingleBot(token, { onPause: pauseCb, onResume: resumeCb } = {}) {
 
   // ---- /listwallets (legacy alias) ----
   inst.command('listwallets', (ctx) => {
-    ctx.replyWithHTML(buildWalletsText(ctx.chat.id), walletsMenu());
+    ctx.replyWithHTML(buildWalletsText(ctx.chat.id), walletsMenu(ctx.chat.id));
   });
 
   // ---- /wallets (alias for the menu screen) ----
   inst.command('wallets', (ctx) => {
-    ctx.replyWithHTML(buildWalletsText(ctx.chat.id), walletsMenu());
+    ctx.replyWithHTML(buildWalletsText(ctx.chat.id), walletsMenu(ctx.chat.id));
   });
 
   // ---- /wallet (inst's own trading key — set / replace / remove) ----
@@ -1111,6 +1257,30 @@ function startSingleBot(token, { onPause: pauseCb, onResume: resumeCb } = {}) {
     // the message as BULK input — comma or newline separated addresses,
     // each optionally followed by a label. Report a single summary.
     const chatId = ctx.chat?.id;
+    // v0.8.8 (experimental) M3.1b: handle per-wallet copy ratio input.
+    // User tapped "Set ratio" on a wallet's config sub-menu; the next
+    // text message becomes the new ratio (1-100). Validated and
+    // persisted; the sub-menu is re-shown with the new value.
+    if (chatId != null && isPendingWalletRatio(chatId)) {
+      const pending = isPendingWalletRatio(chatId);
+      const text = (ctx.message?.text || '').trim();
+      if (text === '/cancel' || text === 'cancel') {
+        pendingWalletRatio.delete(chatId);
+        return ctx.reply('❌ Cancelled.');
+      }
+      const n = Number(text.replace(/[^\d.\-]/g, ''));
+      if (!Number.isFinite(n) || n < 1 || n > 100) {
+        return ctx.reply('❌ Ratio must be 1-100. Try again, or /cancel.');
+      }
+      walletsDb.setCopyConfig({ chatId, address: pending.address, copyRatio: Math.round(n) });
+      pendingWalletRatio.delete(chatId);
+      await ctx.reply(`✅ Ratio set to <b>${Math.round(n)}%</b> for <code>${pending.address}</code>.`, { parse_mode: 'HTML' });
+      // Re-show the wallet's config sub-menu with the new value
+      try {
+        await ctx.replyWithHTML(walletCopyText(chatId, pending.address), walletCopyMenu(chatId, pending.address));
+      } catch (e) { /* ignore */ }
+      return;
+    }
     if (chatId != null && isPendingAdd(chatId)) {
       const text = (ctx.message?.text || '').trim();
       if (text === '/cancel' || text === 'cancel') {
@@ -1122,7 +1292,7 @@ function startSingleBot(token, { onPause: pauseCb, onResume: resumeCb } = {}) {
       await ctx.reply(bulkAddResultMessage(added, skipped), { parse_mode: 'HTML' });
       // Re-show the wallets list with the new entries
       try {
-        await ctx.replyWithHTML(buildWalletsText(ctx.chat.id), walletsMenu());
+        await ctx.replyWithHTML(buildWalletsText(ctx.chat.id), walletsMenu(ctx.chat.id));
       } catch (e) { /* ignore — message was best-effort */ }
       return;
     }
