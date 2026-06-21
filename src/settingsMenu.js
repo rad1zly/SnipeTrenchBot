@@ -502,13 +502,16 @@ async function renderAutoSellQuickPrompt(ctx, key, chatId) {
     '',
     `Current: <b>${summary}</b>`,
     '',
-    'Kirim nilai dalam format salah satu:',
-    '',
-    '<b>Cara 1 — satu baris (CSV):</b>',
+    '<b>Cara 1 — satu baris (CSV, paling simpel):</b>',
+    'TP1, TP2, TP3 adalah OPSIONAL (skip yang gak perlu). SL selalu negatif.',
+    'Cara baca: angka POSITIF = TP (urut dari kecil), 1 angka NEGATIF di akhir = SL.',
     `<code>${fields.exampleCsv}</code>`,
-    '(urutan: ' + fields.csvOrderLabel + ')',
     '',
-    '<b>Cara 2 — per baris (key=value):</b>',
+    'Contoh lain (cuma TP1 + SL, tanpa TP2/TP3):',
+    '<code>50, -30</code>  → TP1 +50%, SL -30%',
+    '<code>100, 200, -30</code>  → TP1 +100%, TP2 +200%, SL -30%',
+    '',
+    '<b>Cara 2 — per baris (key=value, kalau mau partial/selective):</b>',
     ...fields.exampleKvLines.map((l) => `<code>${l}</code>`),
     '(skip key = tidak diubah; tulis key kosong = hapus tier; /cancel = batal)',
     '',
@@ -587,18 +590,58 @@ export function applyAutoSellQuick(key, inputText, stored) {
   const trimmed = (inputText || '').trim();
   if (!trimmed) return { ok: false, msg: 'Empty input.' };
 
-  // Try CSV mode first: detect by absence of '=' and presence of ',' or all-numeric tokens
   let parsed = {};
   const looksLikeKv = trimmed.includes('=');
   if (!looksLikeKv) {
-    // CSV: split by comma or whitespace
+    // CSV: split by comma or whitespace.
+    // IMPORTANT: positional CSV requires ALL fields filled (otherwise we
+    // can't tell if the user's missing slot is intentional or just absent).
+    // The user can omit TPs they don't need by sending FEWER fields than
+    // expected ONLY if all tokens are uniquely identifiable — so we use a
+    // smarter CSV: trailing SL is always allowed alone, but multiple
+    // positional TPs need explicit key=value.
     const tokens = trimmed.split(/[,\s]+/).filter(Boolean);
     if (tokens.length > fields.csvOrder.length) {
       return { ok: false, msg: `Terlalu banyak nilai. Maksimal ${fields.csvOrder.length}: ${fields.csvOrderLabel}` };
     }
-    tokens.forEach((tok, i) => {
-      parsed[fields.csvOrder[i]] = tok;
-    });
+    // If user provided fewer tokens than csvOrder.length, that's still
+    // OK as long as the missing slots are in the MIDDLE (TP2/TP3).
+    // Convention: missing trailing slots = unused.
+    // However, ambiguous — so we accept positional CSV only when tokens
+    // are all numeric OR the LAST token looks like SL (negative).
+    // For mixed cases, recommend key=value.
+    const allNumeric = tokens.every((t) => /^[+-]?\d+(\.\d+)?$/.test(t));
+    // dev_sell_trigger CSV is [mode_text, sell_pct] so first token can be text.
+    const csvAllowsText = key === 'dev_sell_trigger';
+    if (!allNumeric && !csvAllowsText) {
+      return { ok: false, msg: `Format CSV harus angka semua. Untuk mixed/partial, gunakan key=value.` };
+    }
+    if (tokens.length === 1 && !csvAllowsText) {
+      return { ok: false, msg: `1 nilai saja kurang jelas. Gunakan key=value, misal "sl=-30" atau "tp1=50".` };
+    }
+    const negatives = tokens.filter((t) => Number(t) < 0);
+    const positives = tokens.filter((t) => Number(t) > 0);
+    if (negatives.length > 1) {
+      return { ok: false, msg: `Lebih dari 1 angka negatif. Gunakan key=value untuk指定 SL/Trail yang mana. Contoh:\ntp1=50\nsl=-30` };
+    }
+    if (key === 'tp_sl_plan') {
+      // Positives become TP1, TP2, TP3 in order. Negative becomes SL.
+      positives.forEach((tok, i) => { parsed[`tp${i + 1}`] = tok; });
+      if (negatives.length === 1) parsed.sl = negatives[0];
+    } else if (key === 'trailing_stop') {
+      // First positive = act, negative = trail.
+      if (positives.length) parsed.act = positives[0];
+      if (negatives.length === 1) parsed.trail = negatives[0];
+    } else if (key === 'dev_sell_trigger') {
+      // dev_sell: CSV order is mode, sell. So we don't use the negative trick.
+      tokens.forEach((tok, i) => { parsed[fields.csvOrder[i]] = tok; });
+    } else if (key === 'time_sell_plan') {
+      // time_sell: all positives are T1, T2, T3 in order.
+      positives.forEach((tok, i) => { parsed[`t${i + 1}`] = tok; });
+    } else {
+      // Fallback: positional.
+      tokens.forEach((tok, i) => { parsed[fields.csvOrder[i]] = tok; });
+    }
   } else {
     // KV: split by newline or semicolon
     const lines = trimmed.split(/[\n;]+/);
