@@ -31,11 +31,12 @@ const NULLABLE_NUMBER_KEYS = new Set([
 ]);
 
 const CATEGORY_LABELS = {
-  trade:    { emoji: '💰', label: 'Trade',    desc: 'Per-trade params (SOL size, slippage, fees)' },
-  filters:  { emoji: '🔍', label: 'Filters',  desc: 'Entry conditions (unrenounced, MC, age, exclude)' },
-  token:    { emoji: '🪙', label: 'Token',    desc: 'Per-token limits (buy limit, daily cap)' },
-  time:     { emoji: '⏰', label: 'Time',     desc: 'Active-hours window (UTC)' },
-  advanced: { emoji: '🔧', label: 'Advanced', desc: 'Tag, hold time, raw overrides' },
+  trade:     { emoji: '💰', label: 'Trade',     desc: 'Per-trade params (SOL size, slippage, fees)' },
+  filters:   { emoji: '🔍', label: 'Filters',   desc: 'Entry conditions (unrenounced, MC, age, exclude)' },
+  token:     { emoji: '🪙', label: 'Token',     desc: 'Per-token limits (buy limit, daily cap)' },
+  time:      { emoji: '⏰', label: 'Time',      desc: 'Active-hours window (UTC)' },
+  'auto-sell':{ emoji: '🎯', label: 'Auto-Sell',desc: 'Exit plan (TP/SL, Trailing, Dev Sell, Time)' },
+  advanced:  { emoji: '🔧', label: 'Advanced',  desc: 'Tag, hold time, raw overrides' },
 };
 
 // TradeWiz pairs that go side-by-side (2-column layout). Order matters:
@@ -57,7 +58,6 @@ for (const [left, right] of PAIR_GROUPS) {
   PAIR_OF.set(left, right);
   PAIR_OF.set(right, left);
 }
-const SEEN = new Set();
 
 // In-memory state: which setting the user is currently editing
 // chatId -> { key, startedAt, menuMessageId }
@@ -123,6 +123,7 @@ function describeRange(setting) {
  */
 function buildFlatText(chatId) {
   if (chatId == null) throw new Error('settingsMenu.buildFlatText: chatId is required');
+  const SEEN = new Set();
   const lines = [
     '<b>🎯 Copy Trade Settings</b>',
     '',
@@ -131,7 +132,7 @@ function buildFlatText(chatId) {
     '',
   ];
 
-  for (const cat of ['trade', 'filters', 'token', 'time', 'advanced']) {
+  for (const cat of ['trade', 'filters', 'token', 'time', 'auto-sell', 'advanced']) {
     const items = byCategory(cat);
     if (items.length === 0) continue;
     const { emoji, label, desc } = CATEGORY_LABELS[cat];
@@ -177,9 +178,10 @@ function buildFlatText(chatId) {
  */
 function buildFlatKeyboard(chatId) {
   if (chatId == null) throw new Error('settingsMenu.buildFlatKeyboard: chatId is required');
+  const SEEN = new Set();
   const buttons = [];
   // We iterate the catalog in display order, but pair rows consume 2 keys.
-  for (const cat of ['trade', 'filters', 'token', 'time', 'advanced']) {
+  for (const cat of ['trade', 'filters', 'token', 'time', 'auto-sell', 'advanced']) {
     const items = byCategory(cat);
     if (items.length === 0) continue;
     for (const s of items) {
@@ -262,6 +264,139 @@ async function renderFlat(ctx) {
 /**
  * Handle `set:toggle:KEY` and `set:edit:KEY` callbacks. Returns true if handled.
  */
+// -----------------------------------------------------------------------------
+// v0.8.8 (experimental): Auto-Sell structured prompts
+// -----------------------------------------------------------------------------
+// Each auto-sell setting has 3-4 quick presets (Conservative / Aggressive /
+// Moon Bag / Disable) so the user can configure without writing JSON. The
+// preset callback data is `autosell:preset:KEY:PRESET` and is handled by
+// handleAutoSellPreset() — it writes the JSON directly to user_settings.
+
+const AUTO_SELL_PRESETS = {
+  tp_sl_plan: {
+    conservative: { tiers: [{ tp_pct: 30, sell_pct: 50 }, { tp_pct: 60, sell_pct: 50 }], sl_pct: -20, sl_sell_pct: 100 },
+    aggressive:   { tiers: [{ tp_pct: 50, sell_pct: 50 }, { tp_pct: 100, sell_pct: 50 }, { tp_pct: 200, sell_pct: 100 }], sl_pct: -30, sl_sell_pct: 100 },
+    moon_bag:     { tiers: [{ tp_pct: 100, sell_pct: 25 }, { tp_pct: 300, sell_pct: 25 }, { tp_pct: 700, sell_pct: 50 }], sl_pct: -40, sl_sell_pct: 100 },
+  },
+  trailing_stop: {
+    conservative: { act_pct: 30, trail_pct: 15, sell_pct: 100 },
+    aggressive:   { act_pct: 50, trail_pct: 20, sell_pct: 100 },
+    moon_bag:     { act_pct: 100, trail_pct: 30, sell_pct: 100 },
+  },
+  dev_sell_trigger: {
+    conservative: { mode: 'any_amount', sell_pct: 50 },
+    aggressive:   { mode: 'any_amount', sell_pct: 100 },
+    moon_bag:     { mode: 'whole_amount', sell_pct: 100 },
+  },
+  time_sell_plan: {
+    conservative: { tiers: [{ after_s: 30, sell_pct: 50 }, { after_s: 90, sell_pct: 100 }] },
+    aggressive:   { tiers: [{ after_s: 60, sell_pct: 50 }, { after_s: 120, sell_pct: 100 }] },
+    moon_bag:     { tiers: [{ after_s: 180, sell_pct: 50 }, { after_s: 300, sell_pct: 50 }] },
+  },
+};
+
+const AUTO_SELL_PROMPTS = {
+  tp_sl_plan: (current) => [
+    '<b>🎯 Take Profit / Stop Loss Plan</b>',
+    '',
+    `Current: <b>${current || '—'}</b>`,
+    '',
+    'Pick a preset, or reply with your own in JSON:',
+    '<code>{"tiers":[{"tp_pct":50,"sell_pct":50},{"tp_pct":100,"sell_pct":50}],"sl_pct":-30,"sl_sell_pct":100}</code>',
+    '',
+    '<b>Tiers</b> = sell X% of position when price is +Y% from entry.',
+    '<b>SL</b> = sell all when price drops to -Y% from entry.',
+  ].join('\n'),
+  trailing_stop: (current) => [
+    '<b>📉 Trailing Stop</b>',
+    '',
+    `Current: <b>${current || '—'}</b>`,
+    '',
+    'Pick a preset, or reply with your own in JSON:',
+    '<code>{"act_pct":50,"trail_pct":20,"sell_pct":100}</code>',
+    '',
+    '<b>act_pct</b> = trailing activates once price is +X% from entry.',
+    '<b>trail_pct</b> = trail follows peak at -X% (sell if price drops that much from peak).',
+  ].join('\n'),
+  dev_sell_trigger: (current) => [
+    '<b>🚨 Dev Sell Auto-Exit</b>',
+    '',
+    `Current: <b>${current || '—'}</b>`,
+    '',
+    'Pick a preset, or reply with your own in JSON:',
+    '<code>{"mode":"any_amount","sell_pct":100}</code>',
+    '',
+    '<b>mode</b> = "any_amount" (exit on any dev sell) or "whole_amount" (exit only on full dump).',
+    '<b>sell_pct</b> = % of your position to sell.',
+  ].join('\n'),
+  time_sell_plan: (current) => [
+    '<b>⏱️ Time-based Exit</b>',
+    '',
+    `Current: <b>${current || '—'}</b>`,
+    '',
+    'Pick a preset, or reply with your own in JSON:',
+    '<code>{"tiers":[{"after_s":60,"sell_pct":50},{"after_s":120,"sell_pct":100}]}</code>',
+    '',
+    '<b>tiers</b> = sell X% of position after Ys of holding.',
+  ].join('\n'),
+};
+
+function buildAutoSellPrompt(key, chatId) {
+  const current = formatValue(key, chatId);
+  const textFn = AUTO_SELL_PROMPTS[key];
+  const presets = AUTO_SELL_PRESETS[key];
+  if (!textFn || !presets) {
+    return { text: `Unknown auto-sell key: ${key}`, markup: null };
+  }
+  const text = textFn(current);
+  // Inline keyboard: 3 preset columns + 1 row "Disable"
+  const presetLabels = {
+    conservative: '🟢 Conservative',
+    aggressive:   '🟠 Aggressive',
+    moon_bag:     '🚀 Moon Bag',
+  };
+  const buttons = [
+    Object.keys(presets).map((p) =>
+      Markup.button.callback(presetLabels[p], `autosell:preset:${key}:${p}`)
+    ),
+    [Markup.button.callback('❌ Disable', `autosell:preset:${key}:disable`)],
+  ];
+  return { text, markup: { reply_markup: { inline_keyboard: buttons } } };
+}
+
+export async function handleAutoSellPreset(ctx, key, preset) {
+  const chatId = ctx.chat?.id;
+  if (chatId == null) {
+    await ctx.answerCbQuery('No chat context');
+    return true;
+  }
+  const setting = getCatalogEntry(key);
+  if (!setting) {
+    await ctx.answerCbQuery('Unknown setting');
+    return true;
+  }
+  if (preset === 'disable') {
+    set(key, null, chatId);
+    await ctx.answerCbQuery('Disabled');
+    await ctx.reply(`✅ <b>${setting.label}</b> disabled.`, { parse_mode: 'HTML' });
+    clearPending(chatId);
+    return true;
+  }
+  const presets = AUTO_SELL_PRESETS[key];
+  if (!presets || !presets[preset]) {
+    await ctx.answerCbQuery('Unknown preset');
+    return true;
+  }
+  set(key, JSON.stringify(presets[preset]), chatId);
+  await ctx.answerCbQuery(`Applied: ${preset}`);
+  await ctx.reply(
+    `✅ <b>${setting.label}</b> set to <b>${preset}</b>.\n<code>${JSON.stringify(presets[preset])}</code>`,
+    { parse_mode: 'HTML' }
+  );
+  clearPending(chatId);
+  return true;
+}
+
 export async function handleSetCallback(ctx, action, key) {
   const chatId = ctx.chat?.id;
   if (chatId == null) {
@@ -293,18 +428,28 @@ export async function handleSetCallback(ctx, action, key) {
     // force-reply prompt, which Telegram rejects with 400).
     const menuMessageId = ctx.callbackQuery?.message?.message_id ?? null;
     setPending(ctx.chat.id, key, menuMessageId);
-    const text = [
-      `<b>${setting.label}</b>`,
-      '',
-      `Current: <b>${formatValue(key, chatId)}</b>  ${formatSource(key, chatId)}`,
-      `Type: <b>${setting.type}</b>`,
-      `Range: ${describeRange(setting)}`,
-      '',
-      '<i>Send the new value as a reply to this message. Or /cancel to abort.</i>',
-    ].join('\n');
+    // v0.8.8 (experimental): auto-sell settings use structured prompts with
+    // quick-preset buttons (Conservative / Aggressive / Moon Bag / Disable)
+    // instead of raw JSON. Fallback to the old text prompt for non-auto-sell.
+    let text, extraMarkup = null;
+    if (setting.category === 'auto-sell' && setting.type === 'text') {
+      const r = buildAutoSellPrompt(key, chatId);
+      text = r.text;
+      extraMarkup = r.markup;
+    } else {
+      text = [
+        `<b>${setting.label}</b>`,
+        '',
+        `Current: <b>${formatValue(key, chatId)}</b>  ${formatSource(key, chatId)}`,
+        `Type: <b>${setting.type}</b>`,
+        `Range: ${describeRange(setting)}`,
+        '',
+        '<i>Send the new value as a reply to this message. Or /cancel to abort.</i>',
+      ].join('\n');
+    }
     await ctx.reply(text, {
       parse_mode: 'HTML',
-      reply_markup: { force_reply: true, selective: true },
+      reply_markup: { force_reply: true, selective: true, ...(extraMarkup || {}) },
     });
     await ctx.answerCbQuery();
     return true;

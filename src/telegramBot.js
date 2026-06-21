@@ -540,6 +540,14 @@ export function startTelegramBot({ onPause: pauseCb, onResume: resumeCb } = {}) 
         const action = parts[1];
         const key = parts.slice(2).join(':');
         await sm.handleSetCallback(ctx, action, key);
+      } else if (data.startsWith('autosell:preset:')) {
+        // v0.8.8 (experimental): autosell:preset:KEY:PRESET
+        // PRESET is one of: conservative | aggressive | moon_bag | disable
+        const parts = data.split(':');
+        // parts = ['autosell', 'preset', KEY, PRESET]
+        const key = parts[2];
+        const preset = parts.slice(3).join(':');
+        await sm.handleAutoSellPreset(ctx, key, preset);
       } else if (data === 'cmd:status') {
         await renderScreen(ctx, buildStatusText(ctx.chat.id), commandBackMenu());
       } else if (data === 'cmd:stats') {
