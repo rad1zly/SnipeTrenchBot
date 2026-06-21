@@ -26,7 +26,8 @@ import {
 const NULLABLE_NUMBER_KEYS = new Set([
   'min_mc_usd', 'max_mc_usd',
   'min_token_age_min', 'max_token_age_min',
-  'sol_spending_limit', 'buy_priority_fee_sol', 'buy_tip_sol',
+  'sol_spending_limit', 'buy_priority_fee_sol',
+  'tp_sl_plan', 'trailing_stop', 'dev_sell_trigger', 'time_sell_plan', 'sl_pct',
 ]);
 
 const CATEGORY_LABELS = {
@@ -42,8 +43,9 @@ const CATEGORY_LABELS = {
 const PAIR_GROUPS = [
   ['max_mc_usd',           'min_mc_usd'],
   ['max_token_age_min',    'min_token_age_min'],
-  ['buy_priority_fee_sol', 'buy_tip_sol'],
+  ['buy_priority_fee_sol', 'jito_buy_tip_sol'],
   ['slippage_bps',         'pump_slippage_bps'],
+  ['jito_sell_tip_sol',    'pump_sell_slippage_bps'],
   ['unrenounced_only',     'unburned_only'],
   ['exclude_internal',     'exclude_external'],
   ['start_time',           'end_time'],

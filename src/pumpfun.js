@@ -236,10 +236,18 @@ function computeBuyQuote(virtualSolReserves, virtualTokenReserves, solAmountLamp
   const newTokens = k / newSol;
   const tokensOut = virtualTokenReserves - newTokens;
   // Price impact %: (effective - spot) / spot * 100
-  const spotPrice = (virtualSolReserves * BPS_DENOMINATOR) / virtualTokenReserves;  // lamports per 1 token (raw)
-  const effectivePrice = (solAmountLamports * BPS_DENOMINATOR) / tokensOut;
-  const priceImpactBps = effectivePrice > spotPrice
-    ? Number(((effectivePrice - spotPrice) * 10000n) / spotPrice) / 100
+  // v0.8.8 (experimental) fix: integer division truncates to 0n when
+  // virtualTokenReserves >> virtualSolReserves * BPS_DENOMINATOR (token
+  // reserves dominate). Multiply by 1_000_000n scaling factor first, divide
+  // at the end. Also guard against virtualTokenReserves = 0.
+  if (virtualTokenReserves === 0n || tokensOut === 0n) {
+    return { tokensOut, priceImpact: 100, solAfterFee: amountAfterFee };
+  }
+  const SCALE = 1_000_000n;
+  const spotPriceScaled = (virtualSolReserves * BPS_DENOMINATOR * SCALE) / virtualTokenReserves;  // lamports per 1 token (scaled)
+  const effectivePriceScaled = (solAmountLamports * BPS_DENOMINATOR * SCALE) / tokensOut;
+  const priceImpactBps = effectivePriceScaled > spotPriceScaled
+    ? Number(((effectivePriceScaled - spotPriceScaled) * 10000n) / spotPriceScaled) / 100
     : 0;
   return {
     tokensOut,
@@ -699,6 +707,21 @@ export async function buildSwapTransaction({ quoteResponse, userPublicKey, side,
     instructions.push(createAtaIx);
   }
   instructions.push(mainIx);
+
+  // v0.8.8 (experimental): Jito tip. Append as the LAST instruction so the
+  // block engine recognizes this as a Jito-tipped tx. Default 0 = no tip.
+  // When enabled, sends a SOL transfer from the user to a Jito tip account.
+  // Picks a different tip account each call to spread across Jito's 4 active
+  // accounts. If chatId is null, skip (defensive — should never happen in
+  // executor path but is safe).
+  if (chatId != null) {
+    try {
+      const { appendTipIfEnabled } = await import('./jitoTip.js');
+      appendTipIfEnabled(instructions, user, side, chatId);
+    } catch (e) {
+      // jitoTip.js unavailable (rare) — skip silently, no tip
+    }
+  }
 
   // v0.8.5: ComputeBudget → [createATA only for BUY] → mainIx
   const message = new TransactionMessage({

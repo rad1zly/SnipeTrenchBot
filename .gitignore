@@ -34,3 +34,7 @@ Thumbs.db
 *.seed
 coverage/
 .nyc_output/
+
+# Dev log (work-in-progress notes, not for repo)
+log_bot.md
+log_*.txt

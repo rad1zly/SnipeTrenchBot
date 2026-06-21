@@ -71,6 +71,22 @@ function initSchema(d) {
     CREATE INDEX IF NOT EXISTS idx_watched_wallets_address ON watched_wallets(address);
   `);
 
+  // v0.8.8 (experimental): per-wallet signal filters. min/max buy range +
+  // max sell age. Default NULL/0 = no filter. Idempotent ALTER (PRAGMA check
+  // before ADD). Backfill via DEFAULT NULL so existing rows keep working.
+  const wwCols = new Set(
+    d.prepare(`PRAGMA table_info(watched_wallets)`).all().map((c) => c.name)
+  );
+  for (const [col, type] of [
+    ['min_buy_sol',   'REAL'],
+    ['max_buy_sol',   'REAL'],
+    ['max_sell_age_s','INTEGER'],
+  ]) {
+    if (!wwCols.has(col)) {
+      d.exec(`ALTER TABLE watched_wallets ADD COLUMN ${col} ${type} DEFAULT NULL`);
+    }
+  }
+
   // v0.6.2: rename min_mc_sol / max_mc_sol → min_mc_usd / max_mc_usd.
   // MC bounds now live in USD (TradeWiz parity: "MC (USD)"). One-time,
   // idempotent — re-running is a no-op because the old key no longer exists.
@@ -104,7 +120,9 @@ function initSchema(d) {
     CREATE INDEX IF NOT EXISTS idx_positions_mint ON positions(mint);
     CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
     CREATE INDEX IF NOT EXISTS idx_positions_dev ON positions(dev_wallet);
+  `);
 
+  d.exec(`
     CREATE TABLE IF NOT EXISTS signals (
       id         INTEGER PRIMARY KEY AUTOINCREMENT,
       timestamp  INTEGER NOT NULL,
@@ -189,6 +207,19 @@ function initSchema(d) {
   }
   if (!posCols.includes('hold_ms')) {
     d.exec(`ALTER TABLE positions ADD COLUMN hold_ms INTEGER;`);
+  }
+  // v0.8.8 (experimental): Auto-Sell position state. Tracks TP/SL tier
+  // execution, peak value for trailing, partial-fill amount. Idempotent
+  // ALTER for upgrade-from-pre-v0.8.8 safety.
+  for (const [col, type, def] of [
+    ['peak_sol_value',          'REAL', 'NULL'],
+    ['tp_sl_fired',             'TEXT', 'NULL'],   // JSON: ["tp1", "sl"]
+    ['sold_pct',                'REAL', '0'],
+    ['auto_sell_plan_snapshot', 'TEXT', 'NULL'],   // JSON: snapshot of plan at entry time
+  ]) {
+    if (!posCols.includes(col)) {
+      d.exec(`ALTER TABLE positions ADD COLUMN ${col} ${type} DEFAULT ${def};`);
+    }
   }
   // v0.8.7.15: add chat_id column for per-user position isolation.
   // Existing rows get NULL chat_id (legacy pre-isolation data). The

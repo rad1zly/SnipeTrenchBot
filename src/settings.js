@@ -98,10 +98,27 @@ const CATALOG = [
     },
   },
   {
-    key: 'buy_tip_sol', type: 'number', category: 'trade',
-    label: 'Buy Tip 🚀 (SOL)',
+    // v0.8.8 (experimental): Jito tip for BUY. Goes to Jito tip account for
+    // faster block inclusion. Default 0 (no tip, fall back to normal priority
+    // fee). When set, the executor adds a Jito tip transfer instruction.
+    key: 'jito_buy_tip_sol', type: 'number', category: 'trade',
+    label: 'Jito Buy Tip 🚀 (SOL)',
     default: 0.0,
     min: 0,             // no upper bound
+    parseUserInput: (t) => {
+      const s = t.trim().toLowerCase();
+      if (['none', 'unlimited', 'off', '0', ''].includes(s)) return 0;
+      const n = parseFloat(t);
+      if (Number.isNaN(n) || n < 0) return null;
+      return n;
+    },
+  },
+  {
+    // v0.8.8 (experimental): Jito tip for SELL. Default 0 (no tip).
+    key: 'jito_sell_tip_sol', type: 'number', category: 'trade',
+    label: 'Jito Sell Tip 🚀 (SOL)',
+    default: 0.0,
+    min: 0,
     parseUserInput: (t) => {
       const s = t.trim().toLowerCase();
       if (['none', 'unlimited', 'off', '0', ''].includes(s)) return 0;
@@ -145,6 +162,101 @@ const CATALOG = [
     parseUserInput: (t) => {
       const n = parseInt(t, 10);
       if (Number.isNaN(n) || n < 0 || n > 5) return null;
+      return n;
+    },
+  },
+  // ── v0.8.8 (experimental): Auto-Sell Plan (TP/SL/Trailing/DevSell/Time) ────
+  // These settings drive the position-exit engine. They are stored as JSON
+  // strings in user_settings (type 'text' with JSON parsing). Default is null
+  // (= feature disabled). Setting a value like `{"enabled":true,...}` activates
+  // the feature. See parseUserInput for schema validation.
+  {
+    key: 'tp_sl_plan', type: 'text', nullable: true, category: 'trade',
+    label: 'TP/SL Plan (JSON)',
+    default: null,  // null = disabled. Format: {"enabled":true,"tiers":[{"tp_pct":50,"sell_pct":50},...],"sl_pct":-30,"sl_sell_pct":100}
+    parseUserInput: (t) => {
+      const s = t.trim();
+      if (['none', 'off', '0', ''].includes(s.toLowerCase())) return null;
+      try {
+        const obj = JSON.parse(s);
+        if (typeof obj !== 'object' || obj === null) return null;
+        if (obj.tiers && !Array.isArray(obj.tiers)) return null;
+        if (obj.tiers) {
+          for (const tier of obj.tiers) {
+            if (typeof tier.tp_pct !== 'number' || typeof tier.sell_pct !== 'number') return null;
+            if (tier.tp_pct <= 0 || tier.sell_pct <= 0 || tier.sell_pct > 100) return null;
+          }
+        }
+        if (obj.sl_pct !== undefined && (typeof obj.sl_pct !== 'number' || obj.sl_pct >= 0)) return null;
+        if (obj.sl_sell_pct !== undefined && (typeof obj.sl_sell_pct !== 'number' || obj.sl_sell_pct <= 0 || obj.sl_sell_pct > 100)) return null;
+        return JSON.stringify(obj);
+      } catch (e) { return null; }
+    },
+  },
+  {
+    key: 'trailing_stop', type: 'text', nullable: true, category: 'trade',
+    label: 'Trailing Stop (JSON)',
+    default: null,  // null = disabled. Format: {"enabled":true,"act_pct":20,"trail_pct":10,"sell_pct":100}
+    parseUserInput: (t) => {
+      const s = t.trim();
+      if (['none', 'off', '0', ''].includes(s.toLowerCase())) return null;
+      try {
+        const obj = JSON.parse(s);
+        if (typeof obj !== 'object' || obj === null) return null;
+        if (typeof obj.act_pct !== 'number' || obj.act_pct <= 0) return null;
+        if (typeof obj.trail_pct !== 'number' || obj.trail_pct <= 0) return null;
+        if (typeof obj.sell_pct !== 'number' || obj.sell_pct <= 0 || obj.sell_pct > 100) return null;
+        return JSON.stringify(obj);
+      } catch (e) { return null; }
+    },
+  },
+  {
+    key: 'dev_sell_trigger', type: 'text', nullable: true, category: 'trade',
+    label: 'Dev Sell Trigger (JSON)',
+    default: null,  // null = disabled. Format: {"enabled":true,"mode":"any_amount"|"whole_amount","sell_pct":100}
+    parseUserInput: (t) => {
+      const s = t.trim();
+      if (['none', 'off', '0', ''].includes(s.toLowerCase())) return null;
+      try {
+        const obj = JSON.parse(s);
+        if (typeof obj !== 'object' || obj === null) return null;
+        if (obj.mode && !['any_amount', 'whole_amount'].includes(obj.mode)) return null;
+        if (obj.sell_pct !== undefined && (typeof obj.sell_pct !== 'number' || obj.sell_pct <= 0 || obj.sell_pct > 100)) return null;
+        return JSON.stringify(obj);
+      } catch (e) { return null; }
+    },
+  },
+  {
+    key: 'time_sell_plan', type: 'text', nullable: true, category: 'trade',
+    label: 'Time Sell Plan (JSON)',
+    default: null,  // null = disabled. Format: {"enabled":true,"tiers":[{"after_s":30,"sell_pct":50},{"after_s":60,"sell_pct":100}]}
+    parseUserInput: (t) => {
+      const s = t.trim();
+      if (['none', 'off', '0', ''].includes(s.toLowerCase())) return null;
+      try {
+        const obj = JSON.parse(s);
+        if (typeof obj !== 'object' || obj === null) return null;
+        if (obj.tiers && !Array.isArray(obj.tiers)) return null;
+        if (obj.tiers) {
+          for (const tier of obj.tiers) {
+            if (typeof tier.after_s !== 'number' || tier.after_s <= 0) return null;
+            if (typeof tier.sell_pct !== 'number' || tier.sell_pct <= 0 || tier.sell_pct > 100) return null;
+          }
+        }
+        return JSON.stringify(obj);
+      } catch (e) { return null; }
+    },
+  },
+  {
+    key: 'sl_pct', type: 'number', nullable: true, category: 'trade',
+    label: 'Stop Loss % (negative)',
+    default: null,  // null = disabled. E.g. -30 = sell all at -30% from entry.
+    min: -100, max: -1,
+    parseUserInput: (t) => {
+      const s = t.trim().toLowerCase();
+      if (['none', 'off', '0', ''].includes(s)) return null;
+      const n = parseFloat(t);
+      if (Number.isNaN(n) || n >= 0 || n < -100) return null;
       return n;
     },
   },
