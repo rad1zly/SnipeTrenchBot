@@ -7,10 +7,13 @@
 // anti-sandwich). Reference: https://docs.jito.wtf/lowlatencytxnsend/
 //
 // Usage:
-//   import { buildJitoTipIx, hasJitoTip } from './jitoTip.js';
-//   if (hasJitoTip(chatId)) {
-//     tx.add(buildJitoTipIx(payer, settings.get('jito_buy_tip_sol', chatId)));
-//   }
+//   import { appendTipIfEnabled } from './jitoTip.js';
+//   appendTipIfEnabled(instructions, payer, 'buy');
+//   appendTipIfEnabled(instructions, payer, 'sell');
+//
+// v0.8.8 (experimental) M1.20: Jito tip is now a FIXED admin config, not a
+// per-user setting. Configure via env JITO_BUY_TIP_SOL / JITO_SELL_TIP_SOL
+// (default 0.001 SOL each). Set to 0 to disable.
 //
 // Jito has 8 rotating tip accounts. We pick one randomly per-tx so the
 // validator distribution is fair. If the picked account is invalid (Jito
@@ -19,7 +22,7 @@
 // =============================================================================
 
 import { PublicKey, TransactionInstruction, SystemProgram } from '@solana/web3.js';
-import * as settings from './settings.js';
+import config from './config.js';
 
 // Jito tip accounts (round-robin). Source: https://docs.jito.wtf/lowlatencytxnsend/
 // v0.8.8: only the 3 verified (publicly documented) accounts are used.
@@ -60,13 +63,21 @@ export function buildJitoTipIx(payer, tipSol) {
 }
 
 /**
- * Check whether the user has enabled Jito tip for this side.
- * Returns the tip amount in SOL (0 if disabled).
+ * Check whether Jito tip is configured for this side.
+ * Returns the tip amount in SOL (0 if disabled / not configured).
+ *
+ * v0.8.8 (experimental) M1.20: tip is now a fixed admin config from
+ * `config.JITO_BUY_TIP_SOL` / `config.JITO_SELL_TIP_SOL` (env-driven).
+ * Per-user settings (jito_buy_tip_sol / jito_sell_tip_sol) are no longer
+ * honored — those catalog entries are hidden from the menu.
  */
 export function getTipAmount(side, chatId) {
-  const key = side === 'buy' ? 'jito_buy_tip_sol' : 'jito_sell_tip_sol';
-  if (chatId == null) return 0;
-  return Number(settings.get(key, chatId) || 0);
+  // chatId is unused now but kept in the signature so callers / tests
+  // don't break.
+  void chatId;
+  if (side === 'buy') return Number(config.JITO_BUY_TIP_SOL || 0);
+  if (side === 'sell') return Number(config.JITO_SELL_TIP_SOL || 0);
+  return 0;
 }
 
 /**

@@ -105,6 +105,22 @@ const config = {
   HELIUS_API_KEY: envString('HELIUS_API_KEY', ''),
 
   // ---------------------------------------------------------------------------
+  // Jito tip (admin / fixed config — v0.8.8 experimental M1.20)
+  // ---------------------------------------------------------------------------
+  // Jito tips are a per-process fixed value (not per-user setting). Reference
+  // bot (the one user is cloning) ships with a fixed tip amount, so users
+  // don't need to tune it via the menu. Set JITO_BUY_TIP_SOL / JITO_SELL_TIP_SOL
+  // in .env to override. Default = 0.001 SOL (1_000_000 lamports) for both.
+  JITO_BUY_TIP_SOL: (() => {
+    const v = Number(process.env.JITO_BUY_TIP_SOL ?? '0.001');
+    return Number.isFinite(v) && v >= 0 ? v : 0.001;
+  })(),
+  JITO_SELL_TIP_SOL: (() => {
+    const v = Number(process.env.JITO_SELL_TIP_SOL ?? '0.001');
+    return Number.isFinite(v) && v >= 0 ? v : 0.001;
+  })(),
+
+  // ---------------------------------------------------------------------------
   // Bot trading wallet — REMOVED in v0.3.0
   // ---------------------------------------------------------------------------
   // The private key is now set via Telegram (see /start → 🔑 Wallet) and

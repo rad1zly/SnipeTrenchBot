@@ -710,10 +710,13 @@ export async function buildSwapTransaction({ quoteResponse, userPublicKey, side,
 
   // v0.8.8 (experimental): Jito tip. Append as the LAST instruction so the
   // block engine recognizes this as a Jito-tipped tx. Default 0 = no tip.
-  // When enabled, sends a SOL transfer from the user to a Jito tip account.
-  // Picks a different tip account each call to spread across Jito's 4 active
-  // accounts. If chatId is null, skip (defensive — should never happen in
-  // executor path but is safe).
+  // When enabled (admin config JITO_BUY_TIP_SOL / JITO_SELL_TIP_SOL > 0),
+  // sends a SOL transfer from the user to a Jito tip account. Picks a
+  // different tip account each call to spread across Jito's 3 verified
+  // active accounts.
+  // v0.8.8 (experimental) M1.20: Jito tip is now a fixed admin config, not
+  // a per-user setting. The chatId argument is still accepted for
+  // back-compat with the old API but is no longer used.
   if (chatId != null) {
     try {
       const { appendTipIfEnabled } = await import('./jitoTip.js');

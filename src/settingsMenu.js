@@ -194,7 +194,10 @@ function buildFlatKeyboard(chatId) {
       const pairKey = PAIR_OF.get(s.key);
       if (pairKey) {
         const pairSetting = getCatalogEntry(pairKey);
-        if (pairSetting) {
+        // M1.20: skip pairing if the partner is hidden (e.g. Jito tip is
+        // now admin config; the per-user setting is hidden but the pairing
+        // entry is still in PAIR_OF for back-compat).
+        if (pairSetting && !pairSetting.hidden) {
           SEEN.add(s.key);
           SEEN.add(pairKey);
           buttons.push([

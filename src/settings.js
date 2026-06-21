@@ -105,26 +105,15 @@ const CATALOG = [
       return n;
     },
   },
-  {
-    // v0.8.8 (experimental): Jito tip for BUY. Goes to Jito tip account for
-    // faster block inclusion. Default 0 (no tip, fall back to normal priority
-    // fee). When set, the executor adds a Jito tip transfer instruction.
-    key: 'jito_buy_tip_sol', type: 'number', category: 'trade',
-    label: 'Jito Buy Tip 🚀',
-    default: 0.0,
-    min: 0,             // no upper bound
-    parseUserInput: (t) => {
-      const s = t.trim().toLowerCase();
-      if (['none', 'unlimited', 'off', '0', ''].includes(s)) return 0;
-      const n = parseFloat(t);
-      if (Number.isNaN(n) || n < 0) return null;
-      return n;
-    },
-  },
+  // Jito tip entries REMOVED in v0.8.8 (experimental) M1.20. Jito tip is now
+  // a fixed admin config (env: JITO_BUY_TIP_SOL / JITO_SELL_TIP_SOL) in
+  // config.js — not a per-user setting. Reference bot ships with a fixed
+  // tip amount, so users don't need to tune it.
   {
     // v0.8.8 (experimental): Jito tip for SELL. Default 0 (no tip).
     key: 'jito_sell_tip_sol', type: 'number', category: 'trade',
     label: 'Jito Sell Tip 🚀',
+    hidden: true, // M1.20: moved to config (admin env). Kept here for back-compat reads; not in menu.
     default: 0.0,
     min: 0,
     parseUserInput: (t) => {
