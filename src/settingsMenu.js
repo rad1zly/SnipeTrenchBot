@@ -131,7 +131,6 @@ function buildFlatText(chatId) {
     '<b>🎯 Copy Trade Settings</b>',
     '',
     '<i>Tap a row to edit. Bools toggle on a single tap. Numbers/text open a prompt.</i>',
-    '<i>🟢 DB · 🟡 env · ⚪ default.</i>',
     '',
   ];
 
@@ -153,14 +152,14 @@ function buildFlatText(chatId) {
           SEEN.add(s.key);
           SEEN.add(pairKey);
           lines.push(
-            `• <b>${s.label}</b>: ${formatValue(s.key, chatId)}  ${formatSource(s.key, chatId)}` +
-            `    ·    <b>${pairSetting.label}</b>: ${formatValue(pairKey, chatId)}  ${formatSource(pairKey, chatId)}`
+            `• <b>${s.label}</b>: ${formatValue(s.key, chatId)}` +
+            `    ·    <b>${pairSetting.label}</b>: ${formatValue(pairKey, chatId)}`
           );
           continue;
         }
       }
       SEEN.add(s.key);
-      lines.push(`• <b>${s.label}</b>: ${formatValue(s.key, chatId)}  ${formatSource(s.key, chatId)}`);
+      lines.push(`• <b>${s.label}</b>: ${formatValue(s.key, chatId)}`);
     }
     lines.push('');
   }

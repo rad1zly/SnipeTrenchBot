@@ -250,6 +250,7 @@ const CATALOG = [
   {
     key: 'sl_pct', type: 'number', nullable: true, category: 'trade',
     label: 'Stop Loss % (negative)',
+    hidden: true,  // v0.8.8 (experimental): SL is now part of TP/SL Plan.
     default: null,  // null = disabled. E.g. -30 = sell all at -30% from entry.
     min: -100, max: -1,
     parseUserInput: (t) => {
@@ -471,7 +472,7 @@ export function getCatalogEntry(key) {
 }
 
 export function byCategory(cat) {
-  return CATALOG.filter((s) => s.category === cat);
+  return CATALOG.filter((s) => s.category === cat && !s.hidden);
 }
 
 /**
@@ -635,7 +636,57 @@ export function formatValue(key, chatId) {
   if (setting.type === 'text' && (v == null || v === '')) {
     return '—';
   }
+  // v0.8.8 (experimental): pretty-print auto-sell JSON so the button label
+  // shows "TP1 +50% SL -30%" instead of a raw JSON blob. Without this the
+  // /settings menu had ugly truncated JSON like
+  // 'TP/SL Plan = {"tiers":[{"tp_pct":50,"sell_pct":50}],"sl_pct":-30,...'
+  if (setting.type === 'text' && AUTO_SELL_KEYS.has(key) && v) {
+    return summariseAutoSell(key, v);
+  }
   return String(v);
+}
+
+/** Stable list of auto-sell setting keys (kept here to avoid an import cycle). */
+const AUTO_SELL_KEYS = new Set([
+  'tp_sl_plan', 'trailing_stop', 'dev_sell_trigger', 'time_sell_plan',
+]);
+
+/**
+ * Render an auto-sell JSON value as a one-line summary.
+ * Format: 'TP1 +50% TP2 +100% SL -30%'  (separated by single spaces).
+ * Falls back to '—' if the JSON can't be parsed.
+ */
+function summariseAutoSell(key, rawJson) {
+  let obj;
+  try { obj = JSON.parse(rawJson); } catch { return '—'; }
+  const fmtPct = (n) => (n > 0 ? `+${n}%` : `${n}%`);
+  if (key === 'tp_sl_plan') {
+    const parts = [];
+    if (Array.isArray(obj.tiers)) {
+      obj.tiers.forEach((t, i) => {
+        if (t && t.tp_pct != null) parts.push(`TP${i + 1} ${fmtPct(t.tp_pct)}`);
+      });
+    }
+    if (obj.sl_pct != null) parts.push(`SL ${fmtPct(obj.sl_pct)}`);
+    return parts.join(' ') || '—';
+  }
+  if (key === 'trailing_stop') {
+    const parts = [];
+    if (obj.act_pct != null) parts.push(`act ${fmtPct(obj.act_pct)}`);
+    if (obj.trail_pct != null) parts.push(`trail ${fmtPct(obj.trail_pct)}`);
+    return parts.join(' ') || '—';
+  }
+  if (key === 'dev_sell_trigger') {
+    const parts = [];
+    if (obj.mode) parts.push(obj.mode);
+    if (obj.sell_pct != null) parts.push(`sell ${obj.sell_pct}%`);
+    return parts.join(' ') || '—';
+  }
+  if (key === 'time_sell_plan') {
+    if (!Array.isArray(obj.tiers) || obj.tiers.length === 0) return '—';
+    return obj.tiers.map((t) => `${t.after_s}s`).join(' ');
+  }
+  return '—';
 }
 
 /**
