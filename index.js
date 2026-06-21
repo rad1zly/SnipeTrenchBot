@@ -143,6 +143,17 @@ try {
   console.error('[index] stale sweep failed:', e.message);
 }
 
+// v0.8.8 (experimental) M2: re-attach exit loops to any non-stale
+// OPEN positions that survived a restart. These were opened by the
+// bot, had a plan snapshot, but the process died before any tier
+// fired. Re-attach so the exit engine resumes polling them.
+try {
+  const { reattachLoopsOnBoot } = await import('./src/exitEngine.js');
+  reattachLoopsOnBoot();
+} catch (e) {
+  console.error('[index] exit-loop reattach failed:', e.message);
+}
+
 // 6. v0.8.7.4: REMOVED the startup broadcast ("🟢 Bot started...").
 //   Reason: bot restart triggers a flurry of replayed events AND a startup
 //   notification goes to every subscriber — combined, that's pure noise.
@@ -157,6 +168,14 @@ function shutdown(signal) {
   console.log(`\n[index] received ${signal}, shutting down…`);
   try {
     monitor.stop();
+    // v0.8.8 (experimental) M2: stop all exit loops so the process
+    // doesn't get stuck waiting on a poll tick to finish.
+    try {
+      // dynamic import (sync via then) because shutdown is sync.
+      import('./src/exitEngine.js').then((m) => m.stopAllExitLoops()).catch(() => {});
+    } catch (e) {
+      console.error('[index] stopAllExitLoops failed:', e.message);
+    }
     stopTelegramBot();
     notifier.info('🔴 Bot stopped').catch(() => {});
   } catch (e) {

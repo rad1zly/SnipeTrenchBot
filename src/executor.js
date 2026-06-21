@@ -35,6 +35,20 @@ import { effectiveJupiterUrl } from './jupiterMetis.js';
 import notifier from './notifier.js';
 import * as settings from './settings.js';
 import { passesFilters, activeFilters } from './filters.js';
+import { startExitLoop } from './exitEngine.js';
+
+// v0.8.8 (experimental) M2: parse a stored auto-sell setting (which is
+// stored as a JSON string in user_settings) into a flat object with the
+// fields the exit engine expects (tp1, tp1_sell, sl, trail, t1, etc).
+// Returns an empty object if the input is null/empty/garbage so callers
+// can spread without checking.
+function parsePlan(raw) {
+  if (!raw) return {};
+  let v;
+  try { v = JSON.parse(raw); } catch { return {}; }
+  if (!v || typeof v !== 'object') return {};
+  return v;
+}
 import { walletManager } from './walletManager.js';
 
 let connection = null;
@@ -384,6 +398,14 @@ export async function executeSignal(event) {
   const holdMs = settings.get('hold_ms', chatId);
   const autoSell = settings.get('auto_sell', chatId);
   const autoRetry = settings.get('auto_retry', chatId);
+  // v0.8.8 (experimental) M2: read the user's auto-sell plan and pass it
+  // through to the position row as a snapshot. The exit engine reads
+  // from the snapshot so plan edits mid-trade don't retro-fire tiers.
+  const tpSlPlan     = parsePlan(settings.get('tp_sl_plan',     chatId));
+  const trailPlan    = parsePlan(settings.get('trailing_stop',  chatId));
+  const timePlan     = parsePlan(settings.get('time_sell_plan', chatId));
+  const autoSellPlan = { ...tpSlPlan, ...trailPlan, ...timePlan };
+  const hasPlan = Object.keys(autoSellPlan).length > 0;
 
   // v0.8.7.15: pass chatId to guardTrade so cap checks (per-trade cap, daily
   // spend cap, buy-limit-per-token, manual pause) are per-user.
@@ -474,6 +496,7 @@ export async function executeSignal(event) {
     entrySig: null, // filled below
     entrySol: solAmount,
     entryTokens: tokensExpected,
+    autoSellPlan,   // v0.8.8 M2: snapshot the user's plan at entry time
   });
   const positionId = posRes.lastInsertRowid;
 
@@ -520,7 +543,7 @@ export async function executeSignal(event) {
   await new Promise((r) => setTimeout(r, holdMs));
   logStep('HOLD_DONE', { heldMs: holdMs });
 
-  // ----- AUTO-SELL gate -----
+  // ----- AUTO-SELL gate (M2 split) -----
   if (!autoSell) {
     // Skip the sell leg. Position stays OPEN until the user manually closes
     // it (future feature) or it ages out. We log so the user knows.
@@ -528,6 +551,18 @@ export async function executeSignal(event) {
     signalsDb.log({ type: 'AUTO_SELL_OFF', wallet: dev, mint, data: { positionId } });
     return;
   }
+
+  // v0.8.8 (experimental) M2: if the user has an auto-sell plan, hand the
+  // position off to the exit engine. The engine polls the bonding curve
+  // every 1s and fires TP/SL/Trailing/Time tiers as their conditions
+  // are met. The executor's old immediate-sell path is the fallback for
+  // users with no plan.
+  if (hasPlan) {
+    logStep('EXIT_LOOP_HANDOFF', { positionId, hasPlan: true, planKeys: Object.keys(autoSellPlan) });
+    startExitLoop(positionId);
+    return;
+  }
+  logStep('EXIT_LOOP_SKIPPED_NO_PLAN', { positionId });
 
   // ----- SELL -----
   // v0.8.7.9: use ACTUAL on-chain token balance, not the BUY quote's
@@ -648,6 +683,59 @@ export async function executeSignal(event) {
     pnl,
     holdMs,
   }).catch((e) => console.error('[executor] notifier SELL_OK failed:', e.message));
+}
+
+/**
+ * v0.8.8 (experimental) M2: Execute a partial-or-full SELL for an existing
+ * open position. Called by exitEngine.js when a TP/SL/Trailing/Time tier
+ * fires. Returns the sell result { signature, solReceived } on success,
+ * throws on failure (the exit engine handles the throw by notifying the
+ * user and NOT marking the tier fired).
+ *
+ * Differs from the inner `sellAuto` (above) in that:
+ *   - caller already has a position row (we don't re-insert / re-quote
+ *     for the full entry — we know the token amount and target sell %)
+ *   - chatId is required (so we know which wallet to use)
+ *   - on success we update positions.{sold_pct, status=CLOSED, exit_sig,
+ *     exit_sol, pnl_sol, pnl_percent, hold_ms}; on failure we just
+ *     log to signals and return without touching the position row
+ */
+export async function executeSell({ positionId, mint, chatId, tokenRawAmount, slippageBps = null, tierName = null }) {
+  // Defensive: make sure wallet is loaded.
+  const w = walletManager.getStatus(chatId);
+  if (!w.set) {
+    throw new Error(`wallet not set for chat ${chatId} — cannot sell`);
+  }
+
+  const pumpSellSlippageBps = slippageBps ?? settings.get('pump_sell_slippage_bps', chatId);
+  const autoRetry = settings.get('auto_retry', chatId) ?? 0;
+
+  const { quote: sellQuote, route: sellRoute } = await getSellQuote({
+    tokenRawAmount: BigInt(Math.floor(tokenRawAmount)),
+    inputMint: mint,
+    slippageBps: pumpSellSlippageBps,
+    chatId,
+  });
+  if (!sellQuote || sellQuote.error) {
+    throw new Error(`sell quote: ${sellQuote?.error || 'no quote'}`);
+  }
+  const priceImpactPct = Math.abs(parseFloat(sellQuote.priceImpactPct || 0));
+  if (priceImpactPct > 50) {
+    throw new Error(`price impact ${priceImpactPct.toFixed(2)}% exceeds 50%`);
+  }
+  const sellResult = await submitSwapWithRetry({
+    quoteResponse: sellQuote,
+    label: tierName ? `SELL:${tierName}` : 'SELL',
+    maxAttempts: autoRetry,
+    chatId,
+    route: sellRoute,
+    side: 'sell',
+  });
+  return {
+    signature: sellResult.signature,
+    solReceived: Number(sellQuote.outAmount) / config.LAMPORTS_PER_SOL,
+    route: sellRoute,
+  };
 }
 
 /**

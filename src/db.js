@@ -216,6 +216,12 @@ function initSchema(d) {
     ['tp_sl_fired',             'TEXT', 'NULL'],   // JSON: ["tp1", "sl"]
     ['sold_pct',                'REAL', '0'],
     ['auto_sell_plan_snapshot', 'TEXT', 'NULL'],   // JSON: snapshot of plan at entry time
+    // v0.8.8 (experimental) M2.1: live price-tracking columns for the
+    // exit engine. current_sol_value is refreshed on every poll tick;
+    // last_check_at tells us when we last observed a price (for
+    // staleness detection / dropped-WS reconnect).
+    ['current_sol_value',       'REAL', 'NULL'],
+    ['last_check_at',           'INTEGER', 'NULL'],
   ]) {
     if (!posCols.includes(col)) {
       d.exec(`ALTER TABLE positions ADD COLUMN ${col} ${type} DEFAULT ${def};`);
@@ -531,16 +537,33 @@ export const positionsDb = {
    * Open a new position. v0.8.7.15: chatId is REQUIRED so each user's
    * positions are isolated. Trades are tied to the Telegram user who set
    * up the watchlist (and whose wallet is being debited).
+   *
+   * v0.8.8 (experimental) M2: also writes the auto-sell plan snapshot
+   * and initialises current/peak SOL value = entry, last_check_at = now,
+   * tp_sl_fired = []. These let the exit engine start a loop on this
+   * position without needing to enrich the row.
    */
-  open({ chatId, mint, devWallet, entrySig, entrySol, entryTokens = null }) {
+  open({ chatId, mint, devWallet, entrySig, entrySol, entryTokens = null, autoSellPlan = null }) {
     if (chatId == null) throw new Error('positionsDb.open: chatId is required');
     const now = Date.now();
     return getDb()
       .prepare(`
-        INSERT INTO positions (chat_id, mint, dev_wallet, entry_sig, entry_time, entry_sol, entry_tokens, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', ?)
+        INSERT INTO positions (
+          chat_id, mint, dev_wallet, entry_sig, entry_time, entry_sol, entry_tokens,
+          current_sol_value, peak_sol_value, last_check_at, sold_pct, tp_sl_fired,
+          auto_sell_plan_snapshot, status, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 'OPEN', ?)
       `)
-      .run(chatId, mint, devWallet, entrySig, now, entrySol, entryTokens, now);
+      .run(
+        chatId, mint, devWallet, entrySig, now, entrySol, entryTokens,
+        entrySol,    // current_sol_value (== entry on open)
+        entrySol,    // peak_sol_value (== entry on open)
+        now,         // last_check_at
+        JSON.stringify([]),  // tp_sl_fired
+        autoSellPlan ? JSON.stringify(autoSellPlan) : null,
+        now,
+      );
   },
   close(id, { exitSig, exitSol, pnlSol, pnlPercent = null, holdMs = null }) {
     return getDb()
