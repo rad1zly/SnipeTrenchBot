@@ -42,7 +42,7 @@ const CATALOG = [
   },
   {
     key: 'buy_limit_per_token', type: 'number', category: 'trade',
-    label: 'Buy Limit per Token',
+    label: 'Max Buys per Token',
     default: 1,
     min: 1, max: 3,      // KEEP BOUNDED — this is a CHOICE (1, 2, or 3 buys per token), not a continuous range
     parseUserInput: (t) => {
@@ -94,7 +94,7 @@ const CATALOG = [
   },
   {
     key: 'buy_priority_fee_sol', type: 'number', category: 'trade',
-    label: 'Buy Priority Fee (SOL)',
+    label: 'Buy Priority Fee',
     default: 0.0,
     min: 0,             // no upper bound
     parseUserInput: (t) => {
@@ -110,7 +110,7 @@ const CATALOG = [
     // faster block inclusion. Default 0 (no tip, fall back to normal priority
     // fee). When set, the executor adds a Jito tip transfer instruction.
     key: 'jito_buy_tip_sol', type: 'number', category: 'trade',
-    label: 'Jito Buy Tip 🚀 (SOL)',
+    label: 'Jito Buy Tip 🚀',
     default: 0.0,
     min: 0,             // no upper bound
     parseUserInput: (t) => {
@@ -124,7 +124,7 @@ const CATALOG = [
   {
     // v0.8.8 (experimental): Jito tip for SELL. Default 0 (no tip).
     key: 'jito_sell_tip_sol', type: 'number', category: 'trade',
-    label: 'Jito Sell Tip 🚀 (SOL)',
+    label: 'Jito Sell Tip 🚀',
     default: 0.0,
     min: 0,
     parseUserInput: (t) => {
@@ -164,7 +164,7 @@ const CATALOG = [
   },
   {
     key: 'auto_retry', type: 'number', category: 'trade',
-    label: 'Auto Retry (count)',
+    label: 'Auto Retry',
     default: 0,
     min: 0, max: 5,
     parseUserInput: (t) => {
@@ -286,20 +286,20 @@ const CATALOG = [
   },
   {
     key: 'exclude_internal', type: 'bool', category: 'filters',
-    label: 'Exclude Internal',
+    label: 'Skip pump.fun',
     default: false,
     parseUserInput: (t) => /^(1|true|yes|on|y)$/i.test(t.trim()),
   },
   {
     key: 'exclude_external', type: 'bool', category: 'filters',
-    label: 'Exclude External',
+    label: 'Skip Raydium / others',
     default: false,
     parseUserInput: (t) => /^(1|true|yes|on|y)$/i.test(t.trim()),
   },
   {
     key: 'min_mc_usd', type: 'number', nullable: true,  // v0.8.0: '0'/'none' sets to null (disabled)
     category: 'filters',
-    label: 'Min MC (USD)',
+    label: 'Min MC',
     default: null,  // null = unlimited. User can type any positive number.
     min: 0,        // no upper bound — user can set "0.001" or "1000000000" if they want
     parseUserInput: (t) => {
@@ -313,7 +313,7 @@ const CATALOG = [
   {
     key: 'max_mc_usd', type: 'number', nullable: true,  // v0.8.0: '0'/'none' sets to null (disabled)
     category: 'filters',
-    label: 'Max MC (USD)',
+    label: 'Max MC',
     default: null,
     min: 0,        // no upper bound
     parseUserInput: (t) => {
@@ -327,7 +327,7 @@ const CATALOG = [
   {
     key: 'min_token_age_min', type: 'number', nullable: true,  // v0.8.0: '0'/'none' sets to null (disabled)
     category: 'filters',
-    label: 'Min Token Age (s)',  // v0.8.0: unit changed to seconds
+    label: 'Min Token Age',  // v0.8.0: unit changed to seconds
     default: null,
     min: 0,        // no upper bound
     parseUserInput: (t) => {
@@ -341,7 +341,7 @@ const CATALOG = [
   {
     key: 'max_token_age_min', type: 'number', nullable: true,  // v0.8.0: '0'/'none' sets to null (disabled)
     category: 'filters',
-    label: 'Max Token Age (s)',  // v0.8.0: unit changed to seconds
+    label: 'Max Token Age',  // v0.8.0: unit changed to seconds
     default: null,
     min: 0,        // no upper bound
     parseUserInput: (t) => {
@@ -360,7 +360,7 @@ const CATALOG = [
     // matches the typical "dev fully exits" intent. Set to 0.1 to copy every
     // sell, or 1.0 to require a 100% dump.
     key: 'min_sell_ratio', type: 'number', category: 'filters',
-    label: 'Min Sell Ratio (0.1-1.0)',
+    label: 'Min Sell %',
     default: 0.9,
     min: 0.1,
     max: 1.0,
@@ -380,7 +380,7 @@ const CATALOG = [
   {
     key: 'sol_spending_limit', type: 'number', nullable: true,  // v0.8.0: '0'/'none' sets to null (disabled)
     category: 'token',
-    label: 'SOL Spending Limit (daily)',
+    label: 'SOL Spending Limit',
     default: null,
     min: 0,        // no upper bound — user can set "0.5" or "10000" if they want
     parseUserInput: (t) => {
@@ -390,12 +390,13 @@ const CATALOG = [
       if (Number.isNaN(n) || n < 0) return null;
       return n;
     },
+    formatValue: (v) => v == null ? 'Not Limited' : `${formatSolAmount(v)} / day`,
   },
 
   // ── Time ───────────────────────────────────────────────────────────────
   {
     key: 'start_time', type: 'time', category: 'time',
-    label: 'Start Time (UTC, HH:MM)',
+    label: 'Start Time',
     default: '00:00',
     parseUserInput: (t) => {
       const m = t.trim().match(/^(\d{1,2}):(\d{2})$/);
@@ -408,7 +409,7 @@ const CATALOG = [
   },
   {
     key: 'end_time', type: 'time', category: 'time',
-    label: 'End Time (UTC, HH:MM)',
+    label: 'End Time',
     default: '23:59',
     parseUserInput: (t) => {
       const m = t.trim().match(/^(\d{1,2}):(\d{2})$/);
@@ -430,7 +431,8 @@ const CATALOG = [
   },
   {
     key: 'hold_ms', type: 'number', category: 'advanced',
-    label: 'Hold Time (ms)',
+    label: 'Hold Time',
+    unit: 'ms',         // M1.19: input in ms (engine uses ms). Display shows s/m via formatValue.
     env: 'HOLD_MS', default: 1000,
     min: 1,             // no upper bound — user can set 500 or 999999999 if they want
     parseUserInput: (t) => {
@@ -597,6 +599,40 @@ export function resetAll(chatId) {
 // Display formatters
 // -----------------------------------------------------------------------------
 
+/**
+ * Format a SOL amount with up to 6 decimals, stripping trailing zeros so
+ * "0.001 SOL" doesn't show as "0.001000 SOL". Values >= 1 keep 4 decimals
+ * (e.g. 1.5 SOL), values < 1 keep 6 (e.g. 0.0001 SOL).
+ */
+function formatSolAmount(v) {
+  if (v == null) return '—';
+  if (v === 0) return '0 SOL';
+  if (v >= 1) {
+    return `${parseFloat(v.toFixed(4))} SOL`;
+  }
+  // Strip trailing zeros after 6 decimal places.
+  return `${parseFloat(v.toFixed(6))} SOL`;
+}
+
+/**
+ * Format milliseconds as a human-readable duration. Examples:
+ *   1000 -> "1s"
+ *   1500 -> "1.5s"
+ *   60000 -> "1m"
+ *   90000 -> "1m 30s"
+ */
+function formatSeconds(ms) {
+  if (ms == null) return '—';
+  if (ms < 1000) return `${ms}ms`;
+  const totalSec = ms / 1000;
+  if (totalSec < 60) {
+    return Number.isInteger(totalSec) ? `${totalSec}s` : `${parseFloat(totalSec.toFixed(1))}s`;
+  }
+  const m = Math.floor(totalSec / 60);
+  const s = Math.round(totalSec % 60);
+  return s > 0 ? `${m}m ${s}s` : `${m}m`;
+}
+
 /** Format a setting's current value for menu display. */
 export function formatValue(key, chatId) {
   if (chatId == null) throw new Error(`settings.formatValue('${key}'): chatId is required`);
@@ -614,7 +650,7 @@ export function formatValue(key, chatId) {
   if (setting.type === 'number' && (v === null || v === 0)) {
     // For "limit" type numbers, 0 / null = "Not Limited"
     if (['min_mc_usd', 'max_mc_usd', 'min_token_age_min', 'max_token_age_min',
-         'sol_spending_limit', 'buy_priority_fee_sol', 'buy_tip_sol'].includes(key)) {
+         'sol_spending_limit', 'buy_priority_fee_sol', 'buy_tip_sol', 'jito_buy_tip_sol', 'jito_sell_tip_sol'].includes(key)) {
       return 'Not Limited';
     }
   }
@@ -635,10 +671,21 @@ export function formatValue(key, chatId) {
     return `${(v / 100).toFixed(1)}%`;
   }
   if (setting.type === 'number' && setting.key.endsWith('_sol')) {
-    return `${v} SOL`;
+    return formatSolAmount(v);
   }
   if (setting.type === 'number' && setting.key === 'hold_ms') {
-    return `${v} ms (${(v / 1000).toFixed(1)}s)`;
+    // M1.19: hold time displays as seconds, not raw ms.
+    return formatSeconds(v);
+  }
+  if (setting.type === 'number' && setting.key === 'auto_retry') {
+    return v === 0 ? 'Off' : `${v} ${v === 1 ? 'time' : 'times'}`;
+  }
+  if (setting.type === 'number' && setting.key === 'buy_limit_per_token') {
+    return `${v} ${v === 1 ? 'buy' : 'buys'}`;
+  }
+  if (setting.type === 'number' && (setting.key === 'min_mc_usd' || setting.key === 'max_mc_usd')) {
+    // M1.19: format USD with thousands separator.
+    return v === 0 ? 'Any' : `$${v.toLocaleString('en-US')}`;
   }
   if (setting.type === 'number' && setting.key === 'min_sell_ratio') {
     // Sell ratio is a fraction in [0.1, 1.0]. Display as a percentage so the
