@@ -540,6 +540,22 @@ export function startTelegramBot({ onPause: pauseCb, onResume: resumeCb } = {}) 
         const action = parts[1];
         const key = parts.slice(2).join(':');
         await sm.handleSetCallback(ctx, action, key);
+      } else if (data.startsWith('autosell:add:')) {
+        // autosell:add:KEY:SLOT
+        const parts = data.split(':');
+        // parts = ['autosell', 'add', KEY, SLOT]
+        const key = parts[2];
+        const slot = parts.slice(3).join(':');
+        await sm.handleAutoSellAdd(ctx, key, slot);
+      } else if (data.startsWith('autosell:remove:')) {
+        const parts = data.split(':');
+        const key = parts[2];
+        const slot = parts.slice(3).join(':');
+        await sm.handleAutoSellRemove(ctx, key, slot);
+      } else if (data.startsWith('autosell:disable:')) {
+        const parts = data.split(':');
+        const key = parts[2];
+        await sm.handleAutoSellDisable(ctx, key);
       } else if (data === 'cmd:status') {
         await renderScreen(ctx, buildStatusText(ctx.chat.id), commandBackMenu());
       } else if (data === 'cmd:stats') {

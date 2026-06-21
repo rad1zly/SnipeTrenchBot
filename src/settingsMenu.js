@@ -18,6 +18,10 @@ import {
   set, toggle, listCatalog,
   formatValue, formatSource,
 } from './settings.js';
+import {
+  AUTO_SELL_LAYOUT, isAutoSellSetting, parseStored, summarise,
+  applyTierChange, isAutoSellSlot,
+} from './autoSellPlan.js';
 
 // -----------------------------------------------------------------------------
 // Display helpers
@@ -287,6 +291,14 @@ export async function handleSetCallback(ctx, action, key) {
   }
 
   if (action === 'edit') {
+    // v0.8.8 (experimental) M1.12: auto-sell settings get a tier-by-tier
+    // submenu instead of a raw JSON prompt. The user taps +TP1 / +TP2 /
+    // +SL / +Trailing and gets a one-line "send a number" reply.
+    if (setting.category === 'auto-sell' || isAutoSellSetting(key)) {
+      await renderAutoSellSubmenu(ctx, key, chatId);
+      await ctx.answerCbQuery();
+      return true;
+    }
     // Capture the message_id of the flat settings screen the user is
     // currently looking at, so handlePendingText can edit IT after the
     // user replies with a new value (instead of trying to edit the
@@ -357,6 +369,26 @@ export async function handlePendingText(ctx) {
     return true;
   }
 
+  // v0.8.8 (experimental) M1.12: auto-sell tier-by-tier flow.
+  if (pending.key.startsWith('__autosell:')) {
+    const r = handleAutoSellPending(pending.key, text, chatId);
+    if (!r) {
+      clearPending(chatId);
+      return false;
+    }
+    if (!r.ok) {
+      // Bad input: keep the pending alive so the user can retry. Show the error.
+      await ctx.reply(`❌ ${r.msg}\n\nReply again, or /cancel.`, { parse_mode: 'HTML' });
+      return true;
+    }
+    set(r.key, r.json, chatId);
+    clearPending(chatId);
+    await ctx.reply(`✅ ${r.msg}\n\nCurrent: <code>${summarise(r.key, parseStored(r.json))}</code>`, { parse_mode: 'HTML' });
+    // Re-render the submenu in place so the user sees the new row immediately.
+    await renderAutoSellSubmenuEdit(ctx, r.key, chatId, pending.menuMessageId);
+    return true;
+  }
+
   const setting = getCatalogEntry(pending.key);
   if (!setting) {
     clearPending(chatId);
@@ -407,3 +439,239 @@ export {
   buildFlatText, buildFlatKeyboard, renderFlat,
   isPending, clearPending,
 };
+
+// -----------------------------------------------------------------------------
+// v0.8.8 (experimental) M1.12: Auto-Sell tier-by-tier submenu
+// -----------------------------------------------------------------------------
+// When user taps a row that is an auto-sell setting, we render a separate
+// submenu showing one row per tier (TP 1 / TP 2 / TP 3 / SL) with [+ add]
+// buttons for empty slots. Tapping a row pushes it into pending-edit mode
+// awaiting a single number. Tapping [×] removes it. Tapping [Disable] wipes
+// the whole setting.
+
+/** Render the submenu for an auto-sell setting (tp_sl_plan, trailing_stop, etc.). */
+async function renderAutoSellSubmenu(ctx, key, chatId) {
+  const layout = AUTO_SELL_LAYOUT[key];
+  if (!layout) {
+    await ctx.reply('Unknown auto-sell setting.');
+    return;
+  }
+  const stored = parseStored(get(key, chatId));
+  const lines = [
+    `<b>${layout.label}</b>`,
+    layout.header,
+    '',
+    `Current: <b>${summarise(key, stored)}</b>`,
+    '',
+  ];
+  const buttons = [];
+  for (const row of layout.rows) {
+    const filled = isSlotFilled(key, row, stored);
+    if (filled) {
+      const valueLabel = slotValueLabel(key, row, stored);
+      lines.push(`  • <b>${row.label}</b>: ${valueLabel}`);
+      // row button: edit (entire row) + remove (×)
+      buttons.push([
+        Markup.button.callback(`✏️ ${row.label} (${valueLabel})`, `autosell:add:${key}:${row.id}`),
+        Markup.button.callback(`×`, `autosell:remove:${key}:${row.id}`),
+      ]);
+    } else {
+      lines.push(`  <i>${row.addLabel} — tap to set</i>`);
+      buttons.push([
+        Markup.button.callback(row.addLabel, `autosell:add:${key}:${row.id}`),
+      ]);
+    }
+  }
+  // Footer: Disable + Back
+  buttons.push([Markup.button.callback('❌ Disable this whole setting', `autosell:disable:${key}`)]);
+  buttons.push([Markup.button.callback('« Back to /settings', 'cmd:settings')]);
+
+  await ctx.editMessageText(lines.join('\n'), {
+    parse_mode: 'HTML',
+    reply_markup: { inline_keyboard: buttons },
+  });
+}
+
+function isSlotFilled(key, row, stored) {
+  if (key === 'tp_sl_plan') {
+    if (row.kind === 'tier') return Array.isArray(stored.tiers) && stored.tiers[row.tierIndex]?.tp_pct != null;
+    if (row.kind === 'singleton') return stored[row.field] != null;
+  }
+  if (key === 'trailing_stop') return stored[row.field] != null;
+  if (key === 'dev_sell_trigger') return stored[row.field] != null;
+  if (key === 'time_sell_plan') {
+    if (row.kind === 'timeTier') return Array.isArray(stored.tiers) && stored.tiers[row.tierIndex]?.after_s != null;
+  }
+  return false;
+}
+
+function slotValueLabel(key, row, stored) {
+  if (key === 'tp_sl_plan') {
+    if (row.kind === 'tier') {
+      const t = stored.tiers?.[row.tierIndex];
+      if (!t) return '—';
+      const tp = t.tp_pct > 0 ? `+${t.tp_pct}%` : `${t.tp_pct}%`;
+      return `${tp} (sell ${t.sell_pct ?? 50}%)`;
+    }
+    if (row.field === 'sl_pct') {
+      return `${stored.sl_pct}% (sell ${stored.sl_sell_pct ?? 100}%)`;
+    }
+  }
+  if (key === 'trailing_stop') {
+    const v = stored[row.field];
+    if (v == null) return '—';
+    if (row.field === 'act_pct') return `+${v}%`;
+    if (row.field === 'trail_pct') return `${v}%`;
+    return `${v}%`;
+  }
+  if (key === 'dev_sell_trigger') {
+    if (row.field === 'mode') return stored.mode ?? '—';
+    if (row.field === 'sell_pct') return `${stored.sell_pct ?? 100}%`;
+  }
+  if (key === 'time_sell_plan') {
+    const t = stored.tiers?.[row.tierIndex];
+    if (!t) return '—';
+    return `${t.after_s}s (sell ${t.sell_pct ?? 100}%)`;
+  }
+  return '—';
+}
+
+/** Handle autosell:add:KEY:SLOT  → push user into pending-edit for that slot. */
+export async function handleAutoSellAdd(ctx, key, slot) {
+  const chatId = ctx.chat?.id;
+  if (chatId == null) { await ctx.answerCbQuery('No chat context'); return true; }
+  const layout = AUTO_SELL_LAYOUT[key];
+  if (!layout) { await ctx.answerCbQuery('Unknown setting'); return true; }
+  const row = layout.rows.find((r) => r.id === slot);
+  if (!row) { await ctx.answerCbQuery('Unknown slot'); return true; }
+
+  // v0.8.8 (experimental): route through the existing pending-edit flow.
+  // We piggyback on setPending(ctx.chat.id, key, menuMessageId) but store the
+  // slot ID as a special key prefix so handlePendingText knows to call
+  // applyTierChange instead of the generic number parser.
+  setPending(ctx.chat.id, `__autosell:${key}:${slot}`, ctx.callbackQuery?.message?.message_id ?? null);
+
+  const prompt = buildSlotPrompt(key, row);
+  await ctx.reply(prompt, {
+    parse_mode: 'HTML',
+    reply_markup: { force_reply: true, selective: true },
+  });
+  await ctx.answerCbQuery();
+  return true;
+}
+
+/** Handle autosell:remove:KEY:SLOT  → remove that slot, save, refresh submenu. */
+export async function handleAutoSellRemove(ctx, key, slot) {
+  const chatId = ctx.chat?.id;
+  if (chatId == null) { await ctx.answerCbQuery('No chat context'); return true; }
+  const stored = parseStored(get(key, chatId));
+  const r = applyTierChange(key, slot, 'remove', '', stored);
+  if (!r.ok) { await ctx.answerCbQuery(r.msg); return true; }
+  set(key, r.json, chatId);
+  await ctx.answerCbQuery('Removed');
+  // Re-render the submenu on the SAME message that has the buttons.
+  await renderAutoSellSubmenuEdit(ctx, key, chatId, ctx.callbackQuery?.message?.message_id ?? null);
+  return true;
+}
+
+/** Handle autosell:disable:KEY  → wipe the setting. */
+export async function handleAutoSellDisable(ctx, key) {
+  const chatId = ctx.chat?.id;
+  if (chatId == null) { await ctx.answerCbQuery('No chat context'); return true; }
+  set(key, null, chatId);
+  await ctx.answerCbQuery('Disabled');
+  await ctx.reply(`✅ <b>${AUTO_SELL_LAYOUT[key]?.label || key}</b> cleared.`, { parse_mode: 'HTML' });
+  return true;
+}
+
+async function renderAutoSellSubmenuEdit(ctx, key, chatId, menuMessageId) {
+  const layout = AUTO_SELL_LAYOUT[key];
+  if (!layout) return;
+  const stored = parseStored(get(key, chatId));
+  const lines = [
+    `<b>${layout.label}</b>`,
+    layout.header,
+    '',
+    `Current: <b>${summarise(key, stored)}</b>`,
+    '',
+  ];
+  const buttons = [];
+  for (const row of layout.rows) {
+    const filled = isSlotFilled(key, row, stored);
+    if (filled) {
+      const valueLabel = slotValueLabel(key, row, stored);
+      lines.push(`  • <b>${row.label}</b>: ${valueLabel}`);
+      buttons.push([
+        Markup.button.callback(`✏️ ${row.label} (${valueLabel})`, `autosell:add:${key}:${row.id}`),
+        Markup.button.callback(`×`, `autosell:remove:${key}:${row.id}`),
+      ]);
+    } else {
+      lines.push(`  <i>${row.addLabel} — tap to set</i>`);
+      buttons.push([Markup.button.callback(row.addLabel, `autosell:add:${key}:${row.id}`)]);
+    }
+  }
+  buttons.push([Markup.button.callback('❌ Disable this whole setting', `autosell:disable:${key}`)]);
+  buttons.push([Markup.button.callback('« Back to /settings', 'cmd:settings')]);
+  if (menuMessageId) {
+    try {
+      await ctx.telegram.editMessageText(chatId, menuMessageId, undefined, lines.join('\n'), {
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: buttons },
+      });
+    } catch (err) {
+      if (!String(err.message || '').includes('message is not modified')) throw err;
+    }
+  }
+}
+
+function buildSlotPrompt(key, row) {
+  if (key === 'tp_sl_plan') {
+    if (row.kind === 'tier') {
+      return [
+        `<b>${row.label} — berapa % profit target?</b>`,
+        '',
+        'Kirim ANGKA POSITIF (misal: 50 untuk +50%, 100 untuk +100%).',
+        'Sell % default 50% (artinya jual setengah posisi saat target tercapai).',
+        'Atau /cancel untuk batal.',
+      ].join('\n');
+    }
+    if (row.field === 'sl_pct') {
+      return [
+        '<b>SL — berapa % loss maksimal?</b>',
+        '',
+        'Kirim ANGKA NEGATIF (misal: -30 artinya jual semua jika harga turun 30% dari harga beli).',
+        'Range: -100 s/d 0.',
+        'Atau /cancel untuk batal.',
+      ].join('\n');
+    }
+  }
+  if (key === 'trailing_stop') {
+    if (row.field === 'act_pct') {
+      return '<b>Activate — pada +berapa % trailing mulai aktif?</b>\n\nKirim angka positif (misal: 50).';
+    }
+    if (row.field === 'trail_pct') {
+      return '<b>Trail — berapa % drop dari peak yang jadi trigger jual?</b>\n\nKirim angka NEGATIF (misal: -20 artinya jual jika harga turun 20% dari puncak).';
+    }
+  }
+  if (key === 'dev_sell_trigger') {
+    if (row.field === 'mode') return '<b>Mode — kirim "any" atau "whole".</b>\n\nany = exit on any dev sell.\nwhole = exit only on full dump.';
+    if (row.field === 'sell_pct') return '<b>Sell % — berapa % posisi kamu yang dijual saat dev sell?</b>\n\nKirim 1-100.';
+  }
+  if (key === 'time_sell_plan') {
+    return '<b>After berapa DETIK posisi akan dijual?</b>\n\nKirim angka detik (misal: 60). Sell % default 100%.';
+  }
+  return `<b>${row.label}</b> — kirim nilai baru.`;
+}
+
+/** Hook into handlePendingText: if pending.key starts with __autosell:, parse via applyTierChange. */
+export function handleAutoSellPending(pendingKey, inputText, chatId) {
+  // pending.key = '__autosell:KEY:SLOT'
+  const m = pendingKey.match(/^__autosell:([^:]+):(.+)$/);
+  if (!m) return null;
+  const key = m[1];
+  const slot = m[2];
+  const stored = parseStored(get(key, chatId));
+  const r = applyTierChange(key, slot, 'add', inputText, stored);
+  if (!r.ok) return { ok: false, msg: r.msg };
+  return { ok: true, key, json: r.json, msg: r.msg };
+}
