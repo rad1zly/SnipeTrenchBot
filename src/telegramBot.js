@@ -197,12 +197,21 @@ async function buildMainText(chatId) {
   // v0.8.8 (tg 20:00 user feedback): "balance harusnya di menu paling
   // awal lgsg ditampilin sih" — balance is now the first block in the
   // main menu, before Mode and other stats.
+  // v0.8.8 (tg 21:39 user feedback): "jgn cuma balance sol tp convert
+  // ke usd jg" — show USD value next to SOL (CoinGecko, 60s cache).
   let balBlock = '';
   if (w.set) {
     const snap = await fetchBalanceSnapshot(w.address, { limit: 3, minUi: 0 });
+    const solNum = snap.sol?.sol || 0;
     const solStr = snap.sol?.error
       ? `<i>err: ${snap.sol.error}</i>`
-      : `${(snap.sol?.sol || 0).toFixed(4)} SOL`;
+      : `${solNum.toFixed(4)} SOL`;
+    // USD conversion: only show if CoinGecko returned a number. On
+    // network/API error we hide the USD rather than show stale or
+    // wrong data. Format: $1,234.56 (locale en-US for thousands sep).
+    const usdStr = (snap.solUsd != null && Number.isFinite(snap.solUsd))
+      ? ` <i>($${snap.solUsd.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })})</i>`
+      : '';
     // fetchTokenBalances returns mint + uiAmount (no symbol/name unless
     // /balance explicitly fetches metadata). For the main menu we just
     // show a short mint prefix + uiAmount — /balance has the full
@@ -216,7 +225,7 @@ async function buildMainText(chatId) {
     });
     const tokStr = tokLines.length > 0 ? tokLines.join('\n') : '    <i>(no SPL tokens)</i>';
     balBlock = [
-      `<b>💰 ${solStr}</b>  (${w.last4 ? `…${w.last4}` : shortAddr(w.address)})`,
+      `<b>💰 ${solStr}${usdStr}</b>  (${w.last4 ? `…${w.last4}` : shortAddr(w.address)})`,
       tokStr,
     ].join('\n');
   } else {

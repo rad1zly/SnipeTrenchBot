@@ -379,6 +379,7 @@ export { scrub as scrubKey };
 // with the bot on restart.
 // =============================================================================
 const BALANCE_TTL_MS = 30_000;
+const SOL_PRICE_TTL_MS = 60_000;  // 60s — USD price is less volatile than balance
 
 const _balanceCache = new Map(); // address -> { value, expiresAt }
 
@@ -490,13 +491,55 @@ export async function fetchTokenBalances(address, { limit = 10, minUi = 0 } = {}
  * blips should not break the bot).
  */
 export async function fetchBalanceSnapshot(address, opts = {}) {
-  const [sol, tokens] = await Promise.all([
+  const [sol, tokens, solPrice] = await Promise.all([
     fetchSolBalance(address),
     fetchTokenBalances(address, opts),
+    fetchSolPriceUsd().catch((e) => ({ usd: null, error: e.message || String(e), cached: false })),
   ]);
+  // v0.8.8 (experimental) M3.8b: convenience field — total USD value of
+  // the native SOL balance. Tokens aren't priced (no token metadata
+  // resolution in the main menu flow — that's what /balance is for).
+  const solUsd = (sol?.sol && solPrice?.usd) ? sol.sol * solPrice.usd : null;
   return {
     sol,
     tokens,
+    solPrice,
+    solUsd,
     fetchedAt: Date.now(),
   };
+}
+
+/**
+ * v0.8.8 (experimental) M3.8b: fetch the live SOL/USD price from
+ * CoinGecko. Cached for SOL_PRICE_TTL_MS (60s). Returns { usd, cached,
+ * error }. If CoinGecko is down we degrade gracefully — callers should
+ * show SOL only, no USD.
+ *
+ * CoinGecko free API: https://api.coingecko.com/api/v3/simple/price
+ *   ?ids=solana&vs_currencies=usd
+ * No API key required; rate-limit ~10-30 req/min.
+ */
+export async function fetchSolPriceUsd() {
+  return withCache('sol:price:usd', SOL_PRICE_TTL_MS, async () => {
+    try {
+      const ctrl = new AbortController();
+      const timeout = setTimeout(() => ctrl.abort(), 5_000);
+      const resp = await fetch(
+        'https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd',
+        { signal: ctrl.signal, headers: { 'User-Agent': 'SnipeTrenchBot/0.8.8' } }
+      );
+      clearTimeout(timeout);
+      if (!resp.ok) {
+        return { usd: null, cached: false, error: `coingecko HTTP ${resp.status}` };
+      }
+      const data = await resp.json();
+      const usd = data?.solana?.usd;
+      if (typeof usd !== 'number' || !Number.isFinite(usd)) {
+        return { usd: null, cached: false, error: 'coingecko: bad payload' };
+      }
+      return { usd, cached: false, error: null };
+    } catch (e) {
+      return { usd: null, cached: false, error: e.message || String(e) };
+    }
+  });
 }
