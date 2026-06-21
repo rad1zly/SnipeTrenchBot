@@ -61,6 +61,7 @@ import { status as executorStatus, evictKeypair } from './executor.js';
 import { walletManager, fetchBalanceSnapshot } from './walletManager.js';
 import notifier from './notifier.js';
 import * as sm from './settingsMenu.js';
+import * as settings from './settings.js';
 import * as wm from './walletMenu.js';
 
 let bots = []; // M1.5: array of Telegraf instances (one per TELEGRAM_BOT_TOKEN)
@@ -335,6 +336,10 @@ function shortMint(m) {
 function buildStatsText(chatId) {
   const w = positionsDb.winStats(chatId);
   const g = positionsDb.winStats(null);
+  // v0.8.8 (experimental) M3.5: include copy mode + ratio so the user
+  // knows which signal type is currently triggering trades for them.
+  const copyMode = settings.get('copy_mode', chatId) ?? 'reverse';
+  const copyRatio = settings.get('copy_ratio', chatId) ?? 100;
   const section = (label, s) => {
     if (s.totalClosed === 0) {
       return `\n<b>${label}</b>\n  no closed trades yet`;
@@ -356,6 +361,8 @@ function buildStatsText(chatId) {
   };
   return [
     '<b>📈 Stats</b>',
+    `  copy mode:  <b>${copyMode === 'mirror' ? '🟢 Mirror' : copyMode === 'reverse' ? '🟠 Reverse' : '⚪ Off'}</b>  (${copyMode === 'mirror' ? 'BUY_DETECTED → buy' : copyMode === 'reverse' ? 'SELL_DETECTED → buy' : 'no auto trades'})`,
+    `  copy ratio: <b>${copyRatio}%</b>  (mirror mode: bot spends ${copyRatio}% of dev's SOL)`,
     section('Your watchlist', w),
     section('Global (all users)', g),
     '',
@@ -899,7 +906,14 @@ function startSingleBot(token, { onPause: pauseCb, onResume: resumeCb } = {}) {
   });
 
   // ---- /stats — v0.8.0: detailed win/loss tracking ----
+  // v0.8.8 (experimental) M3.5: also include copy_mode + copy_ratio so
+  // users can see at a glance which signal type is triggering trades.
   inst.command('stats', (ctx) => {
+    ctx.reply(buildStatsText(ctx.chat.id), { parse_mode: 'HTML' });
+  });
+  // v0.8.8 M3.5: /copystats is just an alias to /stats. The reference
+  // bot the user is cloning uses `/copystats` so we add it for parity.
+  inst.command('copystats', (ctx) => {
     ctx.reply(buildStatsText(ctx.chat.id), { parse_mode: 'HTML' });
   });
 

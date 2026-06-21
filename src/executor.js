@@ -341,13 +341,33 @@ export async function executeSignal(event) {
     recordTokenCreated(event);
     return;
   }
+  // v0.8.8 (experimental) M3.1: copy_mode decides which event types
+  // actually trigger a trade. 'reverse' (default) keeps the existing
+  // behaviour — only SELL_DETECTED triggers a buy. 'mirror' inverts
+  // that — only BUY_DETECTED triggers a buy. 'off' disables all
+  // event-driven trades (filters still apply for token_created
+  // tracking but nothing actually buys).
+  const copyMode = settings.get('copy_mode', event.chatId) ?? 'reverse';
+
   if (event.type === 'BUY_DETECTED') {
-    // v0.8.7.7: log but don't execute. This is a reverse-copy bot.
+    if (copyMode === 'mirror') {
+      // v0.8.8 M3.1: mirror mode — fall through to the same BUY
+      // execution path used by reverse-copy's SELL_DETECTED branch,
+      // but flag the trigger type in the log.
+      logStep('SIGNAL_ACCEPTED', {
+        dev: event.wallet,
+        mint: event.mint,
+        mode: 'MIRROR_BUY',
+        copyMode,
+      });
+      return _executeBuy(event);
+    }
+    // 'off' or 'reverse': BUY_DETECTED is logged but doesn't trade.
     logStep('SIGNAL_IGNORED', {
       dev: event.wallet,
       mint: event.mint,
       type: 'BUY_DETECTED',
-      reason: 'reverse-copy mode — only SELL_DETECTED triggers a trade',
+      reason: `copy_mode=${copyMode} — only ${copyMode === 'reverse' ? 'SELL_DETECTED' : 'nothing'} triggers a trade`,
     });
     return;
   }
@@ -357,7 +377,33 @@ export async function executeSignal(event) {
   const chatId = event.chatId;
 
   // v0.7.0 (06-15): user override — any watched wallet sell = trigger.
-  logStep('SIGNAL_ACCEPTED', { dev, mint, mode: 'COUNTER_BUY' });
+  // v0.8.8 M3.1: only execute if copy_mode is 'reverse' (default) or
+  // 'mirror' (SELL_DETECTED is informational in mirror mode but doesn't
+  // fire a buy — mirror mode only buys on BUY_DETECTED, see above).
+  if (copyMode === 'off') {
+    logStep('SIGNAL_IGNORED', { dev, mint, type: 'SELL_DETECTED', reason: 'copy_mode=off' });
+    return;
+  }
+  if (copyMode === 'mirror') {
+    // Mirror mode: dev SELL is informational only.
+    logStep('SIGNAL_IGNORED', { dev, mint, type: 'SELL_DETECTED', reason: 'copy_mode=mirror — only BUY_DETECTED triggers' });
+    return;
+  }
+  logStep('SIGNAL_ACCEPTED', { dev, mint, mode: 'COUNTER_BUY', copyMode });
+
+  return _executeBuy(event);
+}
+
+/**
+ * v0.8.8 (experimental) M3.1: internal BUY execution. Used by both
+ * reverse-copy (SELL_DETECTED → counter-buy) and mirror-copy
+ * (BUY_DETECTED → follow-buy) modes. The caller (executeSignal)
+ * has already logged the SIGNAL_ACCEPTED / IGNORED decision and
+ * validated the copy_mode. This function does the actual trade.
+ */
+async function _executeBuy(event) {
+  const { wallet: dev, mint } = event;
+  const chatId = event.chatId;
 
   // ---- Time window gate (UTC) ----
   if (!isWithinTradingHours(chatId)) {
@@ -391,7 +437,20 @@ export async function executeSignal(event) {
   // ---- Read trade params from THIS USER's settings (mutable at runtime) ----
   // v0.8.7.15: chatId is REQUIRED for all settings reads. Each subscriber has
   // their own config — user A's fixed_buy_sol no longer leaks to user B.
-  const solAmount = settings.get('fixed_buy_sol', chatId);
+  // v0.8.8 (experimental) M3.3: copy_ratio. If the event carries a
+  // dev solSpent (mirror mode, BUY_DETECTED) we apply the ratio so the
+  // bot spends (dev_solSpent * copy_ratio / 100). In reverse mode
+  // (default) we use fixed_buy_sol as-is — the dev's sell amount isn't
+  // relevant.
+  const copyRatio = settings.get('copy_ratio', chatId) ?? 100;
+  const fixedBuy = settings.get('fixed_buy_sol', chatId);
+  let solAmount;
+  if (event.type === 'BUY_DETECTED' && typeof event.solSpent === 'number' && event.solSpent > 0) {
+    solAmount = (event.solSpent * copyRatio) / 100;
+    logStep('COPY_RATIO_APPLIED', { devSol: event.solSpent, copyRatio, botSol: solAmount });
+  } else {
+    solAmount = fixedBuy;
+  }
   const slippageBps = settings.get('slippage_bps', chatId);
   const pumpSlippageBps = settings.get('pump_slippage_bps', chatId);
   const pumpSellSlippageBps = settings.get('pump_sell_slippage_bps', chatId);  // v0.8.7.13: separate from buy

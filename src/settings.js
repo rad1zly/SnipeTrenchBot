@@ -41,6 +41,44 @@ const CATALOG = [
     },
   },
   {
+    // v0.8.8 (experimental) M3.3: copy ratio. When copy_mode = 'mirror',
+    // the bot spends (dev_sol * copy_ratio / 100) on the buy instead of
+    // fixed_buy_sol. Lets the user mirror a dev's trade size proportionally
+    // (e.g. dev bought 5 SOL → bot buys 0.5 SOL at 10%). Default 100% = 1:1.
+    key: 'copy_ratio', type: 'number', category: 'trade',
+    label: 'Copy Ratio',
+    unit: '%',
+    default: 100,
+    min: 1, max: 100,
+    parseUserInput: (t) => {
+      const n = Number(String(t).replace(/[^\d.\-]/g, ''));
+      if (!Number.isFinite(n) || n < 1 || n > 100) return null;
+      return n;
+    },
+    formatValue: (v) => v == null ? '100%' : `${v}%`,
+  },
+  {
+    // v0.8.8 (experimental) M3.1: copy mode. Decides which event types
+    // trigger a trade for this user.
+    //   - 'off'     : no event triggers (filters still apply)
+    //   - 'reverse' : SELL_DETECTED triggers a buy (classic reverse-copy)
+    //   - 'mirror'  : BUY_DETECTED triggers a buy (copy-trade)
+    // Default 'reverse' to preserve existing behaviour.
+    key: 'copy_mode', type: 'text', category: 'trade',
+    label: 'Copy Mode',
+    default: 'reverse',
+    parseUserInput: (t) => {
+      const s = t.trim().toLowerCase();
+      if (['off', 'reverse', 'mirror'].includes(s)) return s;
+      return null;
+    },
+    formatValue: (v) => {
+      if (!v) return 'Reverse';
+      const map = { off: 'Off', reverse: 'Reverse', mirror: 'Mirror' };
+      return map[v] || v;
+    },
+  },
+  {
     key: 'buy_limit_per_token', type: 'number', category: 'trade',
     label: 'Max Buys per Token',
     default: 1,
