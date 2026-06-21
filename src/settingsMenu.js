@@ -168,8 +168,15 @@ function buildFlatText(chatId) {
 /**
  * Build the keyboard. Pairs are rendered as a 2-column row; standalone
  * settings take a full row. Footer has Back/Refresh/Save.
+ *
+ * v0.8.8 (experimental) fix: chatId is now REQUIRED because the value
+ * suffix in each button needs the per-user setting (v0.8.7.15 isolation).
+ * Pre-fix, getBool() and formatValue() were called without chatId, which
+ * threw a runtime error and produced no buttons. Now callers MUST pass
+ * chatId (e.g. from ctx.chat.id in the Telegram handler).
  */
-function buildFlatKeyboard() {
+function buildFlatKeyboard(chatId) {
+  if (chatId == null) throw new Error('settingsMenu.buildFlatKeyboard: chatId is required');
   const buttons = [];
   // We iterate the catalog in display order, but pair rows consume 2 keys.
   for (const cat of ['trade', 'filters', 'token', 'time', 'advanced']) {
@@ -184,14 +191,14 @@ function buildFlatKeyboard() {
           SEEN.add(s.key);
           SEEN.add(pairKey);
           buttons.push([
-            settingButton(s),
-            settingButton(pairSetting),
+            settingButton(s, chatId),
+            settingButton(pairSetting, chatId),
           ]);
           continue;
         }
       }
       SEEN.add(s.key);
-      buttons.push([settingButton(s)]);
+      buttons.push([settingButton(s, chatId)]);
     }
   }
   // TradeWiz-style footer: ← Back / ↻ Refresh / + Save
@@ -207,13 +214,18 @@ function buildFlatKeyboard() {
 /**
  * Build a single button for a setting. Bool → toggle; number/text → edit.
  * TradeWiz-style: small icon prefix (🟢/🟠 for bool) + label + value suffix.
+ *
+ * v0.8.8 (experimental) fix: chatId is now REQUIRED. Pre-fix, getBool()
+ * and formatValue() were called without chatId, which threw on
+ * per-user-isolated settings (v0.8.7.15+).
  */
-function settingButton(s) {
+function settingButton(s, chatId) {
+  if (chatId == null) throw new Error('settingsMenu.settingButton: chatId is required');
   if (s.type === 'bool') {
-    const icon = getBool(s.key) ? '🟢' : '🟠';
+    const icon = getBool(s.key, chatId) ? '🟢' : '🟠';
     return Markup.button.callback(`${icon} ${s.label}`, `set:toggle:${s.key}`);
   }
-  return Markup.button.callback(`${s.label} = ${formatValue(s.key)}`, `set:edit:${s.key}`);
+  return Markup.button.callback(`${s.label} = ${formatValue(s.key, chatId)}`, `set:edit:${s.key}`);
 }
 
 // -----------------------------------------------------------------------------
@@ -229,7 +241,7 @@ async function renderFlat(ctx) {
   const chatId = ctx.chat?.id;
   if (chatId == null) throw new Error('settingsMenu.renderFlat: ctx.chat.id is required');
   const text = buildFlatText(chatId);
-  const kb = buildFlatKeyboard();
+  const kb = buildFlatKeyboard(chatId);
   try {
     await ctx.editMessageText(text, {
       parse_mode: 'HTML',
@@ -310,7 +322,7 @@ export async function handleSetCallback(ctx, action, key) {
 // v0.8.7.15: chatId threaded through to scope the rebuilt menu to one user.
 async function rerenderSettingsMenu(ctx, chatId, menuMessageId) {
   const text = buildFlatText(chatId);
-  const kb = buildFlatKeyboard();
+  const kb = buildFlatKeyboard(chatId);
   if (menuMessageId) {
     try {
       await ctx.telegram.editMessageText(
