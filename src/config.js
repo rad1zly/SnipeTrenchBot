@@ -161,6 +161,34 @@ const config = {
   ONLY_NEW_TOKENS: envBool('ONLY_NEW_TOKENS', true),
 
   // ---------------------------------------------------------------------------
+  // v0.8.8 (experimental) M4.0: Multi-lane tip routing.
+  // 4 lanes: jito, 0slot, helius (Sender), astralane (Iris). All accept a
+  // Jito-style tip ix; the difference is the submission endpoint. When the
+  // primary lane is congested, fall back to the next.
+  //
+  //   TIP_LANE_PRIMARY=jito              # which lane to try first
+  //   TIP_LANE_FALLBACKS=helius,0slot,astralane   # fallbacks in order
+  //   TIP_LANE_TIMEOUT_MS=8000           # per-lane wait before fallback
+  //   JITO_TIP_ACCOUNTS=96gYZGLn...,HFqU5x6...,Cw8CFyM9...  # CSV
+  //   HELIUS_SENDER_URL=https://sender.helius-rpc.com/fast
+  //   ZERO_SLOT_URL=https://ny.0slot.trade
+  //   ZERO_SLOT_TIP_ACCOUNTS=Eb2KpSC8q...
+  //   ASTRALANE_IRIS_URL=https://iris.astralane.io/submit
+  //   ASTRALANE_TIP_ACCOUNTS=astra4yeMcH8gB3QYU7ihPocyFaALo1cK8tcGmYjJmQ
+  // ---------------------------------------------------------------------------
+  TIP_LANE_PRIMARY: envString('TIP_LANE_PRIMARY', 'jito'),
+  TIP_LANE_FALLBACKS: envString('TIP_LANE_FALLBACKS', 'helius,0slot,astralane'),
+  TIP_LANE_TIMEOUT_MS: envInt('TIP_LANE_TIMEOUT_MS', 8000),
+  JITO_TIP_ACCOUNTS: envString('JITO_TIP_ACCOUNTS', '96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5,HFqU5x63VTqvQss8hp11i4wV8RH1T5ELA4Q8B42K3d3S,Cw8CFyM9EkoDy76U5Q9YY3pXTjLPgUaW7Y3HLL7n8GHe'),
+  HELIUS_SENDER_URL: envString('HELIUS_SENDER_URL', 'https://sender.helius-rpc.com/fast'),
+  ZERO_SLOT_URL: envString('ZERO_SLOT_URL', 'http://ny.0slot.trade'),
+  ZERO_SLOT_TIP_ACCOUNTS: envString('ZERO_SLOT_TIP_ACCOUNTS', 'Eb2KpSC8uMt9GmzyAEm5Eb1AAAgTjRaXWFjKyFXHZxF3,FCjUJZ1qozm1e8romw216qyfQMaaWKxWsuySnumVCCNe,ENxTEjSQ1YabmUpXAdCgevnHQ9MHdLv8tzFiuiYJqa13,6rYLG55Q9RpsPGvqdPNJs4z5WTxJVatMB8zV3WJhs5EK,Cix2bHfqPcKcM233mzxbLk14kSggUUiz2A87fJtGivXr'),
+  ZERO_SLOT_API_KEY: envString('ZERO_SLOT_API_KEY', ''),
+  ASTRALANE_IRIS_URL: envString('ASTRALANE_IRIS_URL', 'https://fr.gateway.astralane.io/iris'),
+  ASTRALANE_TIP_ACCOUNTS: envString('ASTRALANE_TIP_ACCOUNTS', 'astra4yeMcH8gB3QYU7ihPocyFaALo1cK8tcGmYjJmQ'),
+  ASTRALANE_API_KEY: envString('ASTRALANE_API_KEY', ''),
+
+  // ---------------------------------------------------------------------------
   // Constants
   // ---------------------------------------------------------------------------
   SOL_MINT: 'So11111111111111111111111111111111111111112',

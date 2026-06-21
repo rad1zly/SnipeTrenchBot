@@ -1,33 +1,31 @@
 // src/jitoTip.js
 // =============================================================================
-// Jito tip support (v0.8.8 experimental).
+// Jito tip support (legacy wrapper around tipLanes).
 //
-// Jito block engine accepts Solana transactions that include a tip to a Jito
-// tip account. The validator gives them priority inclusion (faster landing,
-// anti-sandwich). Reference: https://docs.jito.wtf/lowlatencytxnsend/
+// v0.8.8 (experimental) M4.0: TIP ROUTING IS NOW MULTI-LANE.
+// jitoTip.js is kept as a thin back-compat shim around `src/tipLanes.js`.
+// The new flow:
+//   1. buildSwapTransaction appends a Jito-style tip ix (still uses the
+//      Jito tip account by default — all 4 lanes accept it).
+//   2. executor.submitSwap hands the SIGNED tx to
+//      `tipLanes.submitFastTrack`, which tries the primary lane first
+//      (default jito) then fallbacks (helius, 0slot, astralane).
 //
-// Usage:
-//   import { appendTipIfEnabled } from './jitoTip.js';
-//   appendTipIfEnabled(instructions, payer, 'buy');
-//   appendTipIfEnabled(instructions, payer, 'sell');
+// 4 lanes, configurable via env:
+//   TIP_LANE_PRIMARY=jito
+//   TIP_LANE_FALLBACKS=helius,0slot,astralane
+//   JITO_BUY_TIP_SOL=0.001   JITO_SELL_TIP_SOL=0.001
 //
-// v0.8.8 (experimental) M1.20: Jito tip is now a FIXED admin config, not a
-// per-user setting. Configure via env JITO_BUY_TIP_SOL / JITO_SELL_TIP_SOL
-// (default 0.001 SOL each). Set to 0 to disable.
-//
-// Jito has 8 rotating tip accounts. We pick one randomly per-tx so the
-// validator distribution is fair. If the picked account is invalid (Jito
-// changes accounts over time), the validator rejects the whole tx — fine
-// because the executor's retry path will pick a different one next time.
+// Reference: https://docs.jito.wtf/lowlatencytxnsend/
 // =============================================================================
 
-import { PublicKey, TransactionInstruction, SystemProgram } from '@solana/web3.js';
+import { PublicKey, SystemProgram } from '@solana/web3.js';
 import config from './config.js';
+import { buildLaneTipIx, getLaneOrder } from './tipLanes.js';
 
 // Jito tip accounts (round-robin). Source: https://docs.jito.wtf/lowlatencytxnsend/
-// v0.8.8: only the 3 verified (publicly documented) accounts are used.
-// If/when Jito adds more active accounts, append them here after verifying
-// with PublicKey() — invalid addresses throw and would break the round-robin.
+// Now ALSO used as the tip account for non-Jito lanes (all 4 lanes are
+// Jito-compatible; the tip ix is the same).
 const VERIFIED_TIP_ACCOUNTS = [
   '96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5',
   'HFqU5x63VTqvQss8hp11i4wV8RH1T5ELA4Q8B42K3d3S',
@@ -37,7 +35,7 @@ const VERIFIED_TIP_ACCOUNTS = [
 let _lastTipAccountIdx = 0;
 
 /**
- * Pick a Jito tip account. Round-robin through the 4 verified accounts.
+ * Pick a Jito tip account. Round-robin through the 3 verified accounts.
  * Future: random selection + on-error retry with next account.
  */
 export function pickTipAccount() {
@@ -66,10 +64,15 @@ export function buildJitoTipIx(payer, tipSol) {
  * Check whether Jito tip is configured for this side.
  * Returns the tip amount in SOL (0 if disabled / not configured).
  *
- * v0.8.8 (experimental) M1.20: tip is now a fixed admin config from
+ * v0.8.8 (experimental) M1.20: tip is a fixed admin config from
  * `config.JITO_BUY_TIP_SOL` / `config.JITO_SELL_TIP_SOL` (env-driven).
  * Per-user settings (jito_buy_tip_sol / jito_sell_tip_sol) are no longer
  * honored — those catalog entries are hidden from the menu.
+ *
+ * v0.8.8 (experimental) M4.0: still uses Jito tip account because all 4
+ * lanes (jito, helius, 0slot, astralane) are Jito-compatible. The
+ * fallback is at the SUBMISSION level (tipLanes.submitFastTrack), not
+ * the tip account level.
  */
 export function getTipAmount(side, chatId) {
   // chatId is unused now but kept in the signature so callers / tests
@@ -87,8 +90,13 @@ export function getTipAmount(side, chatId) {
 export function appendTipIfEnabled(instructions, payer, side, chatId) {
   const tip = getTipAmount(side, chatId);
   if (tip <= 0) return false;
-  const ix = buildJitoTipIx(payer, tip);
+  // v0.8.8 M4.0: use the primary lane's tip ix (default jito). All 4
+  // lanes are Jito-compatible — the tip account doesn't need to differ
+  // for fallback to work.
+  const primaryLane = (config.TIP_LANE_PRIMARY || 'jito').toLowerCase();
+  const ix = buildLaneTipIx(primaryLane, payer, tip) || buildJitoTipIx(payer, tip);
   if (!ix) return false;
   instructions.push(ix);
   return true;
 }
+
