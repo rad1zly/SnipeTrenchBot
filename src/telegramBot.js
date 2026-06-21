@@ -62,7 +62,7 @@ import notifier from './notifier.js';
 import * as sm from './settingsMenu.js';
 import * as wm from './walletMenu.js';
 
-let bot = null;
+let bots = []; // M1.5: array of Telegraf instances (one per TELEGRAM_BOT_TOKEN)
 let onPause = null; // callback set by index.js so we can stop the monitor if needed
 let onResume = null;
 
@@ -452,24 +452,52 @@ function subscribeMiddleware(ctx, next) {
   return next();
 }
 
+// v0.8.8 (experimental) M1.5: launch one Telegraf instance per token.
+// The list comes from config.TELEGRAM_BOT_TOKEN_LIST (reads TELEGRAM_BOT_TOKENS
+// first, then falls back to TELEGRAM_BOT_TOKEN for back-compat).
 export function startTelegramBot({ onPause: pauseCb, onResume: resumeCb } = {}) {
   onPause = pauseCb;
   onResume = resumeCb;
-  if (!config.TELEGRAM_BOT_TOKEN) {
-    throw new Error('TELEGRAM_BOT_TOKEN is empty — cannot start bot');
+  const tokenList = config.TELEGRAM_BOT_TOKEN_LIST;
+  if (!tokenList || tokenList.length === 0) {
+    throw new Error('No TELEGRAM_BOT_TOKEN(S) configured — cannot start bot');
   }
-  bot = new Telegraf(config.TELEGRAM_BOT_TOKEN);
-  // CRITICAL: attach the bot to the notifier BEFORE attempting launch.
-  // bot.launch() opens a long-poll for incoming updates, but bot.telegram.sendMessage
+  const startedBots = [];
+  for (const token of tokenList) {
+    const inst = startSingleBot(token, { onPause: pauseCb, onResume: resumeCb });
+    if (inst) startedBots.push(inst);
+  }
+  if (startedBots.length > 0) {
+    notifier.attachBot(startedBots[0]);
+    bots.push(...startedBots);
+  }
+  return bots;
+}
+
+/**
+ * Internal: build and launch one Telegraf instance for a single token.
+ * The body below is the legacy single-bot startTelegramBot logic with
+ * `bot` renamed to `inst`. The wrapper above calls this once per token.
+ */
+function startSingleBot(token, { onPause: pauseCb, onResume: resumeCb } = {}) {
+  let inst = null;
+  onPause = pauseCb;
+  onResume = resumeCb;
+  if (!token) {
+    throw new Error('Empty bot token — cannot start bot instance');
+  }
+  inst = new Telegraf(token);
+  // CRITICAL: attach the inst to the notifier BEFORE attempting launch.
+  // inst.launch() opens a long-poll for incoming updates, but inst.telegram.sendMessage
   // uses the Bot API directly and works fine without an active long-poll. If we
   // wait for launch to succeed, the 409-retry loop on a stale long-poll slot
-  // leaves the notifier's bot reference null for the entire retry window (up to
+  // leaves the notifier's inst reference null for the entire retry window (up to
   // 13 min), and every trade notification is silently dropped during that time.
-  notifier.attachBot(bot);
-  bot.use(subscribeMiddleware);
+  notifier.attachBot(inst);
+  inst.use(subscribeMiddleware);
 
   // Pending "add wallet" state: chatId → { startedAt }
-  // (User tapped "➕ Add Wallet" and the bot is waiting for a text reply.)
+  // (User tapped "➕ Add Wallet" and the inst is waiting for a text reply.)
   const pendingAddWallet = new Map();
   const ADD_WALLET_TTL_MS = 5 * 60 * 1000; // 5 min
 
@@ -484,19 +512,19 @@ export function startTelegramBot({ onPause: pauseCb, onResume: resumeCb } = {}) 
   }
 
   // ---- /start ----
-  bot.start((ctx) => {
+  inst.start((ctx) => {
     // subscribeMiddleware already added sender to subscribers table.
     // Show the main menu inline.
     ctx.replyWithHTML(buildMainText(ctx.chat.id), mainMenu(ctx.chat.id));
   });
 
   // ---- /ping (debug: verify notifier can reach this chat) ----
-  bot.command('ping', async (ctx) => {
+  inst.command('ping', async (ctx) => {
     await notifier.ping(ctx.chat.id);
   });
 
   // ---- /menu (shortcut: re-show the main menu) ----
-  bot.command('menu', (ctx) => {
+  inst.command('menu', (ctx) => {
     ctx.replyWithHTML(buildMainText(ctx.chat.id), mainMenu(ctx.chat.id));
   });
 
@@ -504,7 +532,7 @@ export function startTelegramBot({ onPause: pauseCb, onResume: resumeCb } = {}) 
   // Routes `menu:*` (navigate) and `cmd:*` (run command) callbacks to the
   // right screen. Edits the message in place so the chat doesn't fill up
   // with one new message per tap.
-  bot.on('callback_query', async (ctx) => {
+  inst.on('callback_query', async (ctx) => {
     const data = ctx.callbackQuery.data || '';
     try {
       if (data === 'menu:main') {
@@ -665,7 +693,7 @@ export function startTelegramBot({ onPause: pauseCb, onResume: resumeCb } = {}) 
   });
 
   // ---- /stop (unsubscribe) ----
-  bot.command('stop', (ctx) => {
+  inst.command('stop', (ctx) => {
     if (ctx.chat?.id == null) return;
     const removed = subscribersDb.remove(ctx.chat.id);
     if (removed) {
@@ -676,7 +704,7 @@ export function startTelegramBot({ onPause: pauseCb, onResume: resumeCb } = {}) 
   });
 
   // ---- /help ----
-  bot.help((ctx) => {
+  inst.help((ctx) => {
     ctx.reply(
       [
         '<b>Commands:</b>',
@@ -685,7 +713,7 @@ export function startTelegramBot({ onPause: pauseCb, onResume: resumeCb } = {}) 
         '/wallets — show tracked wallets',
         '/addwallet <code>&lt;address&gt;</code> [label] — add a watched wallet',
         '/removewallet <code>&lt;address&gt;</code> — remove a watched wallet',
-        '/wallet — set / replace / remove the bot\'s trading key (encrypted at rest)',
+        '/wallet — set / replace / remove the inst\'s trading key (encrypted at rest)',
         '/pause — pause trading',
         '/resume — resume',
         '/status — safety + executor snapshot',
@@ -697,12 +725,12 @@ export function startTelegramBot({ onPause: pauseCb, onResume: resumeCb } = {}) 
         '<b>What I do:</b>',
         '1. Watch each of <i>your</i> wallets for token-creation transactions',
         '2. Watch each wallet for sell transactions of those tokens',
-        '3. When a sell is detected, buy via Jupiter (using the bot wallet)',
+        '3. When a sell is detected, buy via Jupiter (using the inst wallet)',
         `4. Hold ${config.HOLD_MS}ms, then sell`,
         '5. Log PnL and notify <i>you</i> (the wallet owner)',
         '',
         '<b>Multi-user:</b> anyone can /start. Watchlists and trade alerts are private — you only see your own wallets, and only you get notified about your trades. /stop to unsubscribe.',
-        '<b>Security:</b> /wallet stores the bot key AES-256-GCM encrypted and auto-deletes the key message.',
+        '<b>Security:</b> /wallet stores the inst key AES-256-GCM encrypted and auto-deletes the key message.',
         '<b>Tip:</b> type / in chat to see the autocomplete command list.',
       ].join('\n'),
       { parse_mode: 'HTML' }
@@ -717,7 +745,7 @@ export function startTelegramBot({ onPause: pauseCb, onResume: resumeCb } = {}) 
   //                <addr3> label3
   // The optional label is the first non-address token after the address on
   // the same line. Each address is validated with isValidSolanaAddress.
-  bot.command('addwallet', (ctx) => {
+  inst.command('addwallet', (ctx) => {
     const raw = ctx.message.text.replace(/^\/addwallet\s*/, '').trim();
     if (!raw) {
       return ctx.reply(
@@ -735,7 +763,7 @@ export function startTelegramBot({ onPause: pauseCb, onResume: resumeCb } = {}) 
   });
 
   // ---- /removewallet ----
-  bot.command('removewallet', (ctx) => {
+  inst.command('removewallet', (ctx) => {
     const parts = ctx.message.text.trim().split(/\s+/);
     const addr = parts[1];
     if (!addr) return ctx.reply('Usage: /removewallet <address>');
@@ -746,24 +774,24 @@ export function startTelegramBot({ onPause: pauseCb, onResume: resumeCb } = {}) 
   });
 
   // ---- /listwallets (legacy alias) ----
-  bot.command('listwallets', (ctx) => {
+  inst.command('listwallets', (ctx) => {
     ctx.replyWithHTML(buildWalletsText(ctx.chat.id), walletsMenu());
   });
 
   // ---- /wallets (alias for the menu screen) ----
-  bot.command('wallets', (ctx) => {
+  inst.command('wallets', (ctx) => {
     ctx.replyWithHTML(buildWalletsText(ctx.chat.id), walletsMenu());
   });
 
-  // ---- /wallet (bot's own trading key — set / replace / remove) ----
-  bot.command('wallet', (ctx) => {
+  // ---- /wallet (inst's own trading key — set / replace / remove) ----
+  inst.command('wallet', (ctx) => {
     // Send as a new message (not edit). /wallet is a fresh command, not a
     // tap on an existing button.
     ctx.replyWithHTML(wm.buildWalletText(), wm.walletMenu());
   });
 
   // ---- /copytrade (alias: /settings) — flat single-screen settings menu ----
-  bot.command(['copytrade', 'settings'], async (ctx) => {
+  inst.command(['copytrade', 'settings'], async (ctx) => {
     // Send as a new message (not edit). /copytrade is a fresh command.
     // v0.8.7.15: pass chatId so the menu shows THIS USER's values.
     try {
@@ -775,7 +803,7 @@ export function startTelegramBot({ onPause: pauseCb, onResume: resumeCb } = {}) 
   });
 
   // ---- /pause ----
-  bot.command('pause', (ctx) => {
+  inst.command('pause', (ctx) => {
     // v0.8.7.15: per-user pause. Only this chat_id is paused; other
     // subscribers' bots keep trading independently.
     pause(ctx.chat.id);
@@ -784,24 +812,24 @@ export function startTelegramBot({ onPause: pauseCb, onResume: resumeCb } = {}) 
   });
 
   // ---- /resume ----
-  bot.command('resume', (ctx) => {
+  inst.command('resume', (ctx) => {
     resume(ctx.chat.id);
     onResume?.();
     ctx.reply('▶️  Trading resumed for your account.');
   });
 
   // ---- /status ----
-  bot.command('status', (ctx) => {
+  inst.command('status', (ctx) => {
     ctx.reply(buildStatusText(ctx.chat.id), { parse_mode: 'HTML' });
   });
 
   // ---- /stats — v0.8.0: detailed win/loss tracking ----
-  bot.command('stats', (ctx) => {
+  inst.command('stats', (ctx) => {
     ctx.reply(buildStatsText(ctx.chat.id), { parse_mode: 'HTML' });
   });
 
   // ---- /balance — v0.8.0: wallet SOL + SPL token balances ----
-  bot.command('balance', async (ctx) => {
+  inst.command('balance', async (ctx) => {
     const wm0 = walletManager.getStatus(ctx.chat.id);
     if (!wm0.set) {
       return ctx.reply(
@@ -860,7 +888,7 @@ export function startTelegramBot({ onPause: pauseCb, onResume: resumeCb } = {}) 
   });
 
   // ---- /positions ----
-  bot.command('positions', (ctx) => {
+  inst.command('positions', (ctx) => {
     // v0.8.7.15: per-user. Each subscriber sees their own open positions.
     const open = positionsDb.openAll(ctx.chat.id);
     if (open.length === 0) return ctx.reply('No open positions.');
@@ -872,7 +900,7 @@ export function startTelegramBot({ onPause: pauseCb, onResume: resumeCb } = {}) 
   });
 
   // ---- /recent ----
-  bot.command('recent', (ctx) => {
+  inst.command('recent', (ctx) => {
     const parts = ctx.message.text.trim().split(/\s+/);
     const n = Math.max(1, Math.min(50, parseInt(parts[1], 10) || 10));
     // v0.8.7.15: per-user. Each subscriber sees their own trade history,
@@ -888,7 +916,7 @@ export function startTelegramBot({ onPause: pauseCb, onResume: resumeCb } = {}) 
   });
 
   // ---- /safety ----
-  bot.command('safety', (ctx) => {
+  inst.command('safety', (ctx) => {
     // v0.8.7.15: per-user. Show THIS USER's caps/pause, not global aggregate.
     const s = safetySnapshot(ctx.chat.id);
     ctx.reply(
@@ -908,7 +936,7 @@ export function startTelegramBot({ onPause: pauseCb, onResume: resumeCb } = {}) 
   // ---- /subscribers removed in v0.6.1 (privacy: don't expose other users' chat_ids) ----
 
   // ---- unknown command / free text ----
-  bot.on('text', async (ctx) => {
+  inst.on('text', async (ctx) => {
     // Order matters here. First the settings edit flow, then "add wallet"
     // (watched wallet address), then "set trading wallet" (private key).
     // Each handler is gated by its own pending-map and returns true to
@@ -942,7 +970,7 @@ export function startTelegramBot({ onPause: pauseCb, onResume: resumeCb } = {}) 
   });
 
   // ---- error handler ----
-  bot.catch((err) => {
+  inst.catch((err) => {
     console.error('[telegramBot] error:', err);
   });
 
@@ -953,14 +981,14 @@ export function startTelegramBot({ onPause: pauseCb, onResume: resumeCb } = {}) 
   // catch the 409, wait progressively longer, and re-launch.
   const launchWith409Retry = async (attempt = 1) => {
     try {
-      await bot.launch({ dropPendingUpdates: false });
-      notifier.attachBot(bot);
+      await inst.launch({ dropPendingUpdates: false });
+      notifier.attachBot(inst);
 
       // Register the command list so when a user types "/" in the chat,
       // Telegram shows the autocomplete list with descriptions.
-      // (Scope: default — applies to all private chats with this bot.)
+      // (Scope: default — applies to all private chats with this inst.)
       try {
-        await bot.telegram.setMyCommands(BOT_COMMANDS);
+        await inst.telegram.setMyCommands(BOT_COMMANDS);
         console.log(`[telegramBot] setMyCommands: registered ${BOT_COMMANDS.length} commands.`);
       } catch (e) {
         console.warn('[telegramBot] setMyCommands failed (non-fatal):', e?.message || e);
@@ -990,9 +1018,12 @@ export function startTelegramBot({ onPause: pauseCb, onResume: resumeCb } = {}) 
     process.exit(1);
   });
 
-  return bot;
+  return inst;
 }
 
 export function stopTelegramBot() {
-  if (bot) bot.stop('shutdown');
+  for (const inst of bots) {
+    try { inst.stop('shutdown'); } catch {}
+  }
+  bots.length = 0;
 }

@@ -53,35 +53,43 @@ const CATALOG = [
   },
   {
     key: 'slippage_bps', type: 'number', category: 'trade',
-    label: 'Buy Slippage (bps)',
+    label: 'Buy Slippage',
+    unit: '%',          // M1.18: display as percent (1-100), stored as basis points internally
     env: 'SLIPPAGE_BPS', default: 500,
-    min: 1,             // no upper bound — user can set 50 or 50000 if they want
+    min: 1,             // 1% = 100 bps. UI range 1%-100%. Internal storage unbounded.
+    inputMax: 100,      // UI-only: user enters percent 1-100.
     parseUserInput: (t) => {
-      const n = parseInt(t, 10);
-      if (Number.isNaN(n) || n < 1) return null;
-      return n;
+      const n = Number(String(t).replace(/[^\d.\-]/g, ''));
+      if (!Number.isFinite(n) || n < 1 || n > 100) return null;
+      return Math.round(n * 100); // percent → bps
     },
+    formatValue: (v) => v == null ? '—' : `${(v / 100).toFixed(1)}%`,
   },
   {
     key: 'pump_slippage_bps', type: 'number', category: 'trade',
-    label: 'PUMP Buy Slippage (bps)',
-    default: 100,     // v0.8.7.14: tightened from 1500 (15%) → 100 (1%). User wants maxSolCost ≈ solAmount, not 1.15×.
-    min: 1,             // no upper bound
+    label: 'PUMP Buy Slippage',
+    unit: '%',          // M1.18: display as percent
+    default: 100,       // 100 bps = 1%. v0.8.7.14: tightened from 1500 bps (15%) → 100 bps (1%).
+    min: 1,
+    inputMax: 100,
     parseUserInput: (t) => {
-      const n = parseInt(t, 10);
-      if (Number.isNaN(n) || n < 1) return null;
-      return n;
+      const n = Number(String(t).replace(/[^\d.\-]/g, ''));
+      if (!Number.isFinite(n) || n < 1 || n > 100) return null;
+      return Math.round(n * 100);
     },
+    formatValue: (v) => v == null ? '—' : `${(v / 100).toFixed(1)}%`,
   },
   {
     key: 'pump_sell_slippage_bps', type: 'number', category: 'trade',
-    label: 'PUMP Sell Slippage (bps)',
-    default: 3000,    // v0.8.7.11: widened from 1500 for fast-moving SELLs (dev dump, sandwich)
+    label: 'PUMP Sell Slippage',
+    unit: '%',          // M1.18: display as percent
+    default: 3000,      // 3000 bps = 30%. v0.8.7.11: widened from 1500 bps (15%) for fast-moving SELLs.
     min: 1,
+    inputMax: 100,
     parseUserInput: (t) => {
-      const n = parseInt(t, 10);
-      if (Number.isNaN(n) || n < 1) return null;
-      return n;
+      const n = Number(String(t).replace(/[^\d.\-]/g, ''));
+      if (!Number.isFinite(n) || n < 1 || n > 100) return null;
+      return Math.round(n * 100);
     },
   },
   {
@@ -213,6 +221,7 @@ const CATALOG = [
   {
     key: 'dev_sell_trigger', type: 'text', nullable: true, category: 'trade',
     label: 'Dev Sell Trigger',
+    hidden: true, // M1.18: removed from menu — user has Ratio menu that does this. Catalog kept for legacy/back-compat.
     default: null,  // null = disabled. Format: {"enabled":true,"mode":"any_amount"|"whole_amount","sell_pct":100}
     parseUserInput: (t) => {
       const s = t.trim();
@@ -616,11 +625,14 @@ export function formatValue(key, chatId) {
     const s = v % 60;
     return s > 0 ? `${m}m ${s}s` : `${m}m`;
   }
-  if (setting.type === 'number' && setting.key === 'slippage_bps') {
-    return `${v} bps (${(v / 100).toFixed(1)}%)`;
+  // v0.8.8 (experimental) M1.18: per-setting formatValue takes priority so
+  // slippage bps values are shown as percent in the UI while stored as bps
+  // internally. Falls back to default formatting below.
+  if (typeof setting.formatValue === 'function') {
+    return setting.formatValue(v);
   }
-  if (setting.type === 'number' && setting.key === 'pump_slippage_bps') {
-    return `${v} bps (${(v / 100).toFixed(1)}%)`;
+  if (setting.type === 'number' && (setting.key === 'slippage_bps' || setting.key === 'pump_slippage_bps' || setting.key === 'pump_sell_slippage_bps')) {
+    return `${(v / 100).toFixed(1)}%`;
   }
   if (setting.type === 'number' && setting.key.endsWith('_sol')) {
     return `${v} SOL`;

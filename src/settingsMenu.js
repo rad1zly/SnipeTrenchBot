@@ -98,12 +98,16 @@ function describeRange(setting) {
   if (setting.type === 'text') return `text, max ${setting.maxLen ?? 32} chars`;
   if (setting.type === 'number') {
     let s = '';
-    if (setting.min != null) s += `≥ <code>${setting.min}</code>`;
-    if (setting.min != null && (setting.max == null || setting.max === Infinity)) s += ', ';
-    if (setting.max == null || setting.max === Infinity) {
+    const unit = setting.unit ? ` ${setting.unit}` : '';
+    // M1.18: inputMax is for UI display only (e.g. slippage_bps is stored as
+    // bps internally but the user enters a percent 1-100). Falls back to max.
+    const effMax = setting.inputMax != null ? setting.inputMax : setting.max;
+    if (setting.min != null) s += `≥ <code>${setting.min}${unit}</code>`;
+    if (setting.min != null && (effMax == null || effMax === Infinity)) s += ', ';
+    if (effMax == null || effMax === Infinity) {
       s += 'no upper bound';
     } else {
-      s += `, ≤ <code>${setting.max}</code>`;
+      s += `, ≤ <code>${effMax}${unit}</code>`;
     }
     if (NULLABLE_NUMBER_KEYS.has(setting.key)) {
       s += ' — or <code>none</code> / <code>unlimited</code> / <code>off</code> to disable';
@@ -492,31 +496,7 @@ async function renderAutoSellQuickPrompt(ctx, key, chatId) {
   const stored = parseStored(get(key, chatId));
   const summary = summarise(key, stored);
 
-  // Field list per setting (for instructions + parser)
-  const fields = fieldsForSetting(key);
-
-  // Build prompt text: simple, no JSON, no "Pick a preset"
-  const lines = [
-    `<b>${layout.label}</b>`,
-    '',
-    `Current: <b>${summary}</b>`,
-    '',
-    '<b>Cara 1 — satu baris (CSV, paling simpel):</b>',
-    'TP1, TP2, TP3 adalah OPSIONAL (skip yang gak perlu). SL selalu negatif.',
-    'Cara baca: angka POSITIF = TP (urut dari kecil), 1 angka NEGATIF di akhir = SL.',
-    `<code>${fields.exampleCsv}</code>`,
-    '',
-    'Contoh lain (cuma TP1 + SL, tanpa TP2/TP3):',
-    '<code>50, -30</code>  → TP1 +50%, SL -30%',
-    '<code>100, 200, -30</code>  → TP1 +100%, TP2 +200%, SL -30%',
-    '',
-    '<b>Cara 2 — per baris (key=value, kalau mau partial/selective):</b>',
-    ...fields.exampleKvLines.map((l) => `<code>${l}</code>`),
-    '(skip key = tidak diubah; tulis key kosong = hapus tier; /cancel = batal)',
-    '',
-    fields.note,
-  ].filter(Boolean);
-  const prompt = lines.join('\n');
+  const prompt = buildAutoSellPrompt(key, layout, summary);
 
   // Set pending so handlePendingText routes to applyAutoSellQuick
   setPending(ctx.chat.id, `__autosell_quick:${key}`, ctx.callbackQuery?.message?.message_id ?? null);
@@ -525,6 +505,87 @@ async function renderAutoSellQuickPrompt(ctx, key, chatId) {
     parse_mode: 'HTML',
     reply_markup: { force_reply: true, selective: true },
   });
+}
+
+/**
+ * Build a setting-specific prompt. Each auto-sell setting has its own
+ * field set + semantics, so we render different instructions for each.
+ * Goal: the user never sees the same generic "CSV..." template repeated
+ * for every setting — Trailing Stop should look like Trailing Stop,
+ * Time-based exit should look like Time-based exit, etc.
+ */
+function buildAutoSellPrompt(key, layout, summary) {
+  const header = `<b>${layout.label}</b>\n\nCurrent: <b>${summary}</b>`;
+
+  if (key === 'trailing_stop') {
+    return [
+      header,
+      '',
+      'Trailing Stop: jual <b>semua</b> position saat harga turun Trail% dari peak.',
+      'Trailing mulai aktif setelah harga naik Activate% dari entry.',
+      '',
+      '<b>Activate % (wajib positif)</b>  — kapan trailing mulai aktif.',
+      'Misal <code>20</code> = trailing start setelah harga +20% dari harga beli.',
+      '',
+      '<b>Trail % (wajib negatif)</b>  — berapa % drop dari peak yang trigger jual.',
+      'Misal <code>-10</code> = jual saat harga turun 10% dari harga tertinggi.',
+      '',
+      'Format: <code>20, -10</code>',
+      'Contoh:',
+      '<code>20, -10</code>  → aktif di +20%, jual saat turun 10% dari peak',
+      '<code>50, -20</code>  → aktif di +50%, jual saat turun 20% dari peak (lebih longgar)',
+      '',
+      '<b>Key=value (kalau mau set satu-satu):</b>',
+      '<code>act=20</code>  → set Activate % saja',
+      '<code>trail=-10</code>  → set Trail % saja',
+      '<code>act=0 trail=0</code>  → disable trailing stop',
+      '',
+      '<i>Sell = 100% (jual semua). Default sell % tidak bisa diubah untuk trailing.</i>',
+    ].join('\n');
+  }
+
+  if (key === 'time_sell_plan') {
+    return [
+      header,
+      '',
+      'Time-based exit: jual sebagian position setelah N detik dari entry.',
+      'Bisa sampai 3 tier waktu (T1, T2, T3). Makin banyak tier = exit lebih halus.',
+      '',
+      'Format: jual pada T1 detik, T2 detik, T3 detik (comma-separated).',
+      'Contoh:',
+      '<code>30</code>  → jual 100% setelah 30 detik',
+      '<code>30, 60</code>  → jual 50% pada 30s, 50% pada 60s',
+      '<code>30, 60, 120</code>  → jual di 30s, 60s, 120s',
+      '',
+      '<b>Key=value (per tier):</b>',
+      '<code>t1=30</code>  → set T1 = 30 detik',
+      '<code>t1=30 t1_sell=50 t2=60</code>  → T1 di 30s sell 50%, T2 di 60s sell 100%',
+      '',
+      '<i>Skip key = tier tidak diubah. Hapus tier: tulis key=0 atau hapus baris.</i>',
+    ].join('\n');
+  }
+
+  // Default: TP / SL Plan — multi-tier take-profit + stop-loss
+  return [
+    header,
+    '',
+    'TP / SL plan: jual position saat harga naik (TP) atau turun (SL).',
+    'TP1/TP2/TP3 OPSIONAL — kamu bisa cuma TP1, atau TP1+TP2, atau TP1+TP2+TP3+SL.',
+    '',
+    '<b>Cara 1 — satu baris (CSV, paling simpel):</b>',
+    'Angka POSITIF = TP (urut dari kecil ke besar). SATU angka NEGATIF = SL.',
+    '<code>50, -30</code>  → TP1 +50% (sell 100% krn cuma 1 tier), SL -30% (sell 100%)',
+    '<code>100, 200, -30</code>  → TP1 +100%, TP2 +200%, SL -30% (semua sell 50%)',
+    '<code>50, 100, 200, -30</code>  → TP1/TP2/TP3 +50/+100/+200, SL -30%',
+    '',
+    '<b>Cara 2 — per baris (key=value, partial):</b>',
+    '<code>tp1=50</code>  → set TP1 saja',
+    '<code>sl=-30</code>  → set SL saja',
+    '<code>tp1=100 tp2=200</code>  → TP1 + TP2 (TP3 & SL gak diubah)',
+    '<code>tp3=300 tp1_sell=30</code>  → set TP3 dan sell % TP1',
+    '',
+    '<i>Sell % default: 100% kalau cuma 1 TP tier, 50% kalau 2+. SL selalu 100%.</i>',
+  ].join('\n');
 }
 
 /** Field descriptors per setting (for prompt + parser). */

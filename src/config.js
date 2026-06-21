@@ -88,7 +88,15 @@ const config = {
   // subscribeMiddleware in telegramBot.js. The first /start becomes a
   // subscriber and receives broadcasts. /stop to unsubscribe.
   TELEGRAM_BOT_TOKEN: envString('TELEGRAM_BOT_TOKEN', ''),
+  TELEGRAM_BOT_TOKENS: envString('TELEGRAM_BOT_TOKENS', ''), // M1.5: comma-separated for multi-bot
   TELEGRAM_CHAT_ID: envString('TELEGRAM_CHAT_ID', ''), // legacy/unused, kept for back-compat
+  // M1.5: derived list — prefers TELEGRAM_BOT_TOKENS (csv) over single TELEGRAM_BOT_TOKEN.
+  get TELEGRAM_BOT_TOKEN_LIST() {
+    const multi = this.TELEGRAM_BOT_TOKENS.split(',').map((t) => t.trim()).filter(Boolean);
+    if (multi.length > 0) return multi;
+    if (this.TELEGRAM_BOT_TOKEN) return [this.TELEGRAM_BOT_TOKEN];
+    return [];
+  },
 
   // ---------------------------------------------------------------------------
   // Solana RPC
