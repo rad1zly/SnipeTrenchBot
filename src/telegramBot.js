@@ -257,7 +257,17 @@ function mainMenu(chatId) {
   // single-screen settings menu (TradeWiz parity). 🔑 Wallet stays prominent
   return Markup.inlineKeyboard([
     [Markup.button.callback(running ? '⏸ Pause Trading' : '▶️ Resume Trading', 'cmd:toggle_pause')],
-    [Markup.button.callback('🎯 Copy Trade', 'menu:copytrade')],
+    // v0.8.8 (experimental) M3.9: split single Copy Trade into two —
+    // 🪞 Copy Trade (mirror) and 🔁 Reverse Copy (counter). Per user
+    // feedback (tg 01:01): "ada beberapa fitur yang berbeda disitu,
+    // jadi lebih baik fitur copy trade sm reverse copy trade menunya
+    // dipisah". Each menu shows settings filtered by `mode` in the
+    // catalog. Per-wallet copy_mode + copy_ratio (M3.1b) live in
+    // /wallets, not here.
+    [
+      Markup.button.callback('🪞 Copy Trade',    'cmd:copytrade_mirror'),
+      Markup.button.callback('🔁 Reverse Copy',  'cmd:copytrade_reverse'),
+    ],
     [
       Markup.button.callback('📊 Status',    'cmd:status'),
       Markup.button.callback('🔄 Refresh',   'menu:main'),
@@ -777,11 +787,24 @@ function startSingleBot(token, { onPause: pauseCb, onResume: resumeCb } = {}) {
         // into [object Promise] in the menu body.
         const text = await buildMainText(ctx.chat.id);
         await renderScreen(ctx, text, mainMenu(ctx.chat.id));
+      } else if (data === 'cmd:copytrade_mirror') {
+        // v0.8.8 (experimental) M3.9: Copy Trade menu (mirror mode).
+        // Shows settings with mode='mirror' or mode='both' in the
+        // catalog — the Buy Ratio, Copy Sell, Trader Buy Limit, and
+        // other mirror-only TradeWiz features. Tap a setting to edit.
+        await sm.renderFlat(ctx, 'mirror');
+      } else if (data === 'cmd:copytrade_reverse') {
+        // v0.8.8 (experimental) M3.9: Reverse Copy menu (counter-trade).
+        // Shows settings with mode='reverse' or mode='both' — focused on
+        // the counter-trade entry signal + structured exit (TP/SL,
+        // Trailing, Dev Sell, Time). No Buy Ratio (we use fixed_buy_sol).
+        await sm.renderFlat(ctx, 'reverse');
       } else if (data === 'cmd:copytrade' || data === 'menu:settings') {
-        // Flat single-screen Copy Trade settings menu (v0.5.2+).
-        // `menu:settings` is kept as an alias for backwards-compat with
-        // any old messages that still have a Settings button.
-        await sm.renderFlat(ctx);
+        // Back-compat: legacy single-menu button. v0.8.8 M3.9 split
+        // this into cmd:copytrade_mirror and cmd:copytrade_reverse.
+        // Kept as an alias for any old messages that still have the
+        // button. Default to 'both' so all settings are shown.
+        await sm.renderFlat(ctx, 'both');
       } else if (data === 'menu:wallet') {
         // Bot's own trading wallet (encrypted). Set / Replace / Remove.
         // MUST be checked BEFORE the generic menu: catch-all below, otherwise
@@ -800,7 +823,9 @@ function startSingleBot(token, { onPause: pauseCb, onResume: resumeCb } = {}) {
         if (rest === 'wallet' || rest === 'main') {
           // handled above
         } else {
-          await sm.renderFlat(ctx);
+          // v0.8.8 (experimental) M3.9: keep the active mode on
+          // back-compat fall-through. Default to 'both' if not set.
+          await sm.renderFlat(ctx, 'both');
         }
       } else if (data.startsWith('set:')) {
         // set:toggle:KEY  or  set:edit:KEY

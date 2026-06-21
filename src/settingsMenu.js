@@ -63,6 +63,14 @@ for (const [left, right] of PAIR_GROUPS) {
 }
 const SEEN = new Set();
 
+// v0.8.8 (experimental) M3.9: which mode the current flat menu is in.
+// 'both' (default) shows every setting; 'mirror' hides reverse-only
+// settings; 'reverse' hides mirror-only settings. Set by renderFlat()
+// before calling buildFlatText/buildFlatKeyboard, read by them.
+let activeMode = 'both';
+function setActiveMode(mode) { activeMode = mode || 'both'; }
+function getActiveMode() { return activeMode; }
+
 // In-memory state: which setting the user is currently editing
 // chatId -> { key, startedAt, menuMessageId }
 //   menuMessageId is the Telegram message_id of the flat settings screen the
@@ -131,15 +139,22 @@ function describeRange(setting) {
  */
 function buildFlatText(chatId) {
   if (chatId == null) throw new Error('settingsMenu.buildFlatText: chatId is required');
+  const mode = getActiveMode();
+  // v0.8.8 (experimental) M3.9: header + sub-title differ per mode.
+  const header = mode === 'mirror'
+    ? '<b>🪞 Copy Trade Settings</b>  <i>— mirror the target wallet</i>'
+    : mode === 'reverse'
+    ? '<b>🔁 Reverse Copy Settings</b>  <i>— counter-trade the target wallet</i>'
+    : '<b>🎯 Copy Trade Settings</b>';
   const lines = [
-    '<b>🎯 Copy Trade Settings</b>',
+    header,
     '',
     '<i>Tap a row to edit. Bools toggle on a single tap. Numbers/text open a prompt.</i>',
     '',
   ];
 
   for (const cat of ['trade', 'filters', 'token', 'time', 'advanced']) {
-    const items = byCategory(cat);
+    const items = byCategory(cat, mode);
     if (items.length === 0) continue;
     const { emoji, label, desc } = CATEGORY_LABELS[cat];
     lines.push(`<b>${emoji} ${label}</b>  <i>— ${desc}</i>`);
@@ -184,10 +199,11 @@ function buildFlatText(chatId) {
  */
 function buildFlatKeyboard(chatId) {
   if (chatId == null) throw new Error('settingsMenu.buildFlatKeyboard: chatId is required');
+  const mode = getActiveMode();
   const buttons = [];
   // We iterate the catalog in display order, but pair rows consume 2 keys.
   for (const cat of ['trade', 'filters', 'token', 'time', 'advanced']) {
-    const items = byCategory(cat);
+    const items = byCategory(cat, mode);
     if (items.length === 0) continue;
     for (const s of items) {
       if (SEEN.has(s.key)) continue;
@@ -247,7 +263,12 @@ function settingButton(s, chatId) {
  * sub-menu flow. Edit text in place (no new message per tap).
  * v0.8.7.15: chatId is REQUIRED — the menu shows this user's values.
  */
-async function renderFlat(ctx) {
+async function renderFlat(ctx, mode) {
+  // v0.8.8 (experimental) M3.9: optional `mode` param ('mirror' or
+  // 'reverse') selects which subset of settings to show. The
+  // single-menu (no mode) variant is kept for back-compat and shows
+  // all settings (mode='both').
+  setActiveMode(mode || 'both');
   const chatId = ctx.chat?.id;
   if (chatId == null) throw new Error('settingsMenu.renderFlat: ctx.chat.id is required');
   const text = buildFlatText(chatId);
@@ -292,7 +313,11 @@ export async function handleSetCallback(ctx, action, key) {
     // v0.8.7.15: per-user. Toggle THIS USER's setting only.
     const newVal = toggle(key, chatId);
     await ctx.answerCbQuery(`${setting.label}: ${newVal ? 'ON' : 'OFF'}`);
-    await renderFlat(ctx);
+    // v0.8.8 (experimental) M3.9: re-render in the SAME mode we entered
+    // in (mirror or reverse), not the default 'both'. Otherwise toggling
+    // a setting from the Copy Trade menu would suddenly show ALL
+    // settings including reverse-only ones.
+    await renderFlat(ctx, getActiveMode());
     return true;
   }
 
@@ -339,6 +364,10 @@ export async function handleSetCallback(ctx, action, key) {
 // v0.8.0: extract re-render logic to a helper, used by both the success path
 // and the nullable "set to null" path.
 // v0.8.7.15: chatId threaded through to scope the rebuilt menu to one user.
+// v0.8.8 (experimental) M3.9: activeMode is module-level (set by
+// renderFlat); both buildFlatText and buildFlatKeyboard read it. So
+// after a set:edit round-trip, the user lands back in the same mode
+// they were in (mirror or reverse) — no mode argument needed here.
 async function rerenderSettingsMenu(ctx, chatId, menuMessageId) {
   const text = buildFlatText(chatId);
   const kb = buildFlatKeyboard(chatId);

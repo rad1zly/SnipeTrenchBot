@@ -30,7 +30,7 @@ import { userSettingsDb, positionsDb } from './db.js';
 const CATALOG = [
   // ── Trade ──────────────────────────────────────────────────────────────
   {
-    key: 'fixed_buy_sol', type: 'number', category: 'trade',
+    key: 'fixed_buy_sol', type: 'number', category: 'trade', mode: 'both',
     label: 'Fixed Buy (SOL)',
     env: 'MAX_SOL_PER_TRADE', default: 0.01,
     min: 0.0001,        // no upper bound — user can set 0.001 or 1000 if they want
@@ -48,7 +48,7 @@ const CATALOG = [
   // The /wallets menu lists each wallet with its current mode + ratio
   // and a button to change them.
   {
-    key: 'buy_limit_per_token', type: 'number', category: 'trade',
+    key: 'buy_limit_per_token', type: 'number', category: 'trade', mode: 'both',
     label: 'Max Buys per Token',
     default: 1,
     min: 1, max: 3,      // KEEP BOUNDED — this is a CHOICE (1, 2, or 3 buys per token), not a continuous range
@@ -59,7 +59,7 @@ const CATALOG = [
     },
   },
   {
-    key: 'slippage_bps', type: 'number', category: 'trade',
+    key: 'slippage_bps', type: 'number', category: 'trade', mode: 'both',
     label: 'Buy Slippage',
     unit: '%',          // M1.18: display as percent (1-100), stored as basis points internally
     env: 'SLIPPAGE_BPS', default: 500,
@@ -73,7 +73,7 @@ const CATALOG = [
     formatValue: (v) => v == null ? '—' : `${(v / 100).toFixed(1)}%`,
   },
   {
-    key: 'pump_slippage_bps', type: 'number', category: 'trade',
+    key: 'pump_slippage_bps', type: 'number', category: 'trade', mode: 'both',
     label: 'PUMP Buy Slippage',
     unit: '%',          // M1.18: display as percent
     default: 100,       // 100 bps = 1%. v0.8.7.14: tightened from 1500 bps (15%) → 100 bps (1%).
@@ -87,7 +87,7 @@ const CATALOG = [
     formatValue: (v) => v == null ? '—' : `${(v / 100).toFixed(1)}%`,
   },
   {
-    key: 'pump_sell_slippage_bps', type: 'number', category: 'trade',
+    key: 'pump_sell_slippage_bps', type: 'number', category: 'trade', mode: 'both',
     label: 'PUMP Sell Slippage',
     unit: '%',          // M1.18: display as percent
     default: 3000,      // 3000 bps = 30%. v0.8.7.11: widened from 1500 bps (15%) for fast-moving SELLs.
@@ -100,7 +100,7 @@ const CATALOG = [
     },
   },
   {
-    key: 'buy_priority_fee_sol', type: 'number', category: 'trade',
+    key: 'buy_priority_fee_sol', type: 'number', category: 'trade', mode: 'both',
     label: 'Buy Priority Fee',
     default: 0.0,
     min: 0,             // no upper bound
@@ -118,7 +118,7 @@ const CATALOG = [
   // tip amount, so users don't need to tune it.
   {
     // v0.8.8 (experimental): Jito tip for SELL. Default 0 (no tip).
-    key: 'jito_sell_tip_sol', type: 'number', category: 'trade',
+    key: 'jito_sell_tip_sol', type: 'number', category: 'trade', mode: 'both',
     label: 'Jito Sell Tip 🚀',
     hidden: true, // M1.20: moved to config (admin env). Kept here for back-compat reads; not in menu.
     default: 0.0,
@@ -132,7 +132,7 @@ const CATALOG = [
     },
   },
   {
-    key: 'anti_mev', type: 'bool', category: 'trade',
+    key: 'anti_mev', type: 'bool', category: 'trade', mode: 'both',
     label: 'Anti-MEV Buy',
     default: false,
     parseUserInput: (t) => {
@@ -148,7 +148,7 @@ const CATALOG = [
     // setting in the catalog for parity with the docs and for the safety
     // snapshot's autoSell field; the executor's buy→hold→sell flow always
     // sells. Default true = current behavior.
-    key: 'auto_sell', type: 'bool', category: 'trade',
+    key: 'auto_sell', type: 'bool', category: 'trade', mode: 'both',
     label: 'Auto Sell',
     default: true,
     parseUserInput: (t) => {
@@ -159,7 +159,7 @@ const CATALOG = [
     },
   },
   {
-    key: 'auto_retry', type: 'number', category: 'trade',
+    key: 'auto_retry', type: 'number', category: 'trade', mode: 'both',
     label: 'Auto Retry',
     default: 0,
     min: 0, max: 5,
@@ -175,7 +175,7 @@ const CATALOG = [
   // (= feature disabled). Setting a value like `{"enabled":true,...}` activates
   // the feature. See parseUserInput for schema validation.
   {
-    key: 'tp_sl_plan', type: 'text', nullable: true, category: 'trade',
+    key: 'tp_sl_plan', type: 'text', nullable: true, category: 'trade', mode: 'both',
     label: 'TP / SL Plan',
     default: null,  // null = disabled. Format: {"enabled":true,"tiers":[{"tp_pct":50,"sell_pct":50},...],"sl_pct":-30,"sl_sell_pct":100}
     parseUserInput: (t) => {
@@ -198,7 +198,7 @@ const CATALOG = [
     },
   },
   {
-    key: 'trailing_stop', type: 'text', nullable: true, category: 'trade',
+    key: 'trailing_stop', type: 'text', nullable: true, category: 'trade', mode: 'both',
     label: 'Trailing Stop',
     default: null,  // null = disabled. Format: {"enabled":true,"act_pct":20,"trail_pct":10,"sell_pct":100}
     parseUserInput: (t) => {
@@ -215,7 +215,7 @@ const CATALOG = [
     },
   },
   {
-    key: 'dev_sell_trigger', type: 'text', nullable: true, category: 'trade',
+    key: 'dev_sell_trigger', type: 'text', nullable: true, category: 'trade', mode: 'both',
     label: 'Dev Sell Trigger',
     hidden: true, // M1.18: removed from menu — user has Ratio menu that does this. Catalog kept for legacy/back-compat.
     default: null,  // null = disabled. Format: {"enabled":true,"mode":"any_amount"|"whole_amount","sell_pct":100}
@@ -232,7 +232,7 @@ const CATALOG = [
     },
   },
   {
-    key: 'time_sell_plan', type: 'text', nullable: true, category: 'trade',
+    key: 'time_sell_plan', type: 'text', nullable: true, category: 'trade', mode: 'both',
     label: 'Time-based Exit',
     default: null,  // null = disabled. Format: {"enabled":true,"tiers":[{"after_s":30,"sell_pct":50},{"after_s":60,"sell_pct":100}]}
     parseUserInput: (t) => {
@@ -253,7 +253,7 @@ const CATALOG = [
     },
   },
   {
-    key: 'sl_pct', type: 'number', nullable: true, category: 'trade',
+    key: 'sl_pct', type: 'number', nullable: true, category: 'trade', mode: 'both',
     label: 'Stop Loss % (negative)',
     hidden: true,  // v0.8.8 (experimental): SL is now part of TP/SL Plan.
     default: null,  // null = disabled. E.g. -30 = sell all at -30% from entry.
@@ -269,32 +269,32 @@ const CATALOG = [
 
   // ── Filters ────────────────────────────────────────────────────────────
   {
-    key: 'unrenounced_only', type: 'bool', category: 'filters',
+    key: 'unrenounced_only', type: 'bool', category: 'filters', mode: 'both',
     label: 'Unrenounced Only',
     default: false,
     parseUserInput: (t) => /^(1|true|yes|on|y)$/i.test(t.trim()),
   },
   {
-    key: 'unburned_only', type: 'bool', category: 'filters',
+    key: 'unburned_only', type: 'bool', category: 'filters', mode: 'both',
     label: 'Unburned Only',
     default: false,
     parseUserInput: (t) => /^(1|true|yes|on|y)$/i.test(t.trim()),
   },
   {
-    key: 'exclude_internal', type: 'bool', category: 'filters',
+    key: 'exclude_internal', type: 'bool', category: 'filters', mode: 'both',
     label: 'Skip pump.fun',
     default: false,
     parseUserInput: (t) => /^(1|true|yes|on|y)$/i.test(t.trim()),
   },
   {
-    key: 'exclude_external', type: 'bool', category: 'filters',
+    key: 'exclude_external', type: 'bool', category: 'filters', mode: 'both',
     label: 'Skip Raydium / others',
     default: false,
     parseUserInput: (t) => /^(1|true|yes|on|y)$/i.test(t.trim()),
   },
   {
     key: 'min_mc_usd', type: 'number', nullable: true,  // v0.8.0: '0'/'none' sets to null (disabled)
-    category: 'filters',
+    category: 'filters', mode: 'both',
     label: 'Min MC',
     default: null,  // null = unlimited. User can type any positive number.
     min: 0,        // no upper bound — user can set "0.001" or "1000000000" if they want
@@ -308,7 +308,7 @@ const CATALOG = [
   },
   {
     key: 'max_mc_usd', type: 'number', nullable: true,  // v0.8.0: '0'/'none' sets to null (disabled)
-    category: 'filters',
+    category: 'filters', mode: 'both',
     label: 'Max MC',
     default: null,
     min: 0,        // no upper bound
@@ -322,7 +322,7 @@ const CATALOG = [
   },
   {
     key: 'min_token_age_min', type: 'number', nullable: true,  // v0.8.0: '0'/'none' sets to null (disabled)
-    category: 'filters',
+    category: 'filters', mode: 'both',
     label: 'Min Token Age',  // v0.8.0: unit changed to seconds
     default: null,
     min: 0,        // no upper bound
@@ -336,7 +336,7 @@ const CATALOG = [
   },
   {
     key: 'max_token_age_min', type: 'number', nullable: true,  // v0.8.0: '0'/'none' sets to null (disabled)
-    category: 'filters',
+    category: 'filters', mode: 'both',
     label: 'Max Token Age',  // v0.8.0: unit changed to seconds
     default: null,
     min: 0,        // no upper bound
@@ -355,7 +355,7 @@ const CATALOG = [
     // Stored as a fraction in [0.1, 1.0] (e.g. 0.9 = 90%). Default 0.9
     // matches the typical "dev fully exits" intent. Set to 0.1 to copy every
     // sell, or 1.0 to require a 100% dump.
-    key: 'min_sell_ratio', type: 'number', category: 'filters',
+    key: 'min_sell_ratio', type: 'number', category: 'filters', mode: 'both',
     label: 'Min Sell %',
     default: 0.9,
     min: 0.1,
@@ -375,7 +375,7 @@ const CATALOG = [
   // ── Token ──────────────────────────────────────────────────────────────
   {
     key: 'sol_spending_limit', type: 'number', nullable: true,  // v0.8.0: '0'/'none' sets to null (disabled)
-    category: 'token',
+    category: 'token', mode: 'both',
     label: 'SOL Spending Limit',
     default: null,
     min: 0,        // no upper bound — user can set "0.5" or "10000" if they want
@@ -391,7 +391,7 @@ const CATALOG = [
 
   // ── Time ───────────────────────────────────────────────────────────────
   {
-    key: 'start_time', type: 'time', category: 'time',
+    key: 'start_time', type: 'time', category: 'time', mode: 'both',
     label: 'Start Time',
     default: '00:00',
     parseUserInput: (t) => {
@@ -404,7 +404,7 @@ const CATALOG = [
     },
   },
   {
-    key: 'end_time', type: 'time', category: 'time',
+    key: 'end_time', type: 'time', category: 'time', mode: 'both',
     label: 'End Time',
     default: '23:59',
     parseUserInput: (t) => {
@@ -419,14 +419,14 @@ const CATALOG = [
 
   // ── Advanced ───────────────────────────────────────────────────────────
   {
-    key: 'tag', type: 'text', category: 'advanced',
+    key: 'tag', type: 'text', category: 'advanced', mode: 'both',
     label: 'Tag (label for this watcher)',
     default: '',
     maxLen: 32,
     parseUserInput: (t) => t.trim().slice(0, 32),
   },
   {
-    key: 'hold_ms', type: 'number', category: 'advanced',
+    key: 'hold_ms', type: 'number', category: 'advanced', mode: 'both',
     label: 'Hold Time',
     unit: 'ms',         // M1.19: input in ms (engine uses ms). Display shows s/m via formatValue.
     env: 'HOLD_MS', default: 1000,
@@ -436,6 +436,158 @@ const CATALOG = [
       if (Number.isNaN(n) || n < 1) return null;
       return n;
     },
+  },
+  // ---------------------------------------------------------------------------
+  // v0.8.8 (experimental) M3.9: MIRROR-ONLY settings.
+  // Shown only in the Copy Trade menu (NOT Reverse Copy). These come from
+  // the TradeWiz reference bot screenshot (tg 01:02 user: "ada beberapa
+  // fitur yang berbeda disitu, jadi lebih baik fitur copy trade sm reverse
+  // copy trade menunya dipisah").
+  //
+  // Reference bot Copy Trade-only features:
+  //   - Buy Ratio (% of target's buy)            — global default for size
+  //   - Copy Sell (mirror target's exits)        — when target SELLS, also sell
+  //   - Trader Buy Limit (min-max range)         — only copy if target buys X-Y SOL
+  //   - No Duplicate Buys from Target            — anti-spam
+  //   - Buy Times Reset after Sold               — reset counter on close
+  //   - Sell Proportionally                      — sell % = target's sell %
+  //   - Sell All When Trader Transfer Tokens     — auto-exit on transfer
+  //   - Only copy Dev-Create                     — filter: only creator-created tokens
+  //   - Min Token Liquidity (USD)                — filter: min liquidity
+  //   - Anti-PVP Protection                      — filter: skip if same addr buys multiple times
+  //   - Buy Dip                                  — custom signal
+  //   - Turbo Mode                               — "simplified settings for faster setup"
+  // ---------------------------------------------------------------------------
+  {
+    // Default copy ratio (%). Used as fallback when a watched wallet doesn't
+    // have its own copy_ratio set on watched_wallets.copy_ratio. Effective
+    // ratio in mirror mode = wallet.copy_ratio ?? settings.copy_ratio.
+    key: 'copy_ratio', type: 'number', category: 'trade', mode: 'mirror',
+    label: 'Copy Ratio',
+    unit: '%', default: 100, min: 1, max: 100,
+    parseUserInput: (t) => {
+      const n = Number(String(t).replace(/[^\d.\-]/g, ''));
+      if (!Number.isFinite(n) || n < 1 || n > 100) return null;
+      return n;
+    },
+    formatValue: (v) => v == null ? '100%' : `${v}%`,
+  },
+  {
+    // v0.8.8 M3.9: when target wallet SELLS, also sell our position. Only
+    // effective in Copy Trade (mirror) mode. In Reverse Copy this is
+    // meaningless — reverse mode already fires on SELL_DETECTED as BUY.
+    key: 'copy_sell', type: 'bool', category: 'trade', mode: 'mirror',
+    label: 'Copy Sell',
+    default: true,
+  },
+  {
+    // v0.8.8 M3.9: only fire if target spent X-Y SOL on the buy. 0/0
+    // means "any amount" (no filter). min > max = invalid.
+    key: 'trader_buy_limit_min', type: 'number', category: 'filters',
+    mode: 'mirror', nullable: true,
+    label: 'Trader Buy Limit (min)',
+    unit: 'SOL', default: null,
+    min: 0,
+    parseUserInput: (t) => {
+      const s = String(t).trim();
+      if (s === '' || s === '0' || s.toLowerCase() === 'none') return null;
+      const n = parseFloat(s);
+      if (Number.isNaN(n) || n < 0) return null;
+      return n;
+    },
+  },
+  {
+    key: 'trader_buy_limit_max', type: 'number', category: 'filters',
+    mode: 'mirror', nullable: true,
+    label: 'Trader Buy Limit (max)',
+    unit: 'SOL', default: null,
+    min: 0,
+    parseUserInput: (t) => {
+      const s = String(t).trim();
+      if (s === '' || s === '0' || s.toLowerCase() === 'none') return null;
+      const n = parseFloat(s);
+      if (Number.isNaN(n) || n < 0) return null;
+      return n;
+    },
+  },
+  {
+    // v0.8.8 M3.9: anti-spam toggle — don't fire if we already bought
+    // this token from this wallet in the last N seconds.
+    key: 'no_duplicate_buys', type: 'bool', category: 'filters', mode: 'mirror',
+    label: 'No Duplicate Buys from Target',
+    default: true,
+  },
+  {
+    // v0.8.8 M3.9: after we close a position, reset the buy counter so
+    // we can buy this token again. Default off (we count forever).
+    key: 'buy_times_reset_after_sold', type: 'bool', category: 'filters', mode: 'mirror',
+    label: 'Buy Times Reset after Sold',
+    default: false,
+  },
+  {
+    // v0.8.8 M3.9: when target sells, sell the same % of our position
+    // (proportional mirror). Default off (sell 100%).
+    key: 'sell_proportionally', type: 'bool', category: 'trade', mode: 'mirror',
+    label: 'Sell Proportionally',
+    default: false,
+  },
+  {
+    // v0.8.8 M3.9: auto-exit if target wallet transfers (not sells)
+    // tokens out of their wallet. Distinguishes sell vs transfer by
+    // checking the destination: pool = sell, external = transfer.
+    key: 'sell_all_on_trader_transfer', type: 'bool', category: 'trade', mode: 'mirror',
+    label: 'Sell All on Trader Transfer',
+    default: false,
+  },
+  {
+    // v0.8.8 M3.9: only fire on tokens CREATED by the target wallet
+    // (creator = feePayer on the token's first tx). Filters out tokens
+    // the target just bought into.
+    key: 'only_copy_dev_create', type: 'bool', category: 'filters', mode: 'mirror',
+    label: 'Only Copy Dev-Create',
+    default: false,
+  },
+  {
+    // v0.8.8 M3.9: filter — minimum token liquidity in USD. null = off.
+    key: 'min_token_liquidity_usd', type: 'number', category: 'filters',
+    mode: 'mirror', nullable: true,
+    label: 'Min Token Liquidity',
+    unit: 'USD', default: null, min: 0,
+    parseUserInput: (t) => {
+      const s = String(t).trim();
+      if (s === '' || s === '0' || s.toLowerCase() === 'none') return null;
+      const n = parseFloat(s.replace(/[^\d.\-]/g, ''));
+      if (Number.isNaN(n) || n < 0) return null;
+      return n;
+    },
+    formatValue: (v) => v == null ? 'Off' : `$${v.toLocaleString('en-US')}`,
+  },
+  {
+    // v0.8.8 M3.9: anti-PVP — skip tokens where the same address
+    // bought multiple times in a short window (cluster signal).
+    key: 'anti_pvp', type: 'bool', category: 'filters', mode: 'mirror',
+    label: 'Anti-PVP Protection',
+    default: false,
+  },
+  {
+    // v0.8.8 M3.9: Buy Dip — a custom signal. When target wallet buys
+    // and the token has dipped -X% from ATH, also buy. Implementation
+    // deferred (requires ATH tracking). For now: a placeholder bool that
+    // does nothing — exists so the UI matches the reference bot.
+    key: 'buy_dip', type: 'bool', category: 'filters', mode: 'mirror',
+    label: 'Buy Dip',
+    default: false,
+    hidden: true,    // not implemented yet — hide from menu
+  },
+  {
+    // v0.8.8 M3.9: Turbo Mode — "simplified settings for faster setup"
+    // (TradeWiz's literal copy). Functionally: enables recommended
+    // defaults (auto_retry=1, no_duplicate_buys=true, etc) and hides
+    // advanced settings. Currently a stub.
+    key: 'turbo_mode', type: 'bool', category: 'advanced', mode: 'mirror',
+    label: 'Turbo Mode',
+    default: false,
+    hidden: true,    // not implemented yet — hide from menu
   },
 ];
 
@@ -478,8 +630,17 @@ export function getCatalogEntry(key) {
   return BY_KEY[key] || null;
 }
 
-export function byCategory(cat) {
-  return CATALOG.filter((s) => s.category === cat && !s.hidden);
+export function byCategory(cat, mode = null) {
+  // v0.8.8 (experimental) M3.9: optional `mode` filter — 'mirror' or
+  // 'reverse' or null/'both'. When set, only settings whose `mode` is
+  // 'both' or matches the requested mode are returned. Used by
+  // settingsMenu.renderFlat(ctx, mode) to show different settings in
+  // the Copy Trade menu vs Reverse Copy menu.
+  return CATALOG.filter((s) =>
+    s.category === cat &&
+    !s.hidden &&
+    (mode == null || s.mode === 'both' || s.mode === mode)
+  );
 }
 
 /**
