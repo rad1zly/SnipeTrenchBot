@@ -174,7 +174,13 @@ function bulkAddResultMessage(added, skipped) {
 // result inline. Tapping a button edits the message in place — Telegram
 // doesn't get a wall of new messages.
 
-function buildMainText(chatId) {
+// v0.8.8 (experimental): buildMainText is now async so it can fetch the
+// live SOL balance + top-3 SPL token balances from RPC. The whole
+// header is the BALANCE — user requested "balance harusnya di menu paling
+// awal lgsg ditampilin sih" (tg 20:00). Fetches are cached for
+// BALANCE_TTL_MS (30s) inside walletManager, so refreshing the menu
+// via the 🔄 button doesn't hammer the RPC.
+async function buildMainText(chatId) {
   const e = executorStatus(chatId);
   // v0.8.7.15: pass chatId so /status shows THIS USER's settings + pause state,
   // not a global aggregate. Per-user isolation.
@@ -184,11 +190,45 @@ function buildMainText(chatId) {
   // calling user; subscriber count stays global (system-level stat).
   const myWallets = chatId != null ? walletsDb.count(chatId) : 0;
   const myCopies  = chatId != null ? walletsDb.totalCopies(chatId) : 0;
+
+  // v0.8.8: live balance block. If wallet is set, fetch SOL + top-3 SPL
+  // tokens via fetchBalanceSnapshot (parallel, cached 30s). If not set,
+  // show a friendly "no wallet" hint with a tap-to-set call to action.
+  // v0.8.8 (tg 20:00 user feedback): "balance harusnya di menu paling
+  // awal lgsg ditampilin sih" — balance is now the first block in the
+  // main menu, before Mode and other stats.
+  let balBlock = '';
+  if (w.set) {
+    const snap = await fetchBalanceSnapshot(w.address, { limit: 3, minUi: 0 });
+    const solStr = snap.sol?.error
+      ? `<i>err: ${snap.sol.error}</i>`
+      : `${(snap.sol?.sol || 0).toFixed(4)} SOL`;
+    // fetchTokenBalances returns mint + uiAmount (no symbol/name unless
+    // /balance explicitly fetches metadata). For the main menu we just
+    // show a short mint prefix + uiAmount — /balance has the full
+    // version with metadata.
+    const tokLines = (snap.tokens?.tokens || []).map((t) => {
+      const ui = t.uiAmount != null ? t.uiAmount : 0;
+      const uiStr = ui >= 1
+        ? ui.toLocaleString('en-US', { maximumFractionDigits: 2 })
+        : ui.toFixed(4);
+      return `    <code>${t.mint.slice(0, 6)}…</code>: ${uiStr}`;
+    });
+    const tokStr = tokLines.length > 0 ? tokLines.join('\n') : '    <i>(no SPL tokens)</i>';
+    balBlock = [
+      `<b>💰 ${solStr}</b>  (${w.last4 ? `…${w.last4}` : shortAddr(w.address)})`,
+      tokStr,
+    ].join('\n');
+  } else {
+    balBlock = '💰 <i>no wallet</i>  — tap 🔑 Wallet below to set one.';
+  }
+
   const lines = [
     '<b>🤖 SnipeTrenchBot</b>',
     '',
+    balBlock,
+    '',
     `Mode:      ${config.DRY_RUN ? '<b>DRY_RUN</b>' : '<b>⚠️ LIVE</b>'}`,
-    `Wallet:    ${w.set ? `<code>${shortAddr(w.address)}</code> (...${w.last4})` : '<i>not set</i>'}`,
     `Wallets: ${myWallets}  |  Copies: ${myCopies}  |  Positions: ${s.openPositionCount}  |  Subs: ${subscribersDb.count()}`,
   ];
   if (isPaused(chatId)) lines.push('', '⏸ <b>PAUSED</b>');
@@ -695,10 +735,13 @@ function startSingleBot(token, { onPause: pauseCb, onResume: resumeCb } = {}) {
   }
 
   // ---- /start ----
-  inst.start((ctx) => {
+  // v0.8.8: buildMainText is now async (fetches live SOL + SPL balance),
+  // so the command handler is async too.
+  inst.start(async (ctx) => {
     // subscribeMiddleware already added sender to subscribers table.
     // Show the main menu inline.
-    ctx.replyWithHTML(buildMainText(ctx.chat.id), mainMenu(ctx.chat.id));
+    const text = await buildMainText(ctx.chat.id);
+    await ctx.replyWithHTML(text, mainMenu(ctx.chat.id));
   });
 
   // ---- /ping (debug: verify notifier can reach this chat) ----
@@ -707,8 +750,9 @@ function startSingleBot(token, { onPause: pauseCb, onResume: resumeCb } = {}) {
   });
 
   // ---- /menu (shortcut: re-show the main menu) ----
-  inst.command('menu', (ctx) => {
-    ctx.replyWithHTML(buildMainText(ctx.chat.id), mainMenu(ctx.chat.id));
+  inst.command('menu', async (ctx) => {
+    const text = await buildMainText(ctx.chat.id);
+    await ctx.replyWithHTML(text, mainMenu(ctx.chat.id));
   });
 
   // ---- callback_query handler (inline button taps) ----
@@ -719,7 +763,11 @@ function startSingleBot(token, { onPause: pauseCb, onResume: resumeCb } = {}) {
     const data = ctx.callbackQuery.data || '';
     try {
       if (data === 'menu:main') {
-        await renderScreen(ctx, buildMainText(ctx.chat.id), mainMenu(ctx.chat.id));
+        // v0.8.8: buildMainText is async (live balance fetch). await it
+        // before passing to renderScreen so the Promise isn't stringified
+        // into [object Promise] in the menu body.
+        const text = await buildMainText(ctx.chat.id);
+        await renderScreen(ctx, text, mainMenu(ctx.chat.id));
       } else if (data === 'cmd:copytrade' || data === 'menu:settings') {
         // Flat single-screen Copy Trade settings menu (v0.5.2+).
         // `menu:settings` is kept as an alias for backwards-compat with
@@ -888,7 +936,8 @@ function startSingleBot(token, { onPause: pauseCb, onResume: resumeCb } = {}) {
           pause(ctx.chat.id);
           onPause?.();
         }
-        await renderScreen(ctx, buildMainText(ctx.chat.id), mainMenu(ctx.chat.id));
+        const text = await buildMainText(ctx.chat.id);
+        await renderScreen(ctx, text, mainMenu(ctx.chat.id));
       } else if (data === 'cmd:set_wallet') {
         // Enter pending-import mode. Next text message in this DM is consumed
         // as the private key (see handlePendingWalletText).
@@ -911,7 +960,8 @@ function startSingleBot(token, { onPause: pauseCb, onResume: resumeCb } = {}) {
         await wm.doRemoveWallet(ctx);
       } else {
         // Unknown callback — likely stale from an old message. Just refresh.
-        await renderScreen(ctx, buildMainText(ctx.chat.id), mainMenu(ctx.chat.id));
+        const text = await buildMainText(ctx.chat.id);
+        await renderScreen(ctx, text, mainMenu(ctx.chat.id));
       }
       await ctx.answerCbQuery();
     } catch (err) {
