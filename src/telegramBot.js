@@ -43,6 +43,7 @@ const BOT_COMMANDS = [
   { command: 'stats',       description: 'Win rate, PnL, best/worst trades' },
   { command: 'balance',     description: 'Wallet SOL + SPL token balances' },
   { command: 'positions',   description: 'List open positions' },
+  { command: 'closepos',    description: 'Force-close an open position — /closepos <id> or /closepos all' },
   { command: 'recent',      description: 'Last N closed trades — /recent [n]' },
   { command: 'safety',      description: 'Show safety config' },
   { command: 'pause',       description: 'Pause trading' },
@@ -69,6 +70,13 @@ let onResume = null;
 function shortAddr(a) {
   if (!a) return '?';
   return `${a.slice(0, 4)}…${a.slice(-4)}`;
+}
+
+// v0.8.8 (experimental) M2.12: helper to safely parse a signals.data_json
+// string. Returns null on invalid input so the caller can use `|| {}`.
+function safeJson(s) {
+  if (!s) return null;
+  try { return JSON.parse(s); } catch { return null; }
 }
 
 function isValidSolanaAddress(addr) {
@@ -379,13 +387,80 @@ function buildWalletsText(chatId) {
 function buildPositionsText(chatId) {
   // v0.8.7.15: per-user. Each subscriber sees their own open positions,
   // not a global aggregate.
+  // v0.8.8 (experimental) M2.10: live value, peak gain %, fired tiers,
+  // sold_pct progress bar, and a tap-to-close hint when a position is
+  // held with no plan (manual close required).
   const open = positionsDb.openAll(chatId);
   if (open.length === 0) return '💼 <b>Open positions</b>\n\nNone right now.';
-  const lines = open.map(
-    (p) =>
-      `• <code>${p.mint}</code>\n  dev: ${shortAddr(p.dev_wallet)} | spent ${p.entry_sol} SOL | opened ${new Date(p.entry_time).toISOString().slice(11, 19)}Z`
-  );
-  return `<b>💼 Open positions (${open.length}):</b>\n\n${lines.join('\n')}`;
+  const lines = open.map((p) => {
+    const entry = p.entry_sol || 0;
+    const current = p.current_sol_value ?? entry;
+    const peak = p.peak_sol_value ?? entry;
+    const gainPct = entry > 0 ? ((current - entry) / entry) * 100 : 0;
+    const peakPct = entry > 0 ? ((peak - entry) / entry) * 100 : 0;
+    const soldPct = p.sold_pct ?? 0;
+    const fired = parseFiredTiers(p.tp_sl_fired);
+    const hasPlan = p.auto_sell_plan_snapshot && p.auto_sell_plan_snapshot !== 'null';
+    const planNote = hasPlan
+      ? `Plan: <i>${summarisePlan(p.auto_sell_plan_snapshot)}</i>`
+      : '<i>No plan — manual close</i>';
+
+    // Mini bar: 10 chars of filled/empty
+    const totalBars = 10;
+    const filled = Math.min(totalBars, Math.round((soldPct / 100) * totalBars));
+    const bar = '▓'.repeat(filled) + '░'.repeat(totalBars - filled);
+
+    return [
+      `<b>• <code>${p.mint.slice(0, 8)}…${p.mint.slice(-4)}</code></b>`,
+      `  dev: ${shortAddr(p.dev_wallet)}`,
+      `  opened: ${new Date(p.entry_time).toISOString().slice(11, 19)}Z`,
+      `  spent: <code>${entry} SOL</code> → now: <code>${current} SOL</code>`,
+      `  P&L: <b>${gainPct >= 0 ? '+' : ''}${gainPct.toFixed(1)}%</b>  |  peak: <b>+${peakPct.toFixed(1)}%</b>`,
+      `  sold: [${bar}] ${soldPct.toFixed(0)}%`,
+      `  fired: ${fired.length > 0 ? fired.map((t) => `<code>${t}</code>`).join(' ') : '<i>none</i>'}`,
+      `  ${planNote}`,
+    ].join('\n');
+  });
+  return [
+    `<b>💼 Open positions (${open.length}):</b>`,
+    '',
+    lines.join('\n\n'),
+    '',
+    hasAnyPlanOpen(open)
+      ? '<i>Exit engine polling 1s — TP/SL/Trailing/Time tiers will fire automatically.</i>'
+      : '<i>Positions with no plan require /closepos to sell manually.</i>',
+  ].join('\n');
+}
+
+function parseFiredTiers(raw) {
+  if (!raw) return [];
+  try {
+    const v = JSON.parse(raw);
+    return Array.isArray(v) ? v : [];
+  } catch {
+    return [];
+  }
+}
+
+function summarisePlan(raw) {
+  if (!raw) return 'none';
+  let plan;
+  try { plan = JSON.parse(raw); } catch { return 'none'; }
+  if (!plan || typeof plan !== 'object') return 'none';
+  const parts = [];
+  if (typeof plan.tp1 === 'number') parts.push(`TP1 +${plan.tp1}%`);
+  if (typeof plan.tp2 === 'number') parts.push(`TP2 +${plan.tp2}%`);
+  if (typeof plan.tp3 === 'number') parts.push(`TP3 +${plan.tp3}%`);
+  if (typeof plan.sl === 'number') parts.push(`SL ${plan.sl}%`);
+  if (typeof plan.trail === 'number') parts.push(`Trail ${plan.trail}%`);
+  if (typeof plan.t1 === 'number') parts.push(`T1 ${plan.t1}s`);
+  if (typeof plan.t2 === 'number') parts.push(`T2 ${plan.t2}s`);
+  if (typeof plan.t3 === 'number') parts.push(`T3 ${plan.t3}s`);
+  return parts.length > 0 ? parts.join(' · ') : 'none';
+}
+
+function hasAnyPlanOpen(positions) {
+  return positions.some((p) => p.auto_sell_plan_snapshot && p.auto_sell_plan_snapshot !== 'null');
 }
 
 function buildSafetyText(chatId) {
@@ -890,29 +965,103 @@ function startSingleBot(token, { onPause: pauseCb, onResume: resumeCb } = {}) {
   // ---- /positions ----
   inst.command('positions', (ctx) => {
     // v0.8.7.15: per-user. Each subscriber sees their own open positions.
-    const open = positionsDb.openAll(ctx.chat.id);
-    if (open.length === 0) return ctx.reply('No open positions.');
-    const lines = open.map(
-      (p) =>
-        `• <code>${p.mint}</code>\n  dev: ${shortAddr(p.dev_wallet)} | spent ${p.entry_sol} SOL | opened ${new Date(p.entry_time).toISOString().slice(11, 19)}Z`
-    );
-    ctx.reply(`<b>Open positions (${open.length}):</b>\n\n${lines.join('\n')}`, { parse_mode: 'HTML' });
+    // v0.8.8 (experimental) M2.10: use the rich buildPositionsText that
+    // shows live value, peak gain %, fired tiers, sold_pct bar.
+    return ctx.reply(buildPositionsText(ctx.chat.id), { parse_mode: 'HTML' });
+  });
+
+  // ---- /closepos ----
+  // v0.8.8 (experimental) M2.11: manually force-close an open position.
+  // Useful when a position has no plan (so the exit engine isn't polling)
+  // or when the user wants to bail at a custom moment. Usage:
+  //   /closepos <id>      — close a specific position by DB id
+  //   /closepos all       — close every open position for this user
+  inst.command('closepos', async (ctx) => {
+    const parts = ctx.message.text.trim().split(/\s+/);
+    const arg = parts[1] || '';
+    const userOpen = positionsDb.openAll(ctx.chat.id);
+    if (userOpen.length === 0) {
+      return ctx.reply('ℹ️ No open positions to close.');
+    }
+    let targets;
+    if (arg === 'all') {
+      targets = userOpen;
+    } else {
+      const id = parseInt(arg, 10);
+      if (Number.isNaN(id)) {
+        return ctx.reply('Usage: <code>/closepos &lt;id&gt;</code> or <code>/closepos all</code>', { parse_mode: 'HTML' });
+      }
+      const pos = userOpen.find((p) => p.id === id);
+      if (!pos) {
+        return ctx.reply(`❌ Position #${id} not found in your open list. Use /positions to see your ids.`);
+      }
+      targets = [pos];
+    }
+    await ctx.reply(`⏳ Force-closing ${targets.length} position(s)…`);
+    const { executeSell } = await import('./executor.js');
+    const { stopExitLoop } = await import('./exitEngine.js');
+    const results = [];
+    for (const p of targets) {
+      try {
+        // Stop the exit loop first (if any) so it doesn't double-fire.
+        stopExitLoop(p.id);
+        const sellResult = await executeSell({
+          positionId: p.id,
+          mint: p.mint,
+          chatId: ctx.chat.id,
+          tokenRawAmount: p.entry_tokens ?? 0,
+          tierName: 'manual',
+        });
+        positionsDb.close(p.id, {
+          exitSig: sellResult.signature,
+          exitSol: sellResult.solReceived,
+          pnlSol: sellResult.solReceived - p.entry_sol,
+        });
+        results.push(`✅ #${p.id} <code>${p.mint.slice(0, 8)}…</code> closed: ${sellResult.solReceived.toFixed(6)} SOL`);
+      } catch (e) {
+        positionsDb.fail(p.id, `manual close: ${e.message}`);
+        results.push(`❌ #${p.id} <code>${p.mint.slice(0, 8)}…</code> failed: ${e.message.slice(0, 100)}`);
+      }
+    }
+    await ctx.reply(results.join('\n'), { parse_mode: 'HTML' });
   });
 
   // ---- /recent ----
-  inst.command('recent', (ctx) => {
+  // v0.8.8 (experimental) M2.12: also show TIER_FIRED / POSITION_CLOSED
+  // entries from the signals table (the audit trail). This gives users
+  // a chronological view of every event on their positions: open, tier
+  // fires, closes.
+  inst.command('recent', async (ctx) => {
     const parts = ctx.message.text.trim().split(/\s+/);
     const n = Math.max(1, Math.min(50, parseInt(parts[1], 10) || 10));
-    // v0.8.7.15: per-user. Each subscriber sees their own trade history,
-    // not a global aggregate.
-    const list = positionsDb.recent(n, ctx.chat.id);
-    if (list.length === 0) return ctx.reply('No closed positions yet.');
-    const lines = list.map((p) => {
+    // v0.8.7.15: per-user. Each subscriber sees their own trade history.
+    const closedList = positionsDb.recent(n, ctx.chat.id);
+    // Look up TIER_FIRED + POSITION_CLOSED for any of this user's positions.
+    const { signalsDb } = await import('./db.js');
+    const openList = positionsDb.openAll(ctx.chat.id);
+    const myMints = new Set([
+      ...closedList.map((p) => p.mint),
+      ...openList.map((p) => p.mint),
+    ]);
+    const tierFires = myMints.size > 0
+      ? signalsDb.recent(n * 4, null).filter((s) => myMints.has(s.mint) && (s.type === 'TIER_FIRED' || s.type === 'POSITION_CLOSED'))
+      : [];
+    const tierLines = tierFires.slice(0, n).map((s) => {
+      const data = safeJson(s.data_json) || {};
+      const icon = s.type === 'POSITION_CLOSED' ? '✅' : '🎯';
+      return `${icon} <code>${s.mint.slice(0, 8)}…</code> <b>${s.type}</b>${data.tier ? ` (${data.tier})` : ''}\n  ${new Date(s.timestamp).toISOString().slice(11, 19)}Z`;
+    });
+    const posLines = closedList.map((p) => {
       const pnlStr = p.pnl_sol != null ? `${p.pnl_sol >= 0 ? '+' : ''}${p.pnl_sol.toFixed(4)} SOL` : '—';
       const status = p.status === 'CLOSED' ? '✅' : p.status === 'FAILED' ? '❌' : '⏳';
-      return `${status} <code>${p.mint}</code>\n  ${pnlStr}  (${new Date(p.entry_time).toISOString().slice(11, 19)}Z)`;
+      return `${status} <code>${p.mint.slice(0, 8)}…</code>\n  ${pnlStr}  (${new Date(p.entry_time).toISOString().slice(11, 19)}Z)`;
     });
-    ctx.reply(`<b>Recent (${list.length}):</b>\n\n${lines.join('\n')}`, { parse_mode: 'HTML' });
+    const totalLines = tierLines.length + posLines.length;
+    if (totalLines === 0) return ctx.reply('No closed positions yet.');
+    const sections = [];
+    if (tierLines.length > 0) sections.push(`<b>🎯 Tier fires (${tierLines.length}):</b>\n\n${tierLines.join('\n')}`);
+    if (posLines.length > 0) sections.push(`<b>📦 Position closes (${posLines.length}):</b>\n\n${posLines.join('\n')}`);
+    ctx.reply(sections.join('\n\n'), { parse_mode: 'HTML' });
   });
 
   // ---- /safety ----

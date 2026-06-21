@@ -29,6 +29,13 @@ import * as notifier from './notifier.js';
 import { PublicKey } from '@solana/web3.js';
 import bs58 from 'bs58';
 
+// v0.8.8 (experimental) M2.12: tier-fire audit log. Writes a row to the
+// signals table so /recent can show TP1 FIRED / SL FIRED / etc. The
+// signals table is normally populated by the monitor for TOKEN_CREATED /
+// SELL_DETECTED / BUY / SELL — adding the TIER_FIRED type is just another
+// log entry. (We use the signalsDb object from db.js for consistency.)
+import { signalsDb } from './db.js';
+
 // Map of positionId \u2192 { stop: bool, soldThisLoop: 0 }. We use a simple
 // object instead of AbortController so that the logic is easy to read
 // and debug in a Node REPL.
@@ -338,6 +345,17 @@ async function fireTier(positionId, tier, plan, pos) {
     return null;
   }
 
+  // v0.8.8 (experimental) M2.12: audit log to signals table so /recent
+  // can show "TP1 FIRED", "SL FIRED", etc. alongside the regular BUY/SELL
+  // events. Uses the dev_wallet (the watched wallet) as the `wallet`
+  // field so users can filter by watched wallet in their own history.
+  signalsDb.log({
+    type: 'TIER_FIRED',
+    wallet: pos.dev_wallet,
+    mint: pos.mint,
+    data: { positionId, tier, sellPct, cumulativeSoldPct, currentSolValue: pos.current_sol_value, peakSolValue: pos.peak_sol_value },
+  }).catch((e) => console.error('[exitEngine] audit log failed:', e.message));
+
   // Mark tier fired + update sold_pct.
   markTierFired(positionId, tier);
   setSoldPct(positionId, cumulativeSoldPct);
@@ -349,6 +367,13 @@ async function fireTier(positionId, tier, plan, pos) {
       sig: sellResult?.signature ?? null,
       solReceived: sellResult?.solReceived ?? 0,
     });
+    // v0.8.8 (experimental) M2.12: close-event audit log.
+    signalsDb.log({
+      type: 'POSITION_CLOSED',
+      wallet: pos.dev_wallet,
+      mint: pos.mint,
+      data: { positionId, tier, solReceived: sellResult?.solReceived ?? 0, pnlSol: (sellResult?.solReceived ?? 0) - pos.entry_sol },
+    }).catch(() => {});
     await notifier.send(pos.chat_id,
       `\u2705 <b>POSITION CLOSED</b>\nMint: <code>${pos.mint.slice(0, 8)}\u2026</code>\nPnL: <b>${((sellResult?.solReceived ?? 0) - pos.entry_sol).toFixed(6)} SOL</b>`,
       { parse_mode: 'HTML' }
