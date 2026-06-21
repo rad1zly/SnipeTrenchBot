@@ -172,7 +172,7 @@ const CATALOG = [
   // the feature. See parseUserInput for schema validation.
   {
     key: 'tp_sl_plan', type: 'text', nullable: true, category: 'trade',
-    label: 'TP/SL Plan (JSON)',
+    label: 'TP / SL Plan',
     default: null,  // null = disabled. Format: {"enabled":true,"tiers":[{"tp_pct":50,"sell_pct":50},...],"sl_pct":-30,"sl_sell_pct":100}
     parseUserInput: (t) => {
       const s = t.trim();
@@ -195,7 +195,7 @@ const CATALOG = [
   },
   {
     key: 'trailing_stop', type: 'text', nullable: true, category: 'trade',
-    label: 'Trailing Stop (JSON)',
+    label: 'Trailing Stop',
     default: null,  // null = disabled. Format: {"enabled":true,"act_pct":20,"trail_pct":10,"sell_pct":100}
     parseUserInput: (t) => {
       const s = t.trim();
@@ -212,7 +212,7 @@ const CATALOG = [
   },
   {
     key: 'dev_sell_trigger', type: 'text', nullable: true, category: 'trade',
-    label: 'Dev Sell Trigger (JSON)',
+    label: 'Dev Sell Trigger',
     default: null,  // null = disabled. Format: {"enabled":true,"mode":"any_amount"|"whole_amount","sell_pct":100}
     parseUserInput: (t) => {
       const s = t.trim();
@@ -228,7 +228,7 @@ const CATALOG = [
   },
   {
     key: 'time_sell_plan', type: 'text', nullable: true, category: 'trade',
-    label: 'Time Sell Plan (JSON)',
+    label: 'Time-based Exit',
     default: null,  // null = disabled. Format: {"enabled":true,"tiers":[{"after_s":30,"sell_pct":50},{"after_s":60,"sell_pct":100}]}
     parseUserInput: (t) => {
       const s = t.trim();

@@ -19,7 +19,7 @@ import {
   formatValue, formatSource,
 } from './settings.js';
 import {
-  AUTO_SELL_LAYOUT, isAutoSellSetting, parseStored, summarise,
+  AUTO_SELL_LAYOUT, isAutoSellSetting, parseStored, serialise, summarise,
   applyTierChange, isAutoSellSlot,
 } from './autoSellPlan.js';
 
@@ -291,11 +291,12 @@ export async function handleSetCallback(ctx, action, key) {
   }
 
   if (action === 'edit') {
-    // v0.8.8 (experimental) M1.12: auto-sell settings get a tier-by-tier
-    // submenu instead of a raw JSON prompt. The user taps +TP1 / +TP2 /
-    // +SL / +Trailing and gets a one-line "send a number" reply.
-    if (setting.category === 'auto-sell' || isAutoSellSetting(key)) {
-      await renderAutoSellSubmenu(ctx, key, chatId);
+    // v0.8.8 (experimental) M1.14: ONE-CLICK direct prompt for auto-sell.
+    // User feedback: 'harus nya SL TP tu ku klik langsung minta SL sm TP nya
+    // berapa' — tap row TP/SL Plan should go STRAIGHT to a prompt that asks
+    // for TP 1 / TP 2 / TP 3 / SL all at once, NOT through a submenu.
+    if (isAutoSellSetting(key)) {
+      await renderAutoSellQuickPrompt(ctx, key, chatId);
       await ctx.answerCbQuery();
       return true;
     }
@@ -370,6 +371,24 @@ export async function handlePendingText(ctx) {
   }
 
   // v0.8.8 (experimental) M1.12: auto-sell tier-by-tier flow.
+  if (pending.key.startsWith('__autosell_quick:')) {
+    // v0.8.8 (experimental) M1.14: one-click quick prompt for auto-sell.
+    const key = pending.key.slice('__autosell_quick:'.length);
+    const stored = parseStored(get(key, chatId));
+    const r = applyAutoSellQuick(key, text, stored);
+    if (!r.ok) {
+      await ctx.reply(`❌ ${r.msg}\n\nReply again, atau /cancel.`, { parse_mode: 'HTML' });
+      return true;
+    }
+    set(key, r.json, chatId);
+    clearPending(chatId);
+    const summary = summarise(key, parseStored(r.json));
+    await ctx.reply(`✅ ${r.msg}\n\nCurrent: <b>${summary}</b>`, { parse_mode: 'HTML' });
+    // Re-render the main /settings in place so user sees updated summary.
+    await rerenderSettingsMenu(ctx, chatId, pending.menuMessageId);
+    return true;
+  }
+
   if (pending.key.startsWith('__autosell:')) {
     const r = handleAutoSellPending(pending.key, text, chatId);
     if (!r) {
@@ -448,6 +467,257 @@ export {
 // buttons for empty slots. Tapping a row pushes it into pending-edit mode
 // awaiting a single number. Tapping [×] removes it. Tapping [Disable] wipes
 // the whole setting.
+
+// -----------------------------------------------------------------------------
+// v0.8.8 (experimental) M1.14: One-click direct prompt (skip submenu)
+// -----------------------------------------------------------------------------
+// User feedback: 'harus nya SL TP tu ku klik langsung minta SL sm TP nya
+// berapa' — they want tap-row → straight to a "send me your values" prompt,
+// not tap-row → submenu → tap-+-TP1 → input.
+//
+// We accept two input formats in the reply:
+//   A) CSV 1-line:   "50, 100, 200, -30"
+//      Order matches the field list (TP1, TP2, TP3, SL).
+//   B) Key=Value:    "tp1=50\ntp2=100\nsl=-30"
+//      Missing keys mean "leave unchanged". Empty fields mean "clear tier".
+//
+// For trailing_stop / dev_sell_trigger / time_sell_plan: similar but each
+// setting has its own field set.
+
+async function renderAutoSellQuickPrompt(ctx, key, chatId) {
+  const layout = AUTO_SELL_LAYOUT[key];
+  if (!layout) {
+    await ctx.reply('Unknown auto-sell setting.');
+    return;
+  }
+  const stored = parseStored(get(key, chatId));
+  const summary = summarise(key, stored);
+
+  // Field list per setting (for instructions + parser)
+  const fields = fieldsForSetting(key);
+
+  // Build prompt text: simple, no JSON, no "Pick a preset"
+  const lines = [
+    `<b>${layout.label}</b>`,
+    '',
+    `Current: <b>${summary}</b>`,
+    '',
+    'Kirim nilai dalam format salah satu:',
+    '',
+    '<b>Cara 1 — satu baris (CSV):</b>',
+    `<code>${fields.exampleCsv}</code>`,
+    '(urutan: ' + fields.csvOrderLabel + ')',
+    '',
+    '<b>Cara 2 — per baris (key=value):</b>',
+    ...fields.exampleKvLines.map((l) => `<code>${l}</code>`),
+    '(skip key = tidak diubah; tulis key kosong = hapus tier; /cancel = batal)',
+    '',
+    fields.note,
+  ].filter(Boolean);
+  const prompt = lines.join('\n');
+
+  // Set pending so handlePendingText routes to applyAutoSellQuick
+  setPending(ctx.chat.id, `__autosell_quick:${key}`, ctx.callbackQuery?.message?.message_id ?? null);
+
+  await ctx.reply(prompt, {
+    parse_mode: 'HTML',
+    reply_markup: { force_reply: true, selective: true },
+  });
+}
+
+/** Field descriptors per setting (for prompt + parser). */
+function fieldsForSetting(key) {
+  if (key === 'tp_sl_plan') {
+    return {
+      csvOrder: ['tp1', 'tp2', 'tp3', 'sl'],
+      csvOrderLabel: 'TP1, TP2, TP3, SL (SL negatif)',
+      exampleCsv: '50, 100, 200, -30',
+      exampleKvLines: [
+        'tp1=50',
+        'tp2=100',
+        'tp3=200',
+        'sl=-30',
+      ],
+      note: '<i>Tier yang dikosongkan / di-skip akan dihapus. Sell % default 50 (TP) / 100 (SL).</i>',
+    };
+  }
+  if (key === 'trailing_stop') {
+    return {
+      csvOrder: ['act', 'trail'],
+      csvOrderLabel: 'Activate (+%), Trail (-%)',
+      exampleCsv: '50, -20',
+      exampleKvLines: [
+        'act=50',
+        'trail=-20',
+      ],
+      note: '<i>Sell % default 100 (artinya jual semua saat trigger).</i>',
+    };
+  }
+  if (key === 'dev_sell_trigger') {
+    return {
+      csvOrder: ['mode', 'sell'],
+      csvOrderLabel: 'mode (any/whole), sell %',
+      exampleCsv: 'any, 100',
+      exampleKvLines: [
+        'mode=any',
+        'sell=100',
+      ],
+      note: '<i>mode: "any" (exit on any dev sell) atau "whole" (exit on full dump only).</i>',
+    };
+  }
+  if (key === 'time_sell_plan') {
+    return {
+      csvOrder: ['t1', 't2', 't3'],
+      csvOrderLabel: 'after T1s, T2s, T3s',
+      exampleCsv: '30, 60, 120',
+      exampleKvLines: [
+        't1=30',
+        't2=60',
+        't3=120',
+      ],
+      note: '<i>Sell % default 100 per tier.</i>',
+    };
+  }
+  return { csvOrder: [], csvOrderLabel: '', exampleCsv: '', exampleKvLines: [], note: '' };
+}
+
+/** Parse user input for the quick prompt. Returns new stored object or {error}. */
+export function applyAutoSellQuick(key, inputText, stored) {
+  const fields = fieldsForSetting(key);
+  const trimmed = (inputText || '').trim();
+  if (!trimmed) return { ok: false, msg: 'Empty input.' };
+
+  // Try CSV mode first: detect by absence of '=' and presence of ',' or all-numeric tokens
+  let parsed = {};
+  const looksLikeKv = trimmed.includes('=');
+  if (!looksLikeKv) {
+    // CSV: split by comma or whitespace
+    const tokens = trimmed.split(/[,\s]+/).filter(Boolean);
+    if (tokens.length > fields.csvOrder.length) {
+      return { ok: false, msg: `Terlalu banyak nilai. Maksimal ${fields.csvOrder.length}: ${fields.csvOrderLabel}` };
+    }
+    tokens.forEach((tok, i) => {
+      parsed[fields.csvOrder[i]] = tok;
+    });
+  } else {
+    // KV: split by newline or semicolon
+    const lines = trimmed.split(/[\n;]+/);
+    for (const line of lines) {
+      const m = line.match(/^\s*([a-z0-9_]+)\s*=\s*(.*?)\s*$/i);
+      if (!m) return { ok: false, msg: `Format salah di baris: "${line}". Gunakan key=value.` };
+      const k = m[1].toLowerCase();
+      const v = m[2];
+      // Validate key
+      if (!fields.csvOrder.includes(k)) {
+        return { ok: false, msg: `Key tidak dikenal: "${k}". Key valid: ${fields.csvOrder.join(', ')}` };
+      }
+      parsed[k] = v;
+    }
+  }
+
+  // Apply parsed values to stored
+  const obj = { ...stored };
+  const errors = [];
+  const changes = [];
+
+  if (key === 'tp_sl_plan') {
+    obj.tiers = Array.isArray(obj.tiers) ? [...obj.tiers] : [];
+    for (let i = 1; i <= 3; i++) {
+      const k = `tp${i}`;
+      if (!(k in parsed)) continue;
+      const v = parsed[k].trim();
+      if (v === '' || v === '0') {
+        if (obj.tiers[i - 1]) {
+          obj.tiers.splice(i - 1, 1);
+          changes.push(`TP${i} removed`);
+        }
+        continue;
+      }
+      const n = Number(v);
+      if (!Number.isFinite(n) || n < 1 || n > 100000) {
+        errors.push(`TP${i} harus angka positif (contoh: 50). Got: "${v}"`);
+        continue;
+      }
+      obj.tiers[i - 1] = { tp_pct: n, sell_pct: obj.tiers[i - 1]?.sell_pct ?? 50 };
+      changes.push(`TP${i} = +${n}%`);
+    }
+    if ('sl' in parsed) {
+      const v = String(parsed.sl).trim();
+      if (v === '' || v === '0') {
+        delete obj.sl_pct;
+        delete obj.sl_sell_pct;
+        changes.push('SL removed');
+      } else {
+        const n = Number(v);
+        if (!Number.isFinite(n) || n < -100 || n > 0) {
+          errors.push(`SL harus angka negatif -100..0 (contoh: -30). Got: "${v}"`);
+        } else {
+          obj.sl_pct = n;
+          obj.sl_sell_pct = obj.sl_sell_pct ?? 100;
+          changes.push(`SL = ${n}%`);
+        }
+      }
+    }
+  } else if (key === 'trailing_stop') {
+    if ('act' in parsed) {
+      const v = String(parsed.act).trim();
+      if (v === '' || v === '0') { delete obj.act_pct; changes.push('Activate removed'); }
+      else {
+        const n = Number(v);
+        if (!Number.isFinite(n) || n < 1) errors.push(`Activate harus positif. Got: "${v}"`);
+        else { obj.act_pct = n; changes.push(`Activate = +${n}%`); }
+      }
+    }
+    if ('trail' in parsed) {
+      const v = String(parsed.trail).trim();
+      if (v === '' || v === '0') { delete obj.trail_pct; changes.push('Trail removed'); }
+      else {
+        const n = Number(v);
+        if (!Number.isFinite(n) || n > 0 || n < -100) errors.push(`Trail harus negatif -100..0. Got: "${v}"`);
+        else { obj.trail_pct = n; changes.push(`Trail = ${n}%`); }
+      }
+    }
+  } else if (key === 'dev_sell_trigger') {
+    if ('mode' in parsed) {
+      const v = String(parsed.mode).trim().toLowerCase();
+      if (v === '' || v === '0') { delete obj.mode; changes.push('Mode removed'); }
+      else if (v === 'any' || v === 'any_amount') { obj.mode = 'any_amount'; changes.push('Mode = any'); }
+      else if (v === 'whole' || v === 'whole_amount') { obj.mode = 'whole_amount'; changes.push('Mode = whole'); }
+      else errors.push(`Mode harus "any" atau "whole". Got: "${v}"`);
+    }
+    if ('sell' in parsed) {
+      const v = String(parsed.sell).trim();
+      if (v === '' || v === '0') { delete obj.sell_pct; changes.push('Sell % removed'); }
+      else {
+        const n = Number(v);
+        if (!Number.isFinite(n) || n < 1 || n > 100) errors.push(`Sell % harus 1-100. Got: "${v}"`);
+        else { obj.sell_pct = n; changes.push(`Sell = ${n}%`); }
+      }
+    }
+  } else if (key === 'time_sell_plan') {
+    obj.tiers = Array.isArray(obj.tiers) ? [...obj.tiers] : [];
+    for (let i = 1; i <= 3; i++) {
+      const k = `t${i}`;
+      if (!(k in parsed)) continue;
+      const v = parsed[k].trim();
+      if (v === '' || v === '0') {
+        if (obj.tiers[i - 1]) { obj.tiers.splice(i - 1, 1); changes.push(`T${i} removed`); }
+        continue;
+      }
+      const n = Number(v);
+      if (!Number.isFinite(n) || n < 1 || n > 86400) {
+        errors.push(`${k} harus detik 1..86400. Got: "${v}"`);
+        continue;
+      }
+      obj.tiers[i - 1] = { after_s: n, sell_pct: obj.tiers[i - 1]?.sell_pct ?? 100 };
+      changes.push(`${k} = ${n}s`);
+    }
+  }
+
+  if (errors.length) return { ok: false, msg: errors.join('\n') };
+  const json = serialise(obj);
+  return { ok: true, obj, json, msg: changes.length ? changes.join(', ') : 'No changes.' };
+}
 
 /** Render the submenu for an auto-sell setting (tp_sl_plan, trailing_stop, etc.). */
 async function renderAutoSellSubmenu(ctx, key, chatId) {
