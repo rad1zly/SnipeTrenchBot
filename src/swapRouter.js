@@ -1,15 +1,18 @@
 // src/swapRouter.js
 // =============================================================================
 // Smart router: detect if a token is on pump.fun bonding curve and use the
-// direct pump.fun path. Otherwise fall back to Jupiter. This gives us
-// 200-400ms speedup for pre-graduation tokens (which is most of what
-// copy-trade snipers encounter).
+// direct pump.fun path. Jupiter fallback is DISABLED (M6.2 step 1) per user
+// request — bot is now pump.fun-only. For graduated tokens, see step 2
+// (M6.2b: add pump.fun AMM swap). Until then, trades on graduated tokens
+// will fail with a clear "JUPITER_DISABLED" error so we can audit them.
 //
-// v0.8.0 (June 2026).
+// v0.8.0 (June 2026) + v0.8.8 M6.2 step 1 (June 2026).
 // =============================================================================
 
 import * as pumpfun from './pumpfun.js';
-import * as jupiter from './jupiterMetis.js';
+import * as jupiter from './jupiterMetis.js';  // kept import for back-compat; not called
+
+const JUPITER_DISABLED = true;  // v0.8.8 M6.2 step 1 — set false to re-enable Jupiter fallback
 
 // Cache of "is this mint on pump.fun" to avoid re-checking every signal.
 // Once a token graduates (mcap > ~$69k), this flips to false permanently.
@@ -24,51 +27,58 @@ const PUMP_CHECK_TTL_MS = 30_000;  // recheck every 30s in case of graduation
  */
 export async function getBuyQuote({ solAmount, outputMint, slippageBps = 500, chatId = null }) {
   const isPF = await _isPumpfunToken(outputMint);
-  if (isPF) {
-    try {
-      const quote = await pumpfun.getBuyQuote({ solAmount, outputMint, slippageBps });
-      if (quote && quote.outAmount && quote.outAmount !== '0') {
-        return { quote, route: 'pumpfun' };
-      }
-      // quote returned but outAmount is 0/invalid → treat as failure
-      console.warn(`[swapRouter] pumpfun getBuyQuote returned invalid quote (outAmount=${quote?.outAmount}); falling back to jupiter`);
-    } catch (e) {
-      // v0.8.0: detailed log so we can diagnose 'no quote' errors.
-      // Common causes: "graduated" → use Jupiter. "not found" → use Jupiter.
-      // But for bonding-curve tokens, the path SHOULD work — log it.
-      console.warn(`[swapRouter] pumpfun getBuyQuote failed for ${outputMint.toString()}: ${e.message}; falling back to jupiter`);
-    }
-  }
-  const quote = await jupiter.getBuyQuote({ solAmount, outputMint, slippageBps, chatId });
-  if (!quote || !quote.outAmount) {
+  if (!isPF) {
+    // v0.8.8 M6.2 step 1: Jupiter fallback disabled.
+    // Either the mint isn't a pump.fun token, OR it has graduated.
+    // For graduated tokens, see M6.2 step 2 (pump.fun AMM swap).
+    const detail = await _describeRouteFailure(outputMint);
     throw new Error(
-      `no quote available for ${outputMint.toString()} (route=${isPF ? 'pumpfun-fallback' : 'jupiter'}); ` +
-      `solAmount=${solAmount} SOL, slippageBps=${slippageBps}`
+      `JUPITER_DISABLED: no pump.fun bonding-curve path for ${outputMint.toString()} ` +
+      `(${detail}). Bot is pump.fun-only as of M6.2 step 1. ` +
+      `Graduated tokens: see M6.2 step 2 (AMM swap).`
     );
   }
-  return { quote, route: 'jupiter' };
+  try {
+    const quote = await pumpfun.getBuyQuote({ solAmount, outputMint, slippageBps });
+    if (quote && quote.outAmount && quote.outAmount !== '0') {
+      return { quote, route: 'pumpfun' };
+    }
+    // quote returned but outAmount is 0/invalid → treat as failure
+    throw new Error(`pumpfun quote invalid (outAmount=${quote?.outAmount})`);
+  } catch (e) {
+    // v0.8.8 M6.2: no Jupiter fallback. Bubble up the pump.fun error.
+    throw new Error(
+      `pumpfun getBuyQuote failed for ${outputMint.toString()}: ${e.message}. ` +
+      `(Jupiter fallback disabled in M6.2 step 1.)`
+    );
+  }
 }
 
 export async function getSellQuote({ tokenRawAmount, inputMint, slippageBps = 500, chatId = null }) {
   const isPF = await _isPumpfunToken(inputMint);
-  if (isPF) {
-    try {
-      const quote = await pumpfun.getSellQuote({ tokenRawAmount, inputMint, slippageBps });
-      if (quote && quote.outAmount && quote.outAmount !== '0') {
-        return { quote, route: 'pumpfun' };
-      }
-      console.warn(`[swapRouter] pumpfun getSellQuote returned invalid quote; falling back to jupiter`);
-    } catch (e) {
-      console.warn(`[swapRouter] pumpfun getSellQuote failed for ${inputMint.toString()}: ${e.message}; falling back to jupiter`);
-    }
-  }
-  const quote = await jupiter.getSellQuote({ tokenRawAmount, inputMint, slippageBps, chatId });
-  if (!quote || !quote.outAmount) {
+  if (!isPF) {
+    // v0.8.8 M6.2 step 1: Jupiter fallback disabled.
+    // For graduated tokens, see M6.2 step 2 (pump.fun AMM swap).
+    const detail = await _describeRouteFailure(inputMint);
     throw new Error(
-      `no sell quote available for ${inputMint.toString()} (route=${isPF ? 'pumpfun-fallback' : 'jupiter'})`
+      `JUPITER_DISABLED: no pump.fun bonding-curve path for ${inputMint.toString()} ` +
+      `(${detail}). Bot is pump.fun-only as of M6.2 step 1. ` +
+      `Graduated tokens: see M6.2 step 2 (AMM swap).`
     );
   }
-  return { quote, route: 'jupiter' };
+  try {
+    const quote = await pumpfun.getSellQuote({ tokenRawAmount, inputMint, slippageBps });
+    if (quote && quote.outAmount && quote.outAmount !== '0') {
+      return { quote, route: 'pumpfun' };
+    }
+    throw new Error(`pumpfun quote invalid (outAmount=${quote?.outAmount})`);
+  } catch (e) {
+    // v0.8.8 M6.2: no Jupiter fallback. Bubble up the pump.fun error.
+    throw new Error(
+      `pumpfun getSellQuote failed for ${inputMint.toString()}: ${e.message}. ` +
+      `(Jupiter fallback disabled in M6.2 step 1.)`
+    );
+  }
 }
 
 /**
@@ -111,6 +121,24 @@ async function _isPumpfunToken(mint) {
   const isPF = await pumpfun.isPumpfunToken(m);
   PUMP_CHECK_CACHE.set(m, { value: isPF, checkedAt: Date.now() });
   return isPF;
+}
+
+// v0.8.8 M6.2 step 1: when route fails (Jupiter disabled), give a clearer
+// error message distinguishing "not a pump.fun token" vs "graduated" so
+// the executor/operator can decide what to do.
+async function _describeRouteFailure(mint) {
+  try {
+    const state = await pumpfun.getBondingCurveState(mint);
+    if (state && state.complete) {
+      return 'graduated to AMM';
+    }
+    return 'bonding-curve quote failed';
+  } catch (e) {
+    if (/not found/i.test(e.message)) {
+      return 'no pump.fun bonding curve (not a pump.fun token)';
+    }
+    return `pump.fun error: ${e.message}`;
+  }
 }
 
 export function invalidateRouterCache(mint) {
