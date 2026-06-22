@@ -948,8 +948,15 @@ export async function buildAmmSwapTransaction({ quoteResponse, userPublicKey, ch
     tokenAmount,
     minSolOutput,
   });
-  // Build the versioned transaction with priority fee + main ix
-  const cuLimit = 600_000;  // AMM swap is more complex than bonding
+  // Build the versioned transaction with priority fee + main ix.
+  // CRITICAL: cuLimit must match bonding path (250_000) so the priority
+  // fee math is consistent. v0.8.7.16 had microLamports=1_000_000 with
+  // cu=250_000 → 0.00025 SOL priority (the v0.8.7.14 bug). With the
+  // per-user setting (0.000001 SOL) we get microLamports=4000 → fee
+  // = 0.000001 SOL (correct). AMM path previously used cu=600_000
+  // which would have given 0.0000024 SOL (inconsistent w/ bonding).
+  // Match bonding exactly so per-user settings work uniformly.
+  const cuLimit = 250_000;  // MUST match bonding path (src/pumpfun.js line ~680)
   const cuPriceMicroLamports = priorityFeeSol > 0
     ? Math.round((priorityFeeSol * 1e9 / cuLimit) * 1e6)
     : 0;
