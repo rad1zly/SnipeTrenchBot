@@ -511,6 +511,40 @@ const CATALOG = [
     },
   },
   {
+    // v0.8.8 (experimental) M5: reverse-mode sell filter. Symmetric to
+    // trader_buy_limit_min/max. Only fire counter-buy if the dev wallet
+    // sold X-Y SOL on the SELL_DETECTED event. Default null/0 = no filter.
+    //   - min: skip dust sells (priority fee refunds, ATA close residuals)
+    //   - max: skip huge dumps (dev liquidating 100% — late, too risky)
+    //   - both 0/null: every sell triggers (current behavior, backward compat)
+    key: 'trader_sell_limit_min', type: 'number', category: 'filters',
+    mode: 'reverse', nullable: true,
+    label: 'Trader Sell Limit (min)',
+    unit: 'SOL', default: null,
+    min: 0,
+    parseUserInput: (t) => {
+      const s = String(t).trim();
+      if (s === '' || s === '0' || s.toLowerCase() === 'none') return null;
+      const n = parseFloat(s);
+      if (Number.isNaN(n) || n < 0) return null;
+      return n;
+    },
+  },
+  {
+    key: 'trader_sell_limit_max', type: 'number', category: 'filters',
+    mode: 'reverse', nullable: true,
+    label: 'Trader Sell Limit (max)',
+    unit: 'SOL', default: null,
+    min: 0,
+    parseUserInput: (t) => {
+      const s = String(t).trim();
+      if (s === '' || s === '0' || s.toLowerCase() === 'none') return null;
+      const n = parseFloat(s);
+      if (Number.isNaN(n) || n < 0) return null;
+      return n;
+    },
+  },
+  {
     // v0.8.8 M3.9: anti-spam toggle — don't fire if we already bought
     // this token from this wallet in the last N seconds.
     key: 'no_duplicate_buys', type: 'bool', category: 'filters', mode: 'mirror',

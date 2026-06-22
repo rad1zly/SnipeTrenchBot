@@ -269,6 +269,28 @@ export async function executeSignal(event) {
 
   if (event.type === 'BUY_DETECTED') {
     if (copyMode === 'mirror') {
+      // v0.8.8 (experimental) M5: trader_buy_limit_min/max filter.
+      // Only mirror-buy if target's solSpent falls within configured range.
+      // Default null/0 = no filter (backward compat with pre-M5 installs).
+      const buyMin = settings.get('trader_buy_limit_min', chatId);
+      const buyMax = settings.get('trader_buy_limit_max', chatId);
+      const targetSol = event.solSpent;
+      if (targetSol != null && targetSol > 0) {
+        if (buyMin != null && targetSol < buyMin) {
+          logStep('SIGNAL_IGNORED', {
+            dev, mint, type: 'BUY_DETECTED',
+            reason: `below trader_buy_limit_min (target ${targetSol} SOL < min ${buyMin} SOL)`,
+          });
+          return;
+        }
+        if (buyMax != null && targetSol > buyMax) {
+          logStep('SIGNAL_IGNORED', {
+            dev, mint, type: 'BUY_DETECTED',
+            reason: `above trader_buy_limit_max (target ${targetSol} SOL > max ${buyMax} SOL)`,
+          });
+          return;
+        }
+      }
       // v0.8.8 M3.1b: mirror mode — fall through to the same BUY
       // execution path used by reverse-copy's SELL_DETECTED branch,
       // but flag the trigger type in the log.
@@ -303,6 +325,28 @@ export async function executeSignal(event) {
     // Mirror mode: dev SELL is informational only.
     logStep('SIGNAL_IGNORED', { dev, mint, type: 'SELL_DETECTED', reason: 'wallet.copy_mode=mirror — only BUY_DETECTED triggers' });
     return;
+  }
+  // v0.8.8 (experimental) M5: trader_sell_limit_min/max filter (reverse mode).
+  // Only counter-buy if target's solReceived falls within configured range.
+  // Default null/0 = no filter (backward compat with pre-M5 installs).
+  const sellMin = settings.get('trader_sell_limit_min', chatId);
+  const sellMax = settings.get('trader_sell_limit_max', chatId);
+  const devSolReceived = event.solReceived;
+  if (devSolReceived != null && devSolReceived > 0) {
+    if (sellMin != null && devSolReceived < sellMin) {
+      logStep('SIGNAL_IGNORED', {
+        dev, mint, type: 'SELL_DETECTED',
+        reason: `below trader_sell_limit_min (target sold ${devSolReceived} SOL < min ${sellMin} SOL)`,
+      });
+      return;
+    }
+    if (sellMax != null && devSolReceived > sellMax) {
+      logStep('SIGNAL_IGNORED', {
+        dev, mint, type: 'SELL_DETECTED',
+        reason: `above trader_sell_limit_max (target sold ${devSolReceived} SOL > max ${sellMax} SOL)`,
+      });
+      return;
+    }
   }
   logStep('SIGNAL_ACCEPTED', { dev, mint, mode: 'COUNTER_BUY', copyMode, copyRatio });
 
