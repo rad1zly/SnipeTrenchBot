@@ -229,6 +229,13 @@ function initSchema(d) {
     // staleness detection / dropped-WS reconnect).
     ['current_sol_value',       'REAL', 'NULL'],
     ['last_check_at',           'INTEGER', 'NULL'],
+    // v0.8.8 M6.2 step 2: pump.fun AMM migration support. When the
+    // bonding curve graduates, the position is marked is_graduated=1
+    // and exit engine switches to AMM-based pricing. amm_pool_address
+    // is the AMM pool PDA (for direct routing in step 3).
+    ['is_graduated',           'INTEGER', '0'],
+    ['amm_pool_address',       'TEXT', 'NULL'],
+    ['graduated_at',           'INTEGER', 'NULL'],
   ]) {
     if (!posCols.includes(col)) {
       d.exec(`ALTER TABLE positions ADD COLUMN ${col} ${type} DEFAULT ${def};`);

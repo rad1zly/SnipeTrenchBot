@@ -11,6 +11,7 @@
 
 import * as pumpfun from './pumpfun.js';
 import * as jupiter from './jupiterMetis.js';  // kept import for back-compat; not called
+import config from './config.js';  // v0.8.8 M6.2 step 2: SOL_MINT for AMM quote shape
 
 const JUPITER_DISABLED = true;  // v0.8.8 M6.2 step 1 — set false to re-enable Jupiter fallback
 
@@ -27,70 +28,116 @@ const PUMP_CHECK_TTL_MS = 30_000;  // recheck every 30s in case of graduation
  */
 export async function getBuyQuote({ solAmount, outputMint, slippageBps = 500, chatId = null }) {
   const isPF = await _isPumpfunToken(outputMint);
-  if (!isPF) {
-    // v0.8.8 M6.2 step 1: Jupiter fallback disabled.
-    // Either the mint isn't a pump.fun token, OR it has graduated.
-    // For graduated tokens, see M6.2 step 2 (pump.fun AMM swap).
-    const detail = await _describeRouteFailure(outputMint);
-    throw new Error(
-      `JUPITER_DISABLED: no pump.fun bonding-curve path for ${outputMint.toString()} ` +
-      `(${detail}). Bot is pump.fun-only as of M6.2 step 1. ` +
-      `Graduated tokens: see M6.2 step 2 (AMM swap).`
-    );
-  }
-  try {
-    const quote = await pumpfun.getBuyQuote({ solAmount, outputMint, slippageBps });
-    if (quote && quote.outAmount && quote.outAmount !== '0') {
-      return { quote, route: 'pumpfun' };
+  if (isPF) {
+    // v0.8.8 M6.2 step 1: pump.fun bonding path (unchanged).
+    try {
+      const quote = await pumpfun.getBuyQuote({ solAmount, outputMint, slippageBps });
+      if (quote && quote.outAmount && quote.outAmount !== '0') {
+        return { quote, route: 'pumpfun' };
+      }
+      throw new Error(`pumpfun quote invalid (outAmount=${quote?.outAmount})`);
+    } catch (e) {
+      throw new Error(
+        `pumpfun getBuyQuote failed for ${outputMint.toString()}: ${e.message}. ` +
+        `(Jupiter fallback disabled in M6.2 step 1.)`
+      );
     }
-    // quote returned but outAmount is 0/invalid → treat as failure
-    throw new Error(`pumpfun quote invalid (outAmount=${quote?.outAmount})`);
-  } catch (e) {
-    // v0.8.8 M6.2: no Jupiter fallback. Bubble up the pump.fun error.
-    throw new Error(
-      `pumpfun getBuyQuote failed for ${outputMint.toString()}: ${e.message}. ` +
-      `(Jupiter fallback disabled in M6.2 step 1.)`
-    );
   }
+  // v0.8.8 M6.2 step 2: not on bonding. Try pump.fun AMM.
+  const isAmm = await pumpfun.isAmmPoolExists(outputMint);
+  if (isAmm) {
+    try {
+      // For AMM, the buy shape is different (we'd be buying base tokens with SOL).
+      // But copy-trade bot only BUYs on bonding (fresh tokens). Buying on AMM is
+      // a different strategy and not yet supported. Throw a clear error.
+      throw new Error('AMM_BUY_NOT_SUPPORTED: copy-trade bot only buys on bonding. ' +
+        'For AMM buys, use Jupiter or another tool. (M6.2 step 2 only supports AMM sell.)');
+    } catch (e) {
+      throw e;
+    }
+  }
+  // v0.8.8 M6.2 step 1: Jupiter fallback disabled.
+  const detail = await _describeRouteFailure(outputMint);
+  throw new Error(
+    `JUPITER_DISABLED: no pump.fun path for ${outputMint.toString()} ` +
+    `(${detail}). Bot is pump.fun-only as of M6.2 step 1. ` +
+    `Not a pump.fun token (no bonding curve, no AMM pool).`
+  );
 }
 
 export async function getSellQuote({ tokenRawAmount, inputMint, slippageBps = 500, chatId = null }) {
   const isPF = await _isPumpfunToken(inputMint);
-  if (!isPF) {
-    // v0.8.8 M6.2 step 1: Jupiter fallback disabled.
-    // For graduated tokens, see M6.2 step 2 (pump.fun AMM swap).
-    const detail = await _describeRouteFailure(inputMint);
-    throw new Error(
-      `JUPITER_DISABLED: no pump.fun bonding-curve path for ${inputMint.toString()} ` +
-      `(${detail}). Bot is pump.fun-only as of M6.2 step 1. ` +
-      `Graduated tokens: see M6.2 step 2 (AMM swap).`
-    );
-  }
-  try {
-    const quote = await pumpfun.getSellQuote({ tokenRawAmount, inputMint, slippageBps });
-    if (quote && quote.outAmount && quote.outAmount !== '0') {
-      return { quote, route: 'pumpfun' };
+  if (isPF) {
+    // v0.8.8 M6.2 step 1: pump.fun bonding path (unchanged).
+    try {
+      const quote = await pumpfun.getSellQuote({ tokenRawAmount, inputMint, slippageBps });
+      if (quote && quote.outAmount && quote.outAmount !== '0') {
+        return { quote, route: 'pumpfun' };
+      }
+      throw new Error(`pumpfun quote invalid (outAmount=${quote?.outAmount})`);
+    } catch (e) {
+      throw new Error(
+        `pumpfun getSellQuote failed for ${inputMint.toString()}: ${e.message}. ` +
+        `(Jupiter fallback disabled in M6.2 step 1.)`
+      );
     }
-    throw new Error(`pumpfun quote invalid (outAmount=${quote?.outAmount})`);
-  } catch (e) {
-    // v0.8.8 M6.2: no Jupiter fallback. Bubble up the pump.fun error.
-    throw new Error(
-      `pumpfun getSellQuote failed for ${inputMint.toString()}: ${e.message}. ` +
-      `(Jupiter fallback disabled in M6.2 step 1.)`
-    );
   }
+  // v0.8.8 M6.2 step 2: not on bonding. Try pump.fun AMM.
+  const isAmm = await pumpfun.isAmmPoolExists(inputMint);
+  if (isAmm) {
+    try {
+      const quote = await pumpfun.getAmmSellQuote({ inputMint, tokenRawAmount, slippageBps });
+      if (!quote || quote.outAmount == null) {
+        throw new Error('AMM quote returned invalid (outAmount=null)');
+      }
+      // Wrap in same shape as bonding quote (for downstream consumers)
+      return {
+        quote: {
+          outAmount: quote.outAmount.toString(),  // lamports
+          inAmount: tokenRawAmount.toString(),
+          inputMint: inputMint.toString(),
+          outputMint: config.SOL_MINT,
+          _minSolOutput: quote.minOutAmount.toString(),
+          _route: 'amm',
+          _ammPoolState: quote.poolState,
+        },
+        route: 'amm',
+      };
+    } catch (e) {
+      throw new Error(
+        `pumpfun AMM getSellQuote failed for ${inputMint.toString()}: ${e.message}`
+      );
+    }
+  }
+  // v0.8.8 M6.2 step 1: Jupiter fallback disabled.
+  const detail = await _describeRouteFailure(inputMint);
+  throw new Error(
+    `JUPITER_DISABLED: no pump.fun path for ${inputMint.toString()} ` +
+    `(${detail}). Bot is pump.fun-only as of M6.2 step 1. ` +
+    `Not a pump.fun token (no bonding curve, no AMM pool).`
+  );
 }
 
 /**
  * Build swap transaction. The 'route' must match the quote's route.
  * For Jupiter, signature matches jupiterMetis.buildSwapTransaction exactly.
  * For pump.fun, we need the side ('buy' or 'sell') — derive from quote shape.
+ * v0.8.8 M6.2 step 2: also support 'amm' route (graduated tokens).
  */
 export async function buildSwapTransaction({ quoteResponse, userPublicKey, route, side, chatId = null }) {
   if (route === 'pumpfun') {
     // v0.8.7.16: pass chatId so pump.fun route honors per-user
     // buy_priority_fee_sol. Previously hardcoded to 0.00025 SOL.
     return pumpfun.buildSwapTransaction({ quoteResponse, userPublicKey, side, chatId });
+  }
+  if (route === 'amm') {
+    // v0.8.8 M6.2 step 2: pump.fun AMM sell (no buy support yet).
+    // quoteResponse._minSolOutput is lamports.
+    return pumpfun.buildAmmSwapTransaction({
+      quoteResponse,
+      userPublicKey,
+      chatId,
+    });
   }
   return jupiter.buildSwapTransaction({ quoteResponse, userPublicKey, chatId });
 }

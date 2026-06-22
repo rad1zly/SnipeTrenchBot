@@ -180,21 +180,64 @@ export async function pollOnce(positionId) {
   try {
     bc = await getBondingCurveState(pos.mint);
   } catch (e) {
-    // Bonding curve may have graduated (token migrated to Raydium) or
-    // been rugged. In that case our pricing model is invalid. Mark the
-    // position as FAILED with a reason and stop the loop.
+    // v0.8.8 M6.2 step 2: bonding curve gone (graduated or rugged).
+    // Try pump.fun AMM as a fallback (if graduated, liquidity is now in AMM).
+    // If AMM also doesn't exist, mark as FAILED (rugged or not a pump.fun token).
     if (/not found/i.test(e.message)) {
-      console.log(`[exitEngine] position ${positionId}: bonding curve gone (graduated/rugged)`);
-      // We don't auto-sell because the pump.fun pool is dead; a manual
-      // sell via Raydium would be needed. Just notify the user.
+      const { getAmmPoolState, isAmmPoolExists } = await import('./pumpfun.js');
+      const { markGraduated } = await import('./positionTracker.js');
+      const ammExists = await isAmmPoolExists(pos.mint);
+      if (ammExists) {
+        // Token has graduated to AMM. Mark position, then SELL IMMEDIATELY
+        // at AMM market price (M6.2 step 3 will add TP/SL on AMM).
+        console.log(`[exitEngine] position ${positionId}: graduated to AMM — auto-selling`);
+        const ammPool = await getAmmPoolState(pos.mint);
+        markGraduated(positionId, ammPool?.poolKey?.toString() || null);
+        await notifier.send(pos.chat_id,
+          `\ud83d\udcc8 <b>Position ${positionId}</b> graduated to pump.fun AMM — auto-selling at AMM market price\n` +
+          `Mint: <code>${pos.mint.slice(0, 8)}\u2026</code>`,
+          { parse_mode: 'HTML' }
+        ).catch(() => {});
+        // Fire the AMM sell via executor.executeSell
+        const { executeSell } = await import('./executor.js');
+        const sellPct = 100;  // immediate close on graduation (M6.2 step 2)
+        const sellResult = await executeSell({
+          positionId,
+          mint: pos.mint,
+          chatId: pos.chat_id,
+          tokenRawAmount: pos.entry_tokens?.toString() || '0',
+          slippageBps: 1000,  // 10% slippage for AMM graduation sell (volatile)
+          tierName: 'graduation_auto_sell',
+        });
+        return { stop: true, sold: true, sellResult };
+      }
+      // No AMM either — token is rugged or not a pump.fun token at all.
+      console.log(`[exitEngine] position ${positionId}: bonding curve gone, no AMM (rugged/not pump.fun)`);
       await notifier.send(pos.chat_id,
-        `\u26a0\ufe0f <b>Position ${positionId}</b> \u2014 bonding curve gone (graduated or rugged). Manual sell required.\n` +
+        `\u26a0\ufe0f <b>Position ${positionId}</b> \u2014 bonding curve gone (no AMM fallback). Manual sell required.\n` +
         `Mint: <code>${pos.mint.slice(0, 8)}\u2026</code>`,
         { parse_mode: 'HTML' }
       ).catch(() => {});
       return { stop: true };
     }
     throw e;
+  }
+
+  // v0.8.8 M6.2 step 2: detect graduation WHILE bonding curve still exists
+  // (complete=true). Mark position and start AMM-based pricing.
+  if (bc.complete && !pos.is_graduated) {
+    const { getAmmPoolState, markGraduated } = await import('./positionTracker.js');
+    const ammPool = await getAmmPoolState(pos.mint);
+    if (ammPool) {
+      const marked = markGraduated(positionId, ammPool.poolKey?.toString() || null);
+      if (marked) {
+        console.log(`[exitEngine] position ${positionId}: bonding complete=true, AMM pool found, marked graduated`);
+        await notifier.send(pos.chat_id,
+          `\ud83d\udcc8 <b>Position ${positionId}</b> graduated to pump.fun AMM (next tick will AMM-sell).`,
+          { parse_mode: 'HTML' }
+        ).catch(() => {});
+      }
+    }
   }
 
   // 2. Compute current SOL value of held tokens.

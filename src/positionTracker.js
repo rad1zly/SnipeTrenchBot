@@ -116,6 +116,21 @@ export function markTierFired(positionId, tierName) {
 }
 
 /**
+ * v0.8.8 M6.2 step 2: mark a position as graduated to pump.fun AMM.
+ * Idempotent — only updates if is_graduated is currently 0. Returns
+ * the new state (true if newly marked, false if already graduated).
+ */
+export function markGraduated(positionId, ammPoolAddress = null) {
+  const d = getDb();
+  const pos = getPosition(positionId);
+  if (!pos) return false;
+  if (pos.is_graduated) return false;  // already graduated
+  d.prepare(`UPDATE positions SET is_graduated = 1, amm_pool_address = ?, graduated_at = ? WHERE id = ?`)
+    .run(ammPoolAddress, Date.now(), positionId);
+  return true;
+}
+
+/**
  * Add to the sold_pct (caller passes the absolute pct sold, not delta).
  * This is the canonical "what's been sold" counter. The exit engine
  * checks this so it doesn't try to sell more than the user has left.

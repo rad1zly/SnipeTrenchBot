@@ -25,6 +25,8 @@ const TOKEN_2022_PROGRAM_ID = new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqC
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 const pumpSdk = require('@pump-fun/pump-sdk');
+const pumpSwapSdk = require('@pump-fun/pump-swap-sdk');
+const PUMP_AMM_SDK = pumpSwapSdk.PUMP_AMM_SDK;  // offline AMM SDK (instruction builder + quote math)
 import config from './config.js';
 import * as settings from './settings.js';  // v0.8.7.16: per-user priority fee
 
@@ -768,4 +770,200 @@ export async function isMayhemModeToken(mint) {
   } catch {
     return false;
   }
+}
+
+// =============================================================================
+// v0.8.8 M6.2 step 2: pump.fun AMM swap support.
+// When a token graduates (bonding curve complete=true), liquidity migrates
+// to pump.fun's own AMM (program pAMMBay6...XEA). For graduated tokens,
+// we can no longer trade on the bonding curve — must use the AMM pool.
+// =============================================================================
+
+const PUMP_AMM_PROGRAM_ID = new PublicKey('pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA');
+const POOL_INDEX = 0;  // canonical pool index (pump.fun uses index 0 for the main pool)
+
+/**
+ * Get the AMM pool address for a given mint.
+ * Pool = canonicalPumpPoolPda(0, pumpPoolAuthorityPda(mint), mint, NATIVE_MINT)
+ * @param {string|PublicKey} mint
+ * @returns {PublicKey}
+ */
+export function findAmmPool(mint) {
+  const m = typeof mint === 'string' ? new PublicKey(mint) : mint;
+  return pumpSdk.canonicalPumpPoolPda(m);
+}
+
+/**
+ * Fetch AMM pool state (reserves, fee config, etc.) for a given mint.
+ * Returns null if pool doesn't exist (token not graduated yet).
+ * @param {string|PublicKey} mint
+ * @returns {Promise<Object|null>} Pool state or null
+ */
+export async function getAmmPoolState(mint) {
+  try {
+    const m = typeof mint === 'string' ? new PublicKey(mint) : mint;
+    const poolKey = findAmmPool(m);
+    const conn = getConnection();
+    const onlineAmm = new pumpSwapSdk.OnlinePumpAmmSdk(conn);
+    const pool = await onlineAmm.fetchPool(poolKey);
+    if (!pool) return null;
+    // Also need base/quote token account balances to compute reserves
+    const accountInfos = await conn.getMultipleAccountsInfo([
+      pool.poolBaseTokenAccount,
+      pool.poolQuoteTokenAccount,
+    ]);
+    if (!accountInfos[0] || !accountInfos[1]) return null;
+    return {
+      poolKey,
+      baseMint: pool.baseMint,
+      quoteMint: pool.quoteMint,
+      lpMint: pool.lpMint,
+      baseReserves: BigInt(accountInfos[0].data.readBigUInt64LE(64)),  // amount at offset 64 in TokenAccount
+      quoteReserves: BigInt(accountInfos[1].data.readBigUInt64LE(64)),
+      coinCreator: pool.coinCreator,
+      isMayhemMode: pool.isMayhemMode || false,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Check if a mint has a pump.fun AMM pool (i.e. has graduated).
+ * Returns true if pool exists with non-zero reserves.
+ * @param {string|PublicKey} mint
+ * @returns {Promise<boolean>}
+ */
+export async function isAmmPoolExists(mint) {
+  const state = await getAmmPoolState(mint);
+  return state != null && state.baseReserves > 0n && state.quoteReserves > 0n;
+}
+
+/**
+ * Get a sell quote on the AMM. Returns { outAmount, minOutAmount, route: 'amm' }.
+ * outAmount = SOL lamports you'd receive (no slippage).
+ * minOutAmount = SOL lamports with slippage applied.
+ * @param {Object} args
+ * @param {string|PublicKey} args.inputMint
+ * @param {bigint|number} args.tokenRawAmount  raw token amount (with decimals)
+ * @param {number} [args.slippageBps=500]
+ * @returns {Promise<{outAmount: bigint, minOutAmount: bigint, route: 'amm', poolState: Object}>}
+ */
+export async function getAmmSellQuote({ inputMint, tokenRawAmount, slippageBps = 500 }) {
+  const m = typeof inputMint === 'string' ? new PublicKey(inputMint) : inputMint;
+  const poolState = await getAmmPoolState(m);
+  if (!poolState) {
+    throw new Error(`No AMM pool for ${m.toString()} (token may not be graduated)`);
+  }
+  if (poolState.baseReserves <= 0n || poolState.quoteReserves <= 0n) {
+    throw new Error(`AMM pool for ${m.toString()} has zero reserves`);
+  }
+  // Constant product: outAmount = (tokenIn * quoteReserves) / (baseReserves + tokenIn)
+  // Then apply LP fee (typical: 0.30% = 30 bps) + protocol fee + creator fee.
+  // For simplicity, use 1% total fee estimate. The on-chain AMM may have
+  // different exact fees; the SDK uses accurate simulation but requires
+  // swapSolanaState which needs a user pubkey. For a quote without a
+  // specific user, this manual calc is good enough as a fallback.
+  const tokenIn = BigInt(tokenRawAmount);
+  const baseR = poolState.baseReserves;
+  const quoteR = poolState.quoteReserves;
+  const k = baseR * quoteR;
+  const newBase = baseR + tokenIn;
+  const newQuote = k / newBase;
+  const grossOut = quoteR - newQuote;
+  // Apply ~1% total fee (0.30% LP + 0.10% protocol + 0.20% creator estimate)
+  const feeBps = 60n;  // 0.60% conservative
+  const fee = (grossOut * feeBps) / 10000n;
+  const outAmount = grossOut - fee;
+  // Slippage on top
+  const slippageBpsBig = BigInt(slippageBps);
+  const slippageAmount = (outAmount * slippageBpsBig) / 10000n;
+  const minOutAmount = outAmount - slippageAmount;
+  return {
+    outAmount,           // lamports
+    minOutAmount,        // lamports (slippage-adjusted)
+    route: 'amm',
+    poolState,
+    _feeBps: Number(feeBps),
+  };
+}
+
+/**
+ * Build a pump.fun AMM sell transaction instruction.
+ * Uses the OfflinePumpAmmSdk for instruction building. Requires the
+ * full swap state (pool + user ATAs).
+ * @param {Object} args
+ * @param {string|PublicKey} args.mint
+ * @param {string|PublicKey} args.user  - user's wallet pubkey
+ * @param {bigint|number} args.tokenAmount  - raw token amount to sell
+ * @param {bigint|number} args.minSolOutput  - min SOL output in lamports
+ * @returns {Promise<TransactionInstruction>}
+ */
+export async function buildAmmSellInstruction({ mint, user, tokenAmount, minSolOutput }) {
+  const m = typeof mint === 'string' ? new PublicKey(mint) : mint;
+  const u = typeof user === 'string' ? new PublicKey(user) : user;
+  const conn = getConnection();
+  const onlineAmm = new pumpSwapSdk.OnlinePumpAmmSdk(conn);
+  const poolKey = findAmmPool(m);
+  // Get full swap state (pool + user ATAs). If user has no base token
+  // account, this will still work because swapSolanaState creates
+  // a virtual account for quote computation.
+  const swapState = await onlineAmm.swapSolanaState(poolKey, u);
+  const { BN } = require('@coral-xyz/anchor');
+  const ixs = await PUMP_AMM_SDK.sellInstructions(
+    swapState,
+    new BN(tokenAmount.toString()),
+    new BN(minSolOutput.toString())
+  );
+  if (!ixs || ixs.length === 0) {
+    throw new Error(`pumpfun.buildAmmSellInstruction: SDK returned 0 instructions`);
+  }
+  return ixs[0];
+}
+
+/**
+ * Build a pump.fun AMM swap transaction (SELL only, no BUY support yet).
+ * Returns base64-encoded transaction.
+ * @param {Object} args
+ * @param {Object} args.quoteResponse  - output of getSellQuote with route='amm'
+ * @param {string|PublicKey} args.userPublicKey
+ */
+export async function buildAmmSwapTransaction({ quoteResponse, userPublicKey, chatId = null }) {
+  const conn = getConnection();
+  const { blockhash } = await conn.getLatestBlockhash('processed');
+  const user = new PublicKey(userPublicKey);
+  const mintStr = quoteResponse.inputMint;
+  const mint = new PublicKey(mintStr);
+  const minSolOutput = quoteResponse._minSolOutput;
+  const tokenAmount = quoteResponse.inAmount;
+  // v0.8.7.16: per-user priority fee. Use buy_priority_fee_sol as a
+  // baseline for SELL too (AMM is sell-only in M6.2 step 2).
+  const priorityFeeSol = chatId != null
+    ? settings.get('buy_priority_fee_sol', chatId)
+    : 0.00001;
+  const lamports = await conn.getMinimumBalanceForRentExemption(165);
+  const mainIx = await buildAmmSellInstruction({
+    mint,
+    user,
+    tokenAmount,
+    minSolOutput,
+  });
+  // Build the versioned transaction with priority fee + main ix
+  const cuLimit = 600_000;  // AMM swap is more complex than bonding
+  const cuPriceMicroLamports = priorityFeeSol > 0
+    ? Math.round((priorityFeeSol * 1e9 / cuLimit) * 1e6)
+    : 0;
+  const txIxs = [];
+  if (cuPriceMicroLamports > 0) {
+    txIxs.push(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: cuPriceMicroLamports }));
+  }
+  txIxs.push(ComputeBudgetProgram.setComputeUnitLimit({ units: cuLimit }));
+  txIxs.push(mainIx);
+  const msgV0 = new TransactionMessage({
+    payerKey: user,
+    recentBlockhash: blockhash,
+    instructions: txIxs,
+  }).compileToV0Message();
+  const tx = new VersionedTransaction(msgV0);
+  return Buffer.from(tx.serialize()).toString('base64');
 }
