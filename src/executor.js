@@ -265,7 +265,9 @@ export async function executeSignal(event) {
   const chatId = event.chatId;
   const walletCfg = walletsDb.getCopyConfig({ chatId, address: dev }) || { copy_mode: 'reverse', copy_ratio: 100 };
   const copyMode = walletCfg.copy_mode || 'reverse';
-  const copyRatio = Number(walletCfg.copy_ratio) || 100;
+  // v0.8.8 (experimental) M6.1: copyRatio is now hardcoded to 100 (1:1 mirror).
+  // The DB column is kept for back-compat but ignored. See _executeBuy for details.
+  const copyRatio = 100;
 
   if (event.type === 'BUY_DETECTED') {
     if (copyMode === 'mirror') {
@@ -400,17 +402,18 @@ async function _executeBuy(event, { copyMode, copyRatio } = {}) {
   // ---- Read trade params from THIS USER's settings (mutable at runtime) ----
   // v0.8.7.15: chatId is REQUIRED for all settings reads. Each subscriber has
   // their own config — user A's fixed_buy_sol no longer leaks to user B.
-  // v0.8.8 (experimental) M3.3 + M3.1b: copy_ratio. The ratio is now
-  // PER-WALLET (looked up in executeSignal, threaded in as the
-  // `copyRatio` param). In mirror mode the bot spends
-  // (dev's solSpent * copyRatio / 100) instead of fixed_buy_sol. In
-  // reverse mode the ratio is informational (we still use fixed_buy_sol
-  // — the dev's sell amount is the trigger, not a size reference).
+  // v0.8.8 (experimental) M6.1: copyRatio REMOVED. Was per-wallet (M3.1b),
+  // but added attack surface (typos, bad scaling) without a clear use case
+  // beyond 100% (1:1). Mirror mode now always 1:1 (target.solSpent).
+  // Reverse mode uses fixed_buy_sol as before. copyRatio param still
+  // accepted for backward-compat with the M3.1b watcher signatures,
+  // but always clamped to 100 in the caller (executeSignal).
   const fixedBuy = settings.get('fixed_buy_sol', chatId);
   let solAmount;
   if (event.type === 'BUY_DETECTED' && typeof event.solSpent === 'number' && event.solSpent > 0) {
-    solAmount = (event.solSpent * copyRatio) / 100;
-    logStep('COPY_RATIO_APPLIED', { devSol: event.solSpent, copyRatio, botSol: solAmount });
+    // Mirror mode: 1:1 (target's solSpent). The copyRatio param is ignored.
+    solAmount = event.solSpent;
+    logStep('MIRROR_BUY_1TO1', { devSol: event.solSpent, botSol: solAmount });
   } else {
     solAmount = fixedBuy;
   }

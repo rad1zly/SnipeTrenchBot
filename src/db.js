@@ -524,10 +524,13 @@ export const walletsDb = {
   // reconfigure user B's wallet.
   setCopyConfig({ chatId, address, copyMode, copyRatio }) {
     if (chatId == null) throw new Error('walletsDb.setCopyConfig: chatId is required');
+    // v0.8.8 (experimental) M6.1: copyRatio is now hardcoded to 100 in the
+    // executor (1:1 mirror). The DB column is preserved for back-compat
+    // but the param is silently ignored here. Keep the column writes so
+    // existing rows don't lose data; just don't expose ratio in the UI.
     const sets = [];
     const vals = [];
     if (copyMode != null) { sets.push('copy_mode = ?'); vals.push(copyMode); }
-    if (copyRatio != null) { sets.push('copy_ratio = ?'); vals.push(copyRatio); }
     if (sets.length === 0) return 0;
     vals.push(chatId, address);
     return getDb()
