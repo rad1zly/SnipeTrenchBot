@@ -71,6 +71,28 @@ function initSchema(d) {
     CREATE INDEX IF NOT EXISTS idx_watched_wallets_address ON watched_wallets(address);
   `);
 
+  // v0.8.8 M7 (experimental): per-watched-wallet settings overrides.
+  // Each watched_wallets row can have its own (key, value) overrides for
+  // trade-decision settings (trader_sell_limit_min/max, fixed_buy_sol,
+  // slippage, etc). The lookup chain is:
+  //   1. wallet_settings(watched_wallet_id, key) — per-wallet override
+  //   2. user_settings(chat_id, key)              — per-user default
+  //   3. code default                            — last resort
+  // This lets users tune each dev wallet independently (e.g. wallet A
+  // needs trader_sell_limit_min=5 SOL because it only makes big sells,
+  // wallet B needs 0.1 SOL because it snipes).
+  d.exec(`
+    CREATE TABLE IF NOT EXISTS wallet_settings (
+      watched_wallet_id INTEGER NOT NULL,
+      key               TEXT    NOT NULL,
+      value             TEXT    NOT NULL,
+      updated_at        INTEGER NOT NULL,
+      PRIMARY KEY (watched_wallet_id, key),
+      FOREIGN KEY (watched_wallet_id) REFERENCES watched_wallets(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_wallet_settings_wid ON wallet_settings(watched_wallet_id);
+  `);
+
   // v0.8.8 (experimental): per-wallet signal filters. min/max buy range +
   // max sell age. Default NULL/0 = no filter. Idempotent ALTER (PRAGMA check
   // before ADD). Backfill via DEFAULT NULL so existing rows keep working.

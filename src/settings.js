@@ -10,7 +10,7 @@
 // (getBool/getNumber/getString) at trade time so a change is live immediately.
 // =============================================================================
 
-import { userSettingsDb, positionsDb } from './db.js';
+import { userSettingsDb, positionsDb, getDb } from './db.js';
 
 // -----------------------------------------------------------------------------
 // Catalog — every mutable setting, in the order the menus display them.
@@ -776,6 +776,176 @@ export function reset(key, chatId) {
   if (!BY_KEY[key]) return false;
   if (chatId == null) throw new Error(`settings.reset('${key}'): chatId is required`);
   return userSettingsDb.delete(chatId, key) > 0;
+}
+
+// =============================================================================
+// v0.8.8 M7: per-watched-wallet settings overrides
+// =============================================================================
+//
+// Each user can have multiple watched wallets (dev wallets they want to
+// copy-trade). Different wallets have different trading characters (some
+// snipe small, some whale big, some only buy-to-sell-on-1st-pump). The
+// user wants per-wallet trade-decision settings so they can tune each
+// independently.
+//
+// Resolution order for `getForWallet(chatId, key, walletAddress)`:
+//   1. wallet_settings(watched_wallet_id, key) — per-wallet override
+//   2. user_settings(chat_id, key)              — per-user default
+//   3. env (if any)                              — env fallback
+//   4. code default                              — last resort
+//
+// Falls back gracefully to per-user if no wallet match, then to env/default.
+// This means existing per-user settings keep working unchanged — you only
+// get per-wallet behavior when you explicitly set a wallet_settings row.
+// =============================================================================
+
+/**
+ * Resolve the watched_wallets.id for a (chatId, address) pair. Returns null
+ * if the user doesn't watch this wallet.
+ */
+function resolveWatchedWalletId(chatId, walletAddress) {
+  if (chatId == null || walletAddress == null) return null;
+  try {
+    const d = getDb();
+    const row = d.prepare('SELECT id FROM watched_wallets WHERE chat_id = ? AND address = ?').get(chatId, walletAddress);
+    return row ? row.id : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Get a setting for a specific watched wallet, falling back to per-user
+ * setting, then env, then code default. Use this for trade-decision
+ * settings that should differ per dev wallet (filters, sizing, slippage,
+ * exit plan). For global settings like buy_priority_fee_sol, jito tips,
+ * pause, encryption — use the per-user `get(key, chatId)` instead.
+ *
+ * @param {string} key  - setting key (must exist in CATALOG)
+ * @param {number} chatId  - user's chat id (required)
+ * @param {string} walletAddress  - the watched wallet's address (e.g. the dev wallet being copied)
+ * @returns {*}  the resolved value (typed)
+ */
+export function getForWallet(key, chatId, walletAddress) {
+  if (chatId == null) {
+    throw new Error(
+      `settings.getForWallet('${key}'): chatId is required.`
+    );
+  }
+  const setting = BY_KEY[key];
+  if (!setting) {
+    throw new Error(`settings.getForWallet('${key}'): unknown setting key`);
+  }
+  // 1. Per-wallet override
+  const wid = resolveWatchedWalletId(chatId, walletAddress);
+  if (wid != null) {
+    try {
+      const d = getDb();
+      const row = d.prepare('SELECT value FROM wallet_settings WHERE watched_wallet_id = ? AND key = ?').get(wid, key);
+      if (row && row.value != null) {
+        return coerceByType(setting, row.value);
+      }
+    } catch { /* fall through */ }
+  }
+  // 2. Per-user default
+  return get(key, chatId);
+}
+
+/**
+ * Typed convenience: per-wallet bool with fallback.
+ */
+export function getBoolForWallet(key, chatId, walletAddress, fallback = false) {
+  if (chatId == null) throw new Error(`settings.getBoolForWallet('${key}'): chatId is required`);
+  const v = getForWallet(key, chatId, walletAddress);
+  if (v == null) return fallback;
+  return Boolean(v);
+}
+
+/**
+ * Typed convenience: per-wallet number with fallback.
+ */
+export function getNumberForWallet(key, chatId, walletAddress, fallback = 0) {
+  if (chatId == null) throw new Error(`settings.getNumberForWallet('${key}'): chatId is required`);
+  const v = getForWallet(key, chatId, walletAddress);
+  if (v == null) return fallback;
+  const n = Number(v);
+  return Number.isNaN(n) ? fallback : n;
+}
+
+/**
+ * Typed convenience: per-wallet string with fallback.
+ */
+export function getStringForWallet(key, chatId, walletAddress, fallback = '') {
+  if (chatId == null) throw new Error(`settings.getStringForWallet('${key}'): chatId is required`);
+  const v = getForWallet(key, chatId, walletAddress);
+  if (v == null) return fallback;
+  return String(v);
+}
+
+/**
+ * Set a per-wallet setting override. Pass null to clear (falls back to
+ * per-user / env / default). Validates the value against the catalog
+ * entry just like `set(key, value, chatId)`.
+ */
+export function setForWallet(key, value, chatId, walletAddress) {
+  if (chatId == null) throw new Error(`settings.setForWallet('${key}'): chatId is required`);
+  if (walletAddress == null) throw new Error(`settings.setForWallet('${key}'): walletAddress is required`);
+  const wid = resolveWatchedWalletId(chatId, walletAddress);
+  if (wid == null) {
+    throw new Error(`settings.setForWallet('${key}'): user ${chatId} does not watch wallet ${walletAddress}`);
+  }
+  const setting = BY_KEY[key];
+  if (!setting) throw new Error(`Unknown setting: ${key}`);
+  const d = getDb();
+  if (value == null) {
+    // clear override
+    d.prepare('DELETE FROM wallet_settings WHERE watched_wallet_id = ? AND key = ?').run(wid, key);
+    return;
+  }
+  // Validate
+  let stored = value;
+  if (setting.type === 'number') {
+    const n = Number(value);
+    if (!Number.isFinite(n)) throw new Error(`Setting ${key} expects a number, got ${value}`);
+    if (setting.min != null && n < setting.min) throw new Error(`Setting ${key} must be >= ${setting.min}, got ${n}`);
+    if (setting.max != null && n > setting.max) throw new Error(`Setting ${key} must be <= ${setting.max}, got ${n}`);
+    stored = n;
+  } else if (setting.type === 'bool') {
+    stored = Boolean(value);
+  } else {
+    stored = String(value);
+  }
+  d.prepare(`
+    INSERT INTO wallet_settings (watched_wallet_id, key, value, updated_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(watched_wallet_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+  `).run(wid, key, stored, Date.now());
+}
+
+/**
+ * Reset a per-wallet setting (removes the wallet_settings row, falls back
+ * to per-user / env / default). Returns true if a row was deleted.
+ */
+export function resetForWallet(key, chatId, walletAddress) {
+  if (chatId == null) throw new Error(`settings.resetForWallet('${key}'): chatId is required`);
+  if (walletAddress == null) throw new Error(`settings.resetForWallet('${key}'): walletAddress is required`);
+  const wid = resolveWatchedWalletId(chatId, walletAddress);
+  if (wid == null) return false;
+  const d = getDb();
+  return d.prepare('DELETE FROM wallet_settings WHERE watched_wallet_id = ? AND key = ?').run(wid, key).changes > 0;
+}
+
+/**
+ * List all per-wallet overrides for a watched wallet. Returns array of
+ * { key, value, updatedAt } sorted by key.
+ */
+export function listWalletOverrides(chatId, walletAddress) {
+  if (chatId == null || walletAddress == null) return [];
+  const wid = resolveWatchedWalletId(chatId, walletAddress);
+  if (wid == null) return [];
+  const d = getDb();
+  return d.prepare('SELECT key, value, updated_at FROM wallet_settings WHERE watched_wallet_id = ? ORDER BY key').all(wid)
+    .map(r => ({ key: r.key, value: r.value, updatedAt: r.updated_at }));
 }
 
 /** Reset ALL settings for one user (each user resets their own). */

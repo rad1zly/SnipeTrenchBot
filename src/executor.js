@@ -263,6 +263,11 @@ export async function executeSignal(event) {
   // mirror mode at the same time.
   const { wallet: dev, mint } = event;
   const chatId = event.chatId;
+  // v0.8.8 (experimental) M7: trade-decision settings can now be tuned
+  // per watched wallet via settings.getForWallet(...). The fallback chain
+  // is wallet_settings → user_settings → env → code default, so users
+  // can selectively override one wallet without changing the global
+  // behavior of the others.
   const walletCfg = walletsDb.getCopyConfig({ chatId, address: dev }) || { copy_mode: 'reverse', copy_ratio: 100 };
   const copyMode = walletCfg.copy_mode || 'reverse';
   // v0.8.8 (experimental) M6.1: copyRatio is now hardcoded to 100 (1:1 mirror).
@@ -274,8 +279,9 @@ export async function executeSignal(event) {
       // v0.8.8 (experimental) M5: trader_buy_limit_min/max filter.
       // Only mirror-buy if target's solSpent falls within configured range.
       // Default null/0 = no filter (backward compat with pre-M5 installs).
-      const buyMin = settings.get('trader_buy_limit_min', chatId);
-      const buyMax = settings.get('trader_buy_limit_max', chatId);
+      // v0.8.8 M7: per-wallet override available via wallet_settings.
+      const buyMin = settings.getForWallet('trader_buy_limit_min', chatId, dev);
+      const buyMax = settings.getForWallet('trader_buy_limit_max', chatId, dev);
       const targetSol = event.solSpent;
       if (targetSol != null && targetSol > 0) {
         if (buyMin != null && targetSol < buyMin) {
@@ -331,8 +337,9 @@ export async function executeSignal(event) {
   // v0.8.8 (experimental) M5: trader_sell_limit_min/max filter (reverse mode).
   // Only counter-buy if target's solReceived falls within configured range.
   // Default null/0 = no filter (backward compat with pre-M5 installs).
-  const sellMin = settings.get('trader_sell_limit_min', chatId);
-  const sellMax = settings.get('trader_sell_limit_max', chatId);
+  // v0.8.8 M7: per-wallet override available via wallet_settings.
+  const sellMin = settings.getForWallet('trader_sell_limit_min', chatId, dev);
+  const sellMax = settings.getForWallet('trader_sell_limit_max', chatId, dev);
   const devSolReceived = event.solReceived;
   if (devSolReceived != null && devSolReceived > 0) {
     if (sellMin != null && devSolReceived < sellMin) {
@@ -408,7 +415,11 @@ async function _executeBuy(event, { copyMode, copyRatio } = {}) {
   // Reverse mode uses fixed_buy_sol as before. copyRatio param still
   // accepted for backward-compat with the M3.1b watcher signatures,
   // but always clamped to 100 in the caller (executeSignal).
-  const fixedBuy = settings.get('fixed_buy_sol', chatId);
+  // v0.8.8 M7: trade-decision settings (fixed_buy_sol, slippage, hold_ms,
+  // auto_sell, auto_retry, tp_sl_plan, trailing_stop, time_sell_plan) now
+  // resolve per-watched-wallet first, then per-user. This lets users
+  // tune sizing, exit plan, and tolerance per dev wallet.
+  const fixedBuy = settings.getForWallet('fixed_buy_sol', chatId, dev);
   let solAmount;
   if (event.type === 'BUY_DETECTED' && typeof event.solSpent === 'number' && event.solSpent > 0) {
     // Mirror mode: 1:1 (target's solSpent). The copyRatio param is ignored.
@@ -417,18 +428,18 @@ async function _executeBuy(event, { copyMode, copyRatio } = {}) {
   } else {
     solAmount = fixedBuy;
   }
-  const slippageBps = settings.get('slippage_bps', chatId);
-  const pumpSlippageBps = settings.get('pump_slippage_bps', chatId);
-  const pumpSellSlippageBps = settings.get('pump_sell_slippage_bps', chatId);  // v0.8.7.13: separate from buy
-  const holdMs = settings.get('hold_ms', chatId);
-  const autoSell = settings.get('auto_sell', chatId);
-  const autoRetry = settings.get('auto_retry', chatId);
+  const slippageBps = settings.getForWallet('slippage_bps', chatId, dev);
+  const pumpSlippageBps = settings.getForWallet('pump_slippage_bps', chatId, dev);
+  const pumpSellSlippageBps = settings.getForWallet('pump_sell_slippage_bps', chatId, dev);  // v0.8.7.13: separate from buy
+  const holdMs = settings.getForWallet('hold_ms', chatId, dev);
+  const autoSell = settings.getForWallet('auto_sell', chatId, dev);
+  const autoRetry = settings.getForWallet('auto_retry', chatId, dev);
   // v0.8.8 (experimental) M2: read the user's auto-sell plan and pass it
   // through to the position row as a snapshot. The exit engine reads
   // from the snapshot so plan edits mid-trade don't retro-fire tiers.
-  const tpSlPlan     = parsePlan(settings.get('tp_sl_plan',     chatId));
-  const trailPlan    = parsePlan(settings.get('trailing_stop',  chatId));
-  const timePlan     = parsePlan(settings.get('time_sell_plan', chatId));
+  const tpSlPlan     = parsePlan(settings.getForWallet('tp_sl_plan',     chatId, dev));
+  const trailPlan    = parsePlan(settings.getForWallet('trailing_stop',  chatId, dev));
+  const timePlan     = parsePlan(settings.getForWallet('time_sell_plan', chatId, dev));
   const autoSellPlan = { ...tpSlPlan, ...trailPlan, ...timePlan };
   const hasPlan = Object.keys(autoSellPlan).length > 0;
 
@@ -726,14 +737,26 @@ async function _executeBuy(event, { copyMode, copyRatio } = {}) {
  *     log to signals and return without touching the position row
  */
 export async function executeSell({ positionId, mint, chatId, tokenRawAmount, slippageBps = null, tierName = null }) {
+  // v0.8.8 M7: per-wallet sell slippage. Read from the position's dev
+  // wallet if available, else fall back to the chatId-level setting.
+  // We need the watched wallet (dev) to resolve the override. Pull it
+  // from the position row (openPosition stored dev_wallet).
+  let posDev = null;
+  try {
+    const { getDb } = await import('./db.js');
+    const d = getDb();
+    const pos = d.prepare('SELECT dev_wallet FROM positions WHERE id = ?').get(positionId);
+    if (pos) posDev = pos.dev_wallet;
+  } catch { /* not critical */ }
+
   // Defensive: make sure wallet is loaded.
   const w = walletManager.getStatus(chatId);
   if (!w.set) {
     throw new Error(`wallet not set for chat ${chatId} — cannot sell`);
   }
 
-  const pumpSellSlippageBps = slippageBps ?? settings.get('pump_sell_slippage_bps', chatId);
-  const autoRetry = settings.get('auto_retry', chatId) ?? 0;
+  const pumpSellSlippageBps = slippageBps ?? settings.getForWallet('pump_sell_slippage_bps', chatId, posDev);
+  const autoRetry = settings.getForWallet('auto_retry', chatId, posDev) ?? 0;
 
   const { quote: sellQuote, route: sellRoute } = await getSellQuote({
     tokenRawAmount: BigInt(Math.floor(tokenRawAmount)),
