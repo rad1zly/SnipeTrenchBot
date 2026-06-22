@@ -780,3 +780,136 @@ automatically get `copy_count=0, last_copy_at=0` after the ALTER.
   For MEV-protected routing, switch to `https://metis.jup.io`.
 - All trades are subject to the safety caps. With the defaults, the
   bot can lose at most 0.01 SOL per trade and 0.05 SOL per day.
+
+---
+
+## [Unreleased] — v0.8.8-experimental
+
+> **Status:** Experimental, deployed to internal users only. Branch
+> `experimental`. Not yet tagged for production. Last commit: `b443631`.
+
+This release is a substantial rewrite of the bot's trade logic, settings
+UI, and execution path. It introduces **two trading modes** (mirror and
+reverse-copy), a structured **exit engine** (TP/SL/trailing/time), and
+dozens of UX improvements to the inline-keyboard settings menu.
+
+### Added — Copy modes (M3, M3.1, M3.1b)
+
+The bot now supports two distinct trading strategies, selectable **per
+watched wallet** (not per user):
+
+- **Reverse copy (default, back-compat).** Watched wallet SELL → bot
+  BUYs (counter-trade). Trade size = `fixed_buy_sol` (independent of
+  the target's sell size). Original v0.7.0 behavior.
+- **Mirror copy.** Watched wallet BUY → bot BUYs (follow-trade). Trade
+  size = `target.solSpent × copy_ratio / 100`. Default 100% = 1:1
+  mirror. Configurable per wallet (`watched_wallets.copy_ratio`).
+
+Selectable via `/wallets` → tap a wallet → `🔀 Copy Mode` (Mirror /
+Reverse / Off). The bot emits `SIGNAL_IGNORED` for the non-active
+event type with the reason `wallet.copy_mode=...`.
+
+### Added — Trader limit filters (M3.9, M5)
+
+Two range filters to skip dust and over-sized events. Both default to
+`null` (no filter) for backward compat:
+
+- **Mirror mode:** `trader_buy_limit_min` / `trader_buy_limit_max` (SOL).
+  Skip BUY_DETECTED if `target.solSpent` is outside the range. (Setting
+  defined in M3.9; filter actually applied in M5 — previously a dead
+  config.)
+- **Reverse mode:** `trader_sell_limit_min` / `trader_sell_limit_max`
+  (SOL). Skip SELL_DETECTED if `target.solReceived` is outside the range.
+  Added in M5 per cozi feedback — protects against dust sells (priority
+  fee refunds, ATA close residuals) and huge dumps (dev liquidating
+  100% of supply — too late to follow).
+
+Both filters are also the answer to a common trap pattern: dev sells
+a small amount first, then dumps everything. With
+`trader_sell_limit_min` set to ~0.1 SOL, the first dust sell is
+ignored. (For multi-stage traps where the second sell is the real one,
+see also `no_duplicate_buys` — ensures only one BUY per mint per
+wallet per cooldown window.)
+
+### Added — Exit engine (M2)
+
+Replaces the fixed 1-second hold with a structured **TP / SL / Trailing
+Stop / Time exit** plan. Per-user, configurable via inline-keyboard
+flow (`/settings` → `🎯 Exit Plan`).
+
+- **TP (Take Profit):** up to 3 tiers (TP1, TP2, TP3) with independent
+  sell % and price-multiplier above entry.
+- **SL (Stop Loss):** sell N% of position if price drops below X% of
+  entry.
+- **Trailing Stop:** trails the high-water mark by Y%, sells N% when
+  triggered.
+- **Time Exit:** sell remaining position if not closed within N seconds.
+
+Plans are stored as a snapshot on the position row when BUY_OK fires,
+so editing the plan mid-trade doesn't retro-fire old tiers.
+
+### Added — UI overhaul (M1.12–M1.20)
+
+- M3.8: live wallet balance + USD value in main menu header.
+- M1.18: per-setting prompts, hide dev_sell_trigger, slippage shown as %.
+- M1.17: pretty button labels (`🪙`, `📈`, `🛟`).
+- M1.16: contextual default sell_pct (100% single tier, 50% multi-tier).
+- M1.15: CSV mode for TP plans (TP2/TP3 optional).
+- M1.12: tier-by-tier auto-sell flow (no JSON, no presets).
+
+### Added — Multi-lane tip routing (M4)
+
+`tipLanes.js` — selects a tip route per trade (Jito bundle / Helius
+protected / 0slot / Astralane) based on current slot congestion and
+per-route success rate. Replaces the previous single-RPC path. Settings:
+`buy_tip_sol` (default 0.00001), `tip_lane` (auto / jito / helius / 0slot / astralane).
+
+### Added — `/positions`, `/closepos`, audit log (M2.10–M2.12)
+
+- `/positions` — list currently OPEN positions with live P&L.
+- `/closepos <id>` — manually close a position (skip auto-sell).
+- Audit log: every setting change, /pause, /resume, lane switch is
+  recorded in a new `audit_log` table.
+
+### Changed
+
+- `executor.js` — `executeSignal` now branches on `event.type` and
+  the per-wallet `copy_mode` setting. The reverse-copy SELL_DETECTED
+  path and the mirror-copy BUY_DETECTED path both call the same
+  internal `_executeBuy` function.
+- `heliusWebSocket.js` — emits one event per (wallet, owner) pair, so
+  the executor can look up the per-user copy_mode. (Previously global
+  reverse-only.)
+- `settings.js` — added ~15 new catalog entries (mirror / reverse / exit
+  plan / tip lane / limit). Total catalog size: ~37 entries.
+
+### Migration notes
+
+- The DB schema is forward-compatible: no destructive migrations.
+  All new settings default to `null` (no filter / off) and don't
+  change existing behavior.
+- To enable mirror mode: `/wallets` → tap a wallet → `🔀 Copy Mode` →
+  `Mirror`. Optionally set `copy_ratio` (default 100%).
+- To enable TP/SL: `/settings` → `🎯 Exit Plan` → follow the tier
+  prompts. Empty plan = legacy 1-second hold.
+
+### Lessons learned
+
+- **Settings defined in catalog ≠ filter applied.** `trader_buy_limit_*`
+  was in the catalog since v0.8.8 M3.9 but the executor never checked
+  it. M5 wired it up. Audit: `grep '<key>' src/executor.js
+  src/heliusWebSocket.js src/filters.js` to confirm a setting is
+  consumed.
+- **Mirror vs reverse sizing is fundamentally different.** Mirror is
+  proportional to the target's size (1:1 by default). Reverse is
+  fixed-amount regardless of the target's size. Trying to make
+  reverse proportional is a category error — the dev's SELL is a
+  *signal* of intent, not a sizing input.
+- **The dev-sell trap pattern.** Devs often sell 0.001 SOL of dust
+  first to bait naive bots, then dump 100% on the second tx. Filter
+  with `trader_sell_limit_min` AND `no_duplicate_buys` for full
+  protection.
+
+---
+
+## [0.7.3] - 2026-06-16

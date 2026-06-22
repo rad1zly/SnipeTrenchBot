@@ -1,9 +1,10 @@
 # SnipeTrenchBot
 
-> **Reverse copy-trade** bot for Solana, controlled from Telegram. Watches
-> Pump.fun dev wallets, executes a Jupiter **BUY** the moment a watched
-> wallet **SELLs** its own token, holds for 1 second, and exits.
-> **Documentation-first, safety-first.**
+> **Reverse copy-trade** & **Mirror copy-trade** bot for Solana, controlled
+> from Telegram. Watches Pump.fun dev wallets and executes Jupiter / Pump.fun
+> direct **BUYs** the moment a watched wallet **SELLs** (reverse) or **BUYs**
+> (mirror). Holds per a configurable exit plan (TP / SL / trailing / time),
+> then exits. **Documentation-first, safety-first.**
 
 This is the trimmed-down, single-purpose version of the larger SnipeTrench
 project. The earlier tracker/cluster-detection work lives in a separate
@@ -11,7 +12,12 @@ folder and is paused — this repo is the one that trades.
 
 ---
 
-## 🔁 What is "reverse copy-trade"?
+## 🔁 Trading modes
+
+The bot supports two strategies, selectable **per watched wallet**
+(via `/wallets` → tap a wallet → `🔀 Copy Mode`):
+
+### 1. Reverse copy (default)
 
 Traditional copy-trading follows the leader: if the target **buys**, the
 follower **buys**. SnipeTrenchBot inverts that — it uses a target wallet's
@@ -22,15 +28,58 @@ Target wallet         Bot
 ─────────────         ───
 create(X)  ────────►  (record X as a known dev-token)
 sell(X)    ────────►  buy(X)         ← contrarian entry, snipe the dump
-... 1 second ...
-                     sell(X)        ← scalp exit
+... exit plan ...
+                     sell(X)        ← TP / SL / trailing / time exit
 ```
 
 The thesis is momentum + thin liquidity: a dev's own sell often dumps the
 chart by 30-80% in seconds, but if there are still buyers in the book
 (a real community, not just snipers), the price recovers in the same
-minute. The 1-second hold captures the bounce, the second sell is the
-exit. This is a **scalp, not an investment** — see [RISK.md](RISK.md).
+minute. The exit engine (TP / SL / trailing / time) captures the bounce.
+This is a **scalp, not an investment** — see [RISK.md](RISK.md).
+
+### 2. Mirror copy
+
+Conventional copy-trading — if the target **buys**, the bot **buys** the
+same mint at a proportional size:
+
+```
+Target wallet         Bot
+─────────────         ───
+buy(X) for 0.5 SOL ►  buy(X) for (0.5 × copy_ratio / 100) SOL
+                       e.g. copy_ratio=50% → bot buys 0.25 SOL
+```
+
+Use this when you want to follow a high-conviction wallet into its entries.
+Trade size is proportional — set `copy_ratio` per wallet (default 100% =
+1:1 mirror; 50% = half-size; 200% = 2× leverage-equivalent size).
+
+### Trade size formula
+
+| Mode | Detection event | Bot's trade size |
+|---|---|---|
+| **Reverse copy** | target SELL_DETECTED | `fixed_buy_sol` (per-user, independent of target's sell size) |
+| **Mirror copy** | target BUY_DETECTED | `target.solSpent × copy_ratio / 100` (proportional) |
+
+> **Note:** In reverse copy, the target's sell amount is used as a
+> **trigger signal**, not a sizing input. The bot's buy is `fixed_buy_sol`
+> regardless of whether the target sold 0.001 SOL or 100 SOL. To filter
+> dust or huge sells, set `trader_sell_limit_min` / `trader_sell_limit_max`.
+
+### Range filters (anti-trap)
+
+Both modes support a min-max range filter to skip dust and over-sized
+events (default null = no filter):
+
+| Setting | Mode | Purpose |
+|---|---|---|
+| `trader_buy_limit_min` | mirror | Skip dust buys (airdrop claims, 0.001 SOL noise) |
+| `trader_buy_limit_max` | mirror | Skip huge buys (50+ SOL, way too rich to copy) |
+| `trader_sell_limit_min` | reverse | Skip dust sells (priority fee refunds, ATA close) |
+| `trader_sell_limit_max` | reverse | Skip huge dumps (100% dev liquidation, too late) |
+
+These protect against the common "dev sells dust first, then dumps" trap
+pattern. Set `trader_sell_limit_min` to ~0.1 SOL to ignore the bait.
 
 ---
 
@@ -295,7 +344,7 @@ these commands. There is no owner-only auth.
 
 ## Settings menu
 
-All 22 runtime settings live behind an inline-keyboard menu. No restart
+All ~37 runtime settings live behind an inline-keyboard menu. No restart
 needed — every change is persisted to SQLite (`settings` table) and
 read on the next signal. Defaults live in `src/settings.js → CATALOG`
 and can be overridden by env vars in `.env`.
