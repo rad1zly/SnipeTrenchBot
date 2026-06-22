@@ -62,6 +62,7 @@ import { walletManager, fetchBalanceSnapshot } from './walletManager.js';
 import notifier from './notifier.js';
 import * as sm from './settingsMenu.js';
 import * as settings from './settings.js';
+import * as wsm from './walletSettingsMenu.js';  // v0.8.8 M7: per-wallet settings UI
 import * as wm from './walletMenu.js';
 
 let bots = []; // M1.5: array of Telegraf instances (one per TELEGRAM_BOT_TOKEN)
@@ -317,6 +318,9 @@ function walletCopyMenu(chatId, address) {
   // v0.8.8 (experimental) M3.1b + M6.1: per-wallet copy config sub-menu.
   // Shows current mode and lets the user flip mode. M6.1 removed the
   // "Set ratio" button (ratio is hardcoded 100, see executor.js).
+  // v0.8.8 M7: added "⚙️ Per-wallet settings" button so users can tune
+  // trade-decision settings (filters, sizing, slippage, exit plan) for
+  // THIS specific wallet without affecting other watched wallets.
   const w = walletsDb.getCopyConfig({ chatId, address });
   if (!w) {
     return Markup.inlineKeyboard([[Markup.button.callback('« Back', 'cmd:wallets')]]);
@@ -329,6 +333,7 @@ function walletCopyMenu(chatId, address) {
       Markup.button.callback(`${mode === 'mirror' ? '🟢' : '⚪'} Mirror`, `wallet:mode:${address}:mirror`),
       Markup.button.callback(`${mode === 'off' ? '⚫' : '⚪'} Off`, `wallet:mode:${address}:off`),
     ],
+    [Markup.button.callback('⚙️ Per-wallet settings', `wset:open:${address}`)],
     [Markup.button.callback('« Back to Wallets', 'cmd:wallets')],
   ]);
 }
@@ -879,6 +884,21 @@ function startSingleBot(token, { onPause: pauseCb, onResume: resumeCb } = {}) {
         }
         await ctx.answerCbQuery();
         await ctx.replyWithHTML(walletCopyText(ctx.chat.id, addr), walletCopyMenu(ctx.chat.id, addr));
+      } else if (data.startsWith('wallet:open:')) {
+        // v0.8.8 M7: back button from per-wallet settings → wallet
+        // copy menu. Format: 'wallet:open:<address>'.
+        const addr = data.slice('wallet:open:'.length);
+        await ctx.answerCbQuery();
+        await ctx.replyWithHTML(walletCopyText(ctx.chat.id, addr), walletCopyMenu(ctx.chat.id, addr));
+      } else if (data.startsWith('wset:open:')) {
+        // v0.8.8 M7: open the per-wallet settings screen for a wallet.
+        const addr = data.slice('wset:open:'.length);
+        await ctx.answerCbQuery();
+        await wsm.renderWalletSettings(ctx, addr);
+      } else if (data.startsWith('wset:')) {
+        // v0.8.8 M7: route all other wset:* callbacks to walletSettingsMenu.
+        const handled = await wsm.handleCallback(ctx, data);
+        if (handled) return;
       } else if (data.startsWith('wallet:mode:')) {
         // v0.8.8 M3.1b: switch this wallet's copy mode. Format:
         //   wallet:mode:<address>:<reverse|mirror|off>
@@ -1293,6 +1313,7 @@ function startSingleBot(token, { onPause: pauseCb, onResume: resumeCb } = {}) {
     // Each handler is gated by its own pending-map and returns true to
     // signal the message was consumed.
     if (await sm.handlePendingText(ctx)) return;
+    if (await wsm.handlePendingText(ctx)) return;  // v0.8.8 M7: per-wallet value prompt
     if (await wm.handlePendingWalletText(ctx)) return;
 
     // Second check: is this user in pending-add-wallet mode? If yes, parse
