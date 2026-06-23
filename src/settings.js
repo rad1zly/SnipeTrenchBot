@@ -177,41 +177,85 @@ const CATALOG = [
   {
     key: 'tp_sl_plan', type: 'text', nullable: true, category: 'trade', mode: 'both',
     label: 'TP / SL Plan',
-    default: null,  // null = disabled. Format: {"enabled":true,"tiers":[{"tp_pct":50,"sell_pct":50},...],"sl_pct":-30,"sl_sell_pct":100}
+    default: null,  // null = disabled. Shortcut: "tp:50" or "tp:50 sl:-30" or "tp:50/tp:100 sl:-30"
     parseUserInput: (t) => {
       const s = t.trim();
       if (['none', 'off', '0', ''].includes(s.toLowerCase())) return null;
-      try {
-        const obj = JSON.parse(s);
-        if (typeof obj !== 'object' || obj === null) return null;
-        if (obj.tiers && !Array.isArray(obj.tiers)) return null;
-        if (obj.tiers) {
-          for (const tier of obj.tiers) {
+      if (s.startsWith('{')) {
+        try {
+          const obj = JSON.parse(s);
+          if (typeof obj !== 'object' || obj === null) return null;
+          if (obj.tiers && !Array.isArray(obj.tiers)) return null;
+          if (obj.tiers) for (const tier of obj.tiers) {
             if (typeof tier.tp_pct !== 'number' || typeof tier.sell_pct !== 'number') return null;
             if (tier.tp_pct <= 0 || tier.sell_pct <= 0 || tier.sell_pct > 100) return null;
           }
-        }
-        if (obj.sl_pct !== undefined && (typeof obj.sl_pct !== 'number' || obj.sl_pct >= 0)) return null;
-        if (obj.sl_sell_pct !== undefined && (typeof obj.sl_sell_pct !== 'number' || obj.sl_sell_pct <= 0 || obj.sl_sell_pct > 100)) return null;
-        return JSON.stringify(obj);
-      } catch (e) { return null; }
+          if (obj.sl_pct !== undefined && (typeof obj.sl_pct !== 'number' || obj.sl_pct >= 0)) return null;
+          if (obj.sl_sell_pct !== undefined && (typeof obj.sl_sell_pct !== 'number' || obj.sl_sell_pct <= 0 || obj.sl_sell_pct > 100)) return null;
+          return JSON.stringify(obj);
+        } catch (e) { return null; }
+      }
+      // Shortcut: "tp:50" / "tp:50 sl:-30" / "tp:50/tp:100 sl:-30"
+      const parts = s.split(/\s+/);
+      const tiers = []; let sl_pct = null; let sl_sell_pct = 100;
+      for (const p of parts) {
+        const m = p.match(/^(tp\d?):(\d+)$/i);
+        if (m) { tiers.push({ tp_pct: parseInt(m[2], 10), sell_pct: 100 }); continue; }
+        const slm = p.match(/^sl:(-?\d+)$/i);
+        if (slm) { sl_pct = parseInt(slm[1], 10); if (sl_pct >= 0) return null; continue; }
+        return null;
+      }
+      if (tiers.length === 0 && sl_pct === null) return null;
+      return JSON.stringify({ tiers, sl_pct, sl_sell_pct });
+    },
+    formatValue: (v) => {
+      if (v == null) return '—';
+      try {
+        const obj = JSON.parse(v);
+        const fmt = (n) => (n > 0 ? `+${n}%` : `${n}%`);
+        const parts = [];
+        if (obj.tiers?.length) obj.tiers.forEach(t => { if (t?.tp_pct != null) parts.push(`TP ${fmt(t.tp_pct)}`); });
+        if (obj.sl_pct != null) parts.push(`SL ${fmt(obj.sl_pct)}`);
+        return parts.join(' | ') || '—';
+      } catch { return v; }
     },
   },
   {
     key: 'trailing_stop', type: 'text', nullable: true, category: 'trade', mode: 'both',
     label: 'Trailing Stop',
-    default: null,  // null = disabled. Format: {"enabled":true,"act_pct":20,"trail_pct":10,"sell_pct":100}
+    default: null,  // null = disabled. Shortcut: "act:50 trail:10"
     parseUserInput: (t) => {
       const s = t.trim();
       if (['none', 'off', '0', ''].includes(s.toLowerCase())) return null;
+      if (s.startsWith('{')) {
+        try {
+          const obj = JSON.parse(s);
+          if (typeof obj !== 'object' || obj === null) return null;
+          if (typeof obj.act_pct !== 'number' || obj.act_pct <= 0) return null;
+          if (typeof obj.trail_pct !== 'number' || obj.trail_pct <= 0) return null;
+          if (typeof obj.sell_pct !== 'number' || obj.sell_pct <= 0 || obj.sell_pct > 100) return null;
+          return JSON.stringify(obj);
+        } catch (e) { return null; }
+      }
+      // Shortcut: "act:50 trail:10"
+      const actm = s.match(/act:(\d+)/i);
+      const trailm = s.match(/trail:(\d+)/i);
+      if (!actm || !trailm) return null;
+      const act_pct = parseInt(actm[1], 10);
+      const trail_pct = parseInt(trailm[1], 10);
+      if (act_pct <= 0 || trail_pct <= 0) return null;
+      return JSON.stringify({ act_pct, trail_pct, sell_pct: 100 });
+    },
+    formatValue: (v) => {
+      if (v == null) return '—';
       try {
-        const obj = JSON.parse(s);
-        if (typeof obj !== 'object' || obj === null) return null;
-        if (typeof obj.act_pct !== 'number' || obj.act_pct <= 0) return null;
-        if (typeof obj.trail_pct !== 'number' || obj.trail_pct <= 0) return null;
-        if (typeof obj.sell_pct !== 'number' || obj.sell_pct <= 0 || obj.sell_pct > 100) return null;
-        return JSON.stringify(obj);
-      } catch (e) { return null; }
+        const obj = JSON.parse(v);
+        const fmt = (n) => (n > 0 ? `+${n}%` : `${n}%`);
+        const parts = [];
+        if (obj.act_pct != null) parts.push(`act ${fmt(obj.act_pct)}`);
+        if (obj.trail_pct != null) parts.push(`trail ${fmt(obj.trail_pct)}`);
+        return parts.join(' | ') || '—';
+      } catch { return v; }
     },
   },
   {
@@ -234,22 +278,43 @@ const CATALOG = [
   {
     key: 'time_sell_plan', type: 'text', nullable: true, category: 'trade', mode: 'both',
     label: 'Time-based Exit',
-    default: null,  // null = disabled. Format: {"enabled":true,"tiers":[{"after_s":30,"sell_pct":50},{"after_s":60,"sell_pct":100}]}
+    default: null,  // null = disabled. Shortcut: "30s:50 60s:100" (sell 50% after 30s, 100% after 60s)
     parseUserInput: (t) => {
       const s = t.trim();
       if (['none', 'off', '0', ''].includes(s.toLowerCase())) return null;
-      try {
-        const obj = JSON.parse(s);
-        if (typeof obj !== 'object' || obj === null) return null;
-        if (obj.tiers && !Array.isArray(obj.tiers)) return null;
-        if (obj.tiers) {
-          for (const tier of obj.tiers) {
+      if (s.startsWith('{')) {
+        try {
+          const obj = JSON.parse(s);
+          if (typeof obj !== 'object' || obj === null) return null;
+          if (obj.tiers && !Array.isArray(obj.tiers)) return null;
+          if (obj.tiers) for (const tier of obj.tiers) {
             if (typeof tier.after_s !== 'number' || tier.after_s <= 0) return null;
             if (typeof tier.sell_pct !== 'number' || tier.sell_pct <= 0 || tier.sell_pct > 100) return null;
           }
-        }
-        return JSON.stringify(obj);
-      } catch (e) { return null; }
+          return JSON.stringify(obj);
+        } catch (e) { return null; }
+      }
+      // Shortcut: "30s:50 60s:100" or "30:50 60:100"
+      const parts = s.split(/\s+/);
+      const tiers = [];
+      for (const p of parts) {
+        const m = p.match(/^(\d+)[sS]?:(\d+)$/);
+        if (!m) return null;
+        const after_s = parseInt(m[1], 10);
+        const sell_pct = parseInt(m[2], 10);
+        if (after_s <= 0 || sell_pct <= 0 || sell_pct > 100) return null;
+        tiers.push({ after_s, sell_pct });
+      }
+      if (tiers.length === 0) return null;
+      return JSON.stringify({ tiers });
+    },
+    formatValue: (v) => {
+      if (v == null) return '—';
+      try {
+        const obj = JSON.parse(v);
+        if (!obj.tiers?.length) return '—';
+        return obj.tiers.map(t => `${t.after_s}s:${t.sell_pct}%`).join(' ');
+      } catch { return v; }
     },
   },
   {
@@ -305,6 +370,7 @@ const CATALOG = [
       if (Number.isNaN(n) || n < 0) return null;
       return n;
     },
+    formatValue: (v) => (v == null ? '—' : `${v.toLocaleString()} USD`),
   },
   {
     key: 'max_mc_usd', type: 'number', nullable: true,  // v0.8.0: '0'/'none' sets to null (disabled)
@@ -319,6 +385,7 @@ const CATALOG = [
       if (Number.isNaN(n) || n < 0) return null;
       return n;
     },
+    formatValue: (v) => (v == null ? '—' : `${v.toLocaleString()} USD`),
   },
   {
     key: 'min_token_age_min', type: 'number', nullable: true,  // v0.8.0: '0'/'none' sets to null (disabled)
@@ -545,6 +612,26 @@ const CATALOG = [
     },
   },
   {
+    // v0.8.8 M13: sl_pct — standalone stop-loss percentage (separate from tp_sl_plan).
+    key: 'sl_pct', type: 'number', category: 'trade', mode: 'both', nullable: true,
+    label: 'Stop Loss',
+    unit: '%', default: null,
+    min: -100, max: -1,
+    parseUserInput: (t) => {
+      const n = parseFloat(t);
+      if (!Number.isFinite(n) || n >= 0) return null;  // must be negative
+      if (n < -100) return null;
+      return n;
+    },
+    formatValue: (v) => (v == null ? '—' : `${v}%`),
+  },
+  {
+    // v0.8.8 M13: dev_only — only follow trades where dev is token creator.
+    key: 'dev_only', type: 'bool', category: 'filters', mode: 'both',
+    label: 'Dev Only',
+    default: false,
+  },
+  {
     // v0.8.8 M3.9: anti-spam toggle — don't fire if we already bought
     // this token from this wallet in the last N seconds.
     key: 'no_duplicate_buys', type: 'bool', category: 'filters', mode: 'mirror',
@@ -644,7 +731,11 @@ function readEnvFor(setting) {
 
 function coerceByType(setting, value) {
   if (value == null) return setting.default ?? null;
-  if (setting.type === 'bool') return Boolean(value);
+  if (setting.type === 'bool') {
+    if (value === 'true' || value === '1' || value === '1.0' || value === 1 || value === true) return true;
+    if (value === 'false' || value === '0' || value === '0.0' || value === 0 || value === false) return false;
+    return null;
+  }
   if (setting.type === 'number') {
     const n = Number(value);
     return Number.isNaN(n) ? (setting.default ?? null) : n;
@@ -852,6 +943,22 @@ export function getForWallet(key, chatId, walletAddress) {
 }
 
 /**
+ * Direct per-wallet lookup by wid (row-id). Used by handlePendingText which
+ * already has wid in PENDING state — bypasses address resolution.
+ */
+export function getForWalletById(key, wid) {
+  if (wid == null) return undefined;
+  const setting = BY_KEY[key];
+  if (!setting) return undefined;
+  try {
+    const d = getDb();
+    const row = d.prepare('SELECT value FROM wallet_settings WHERE watched_wallet_id = ? AND key = ?').get(wid, key);
+    if (row && row.value != null) return coerceByType(setting, row.value);
+  } catch { /* ignore */ }
+  return undefined;
+}
+
+/**
  * Typed convenience: per-wallet bool with fallback.
  */
 export function getBoolForWallet(key, chatId, walletAddress, fallback = false) {
@@ -911,7 +1018,7 @@ export function setForWallet(key, value, chatId, walletAddress) {
     if (setting.max != null && n > setting.max) throw new Error(`Setting ${key} must be <= ${setting.max}, got ${n}`);
     stored = n;
   } else if (setting.type === 'bool') {
-    stored = Boolean(value);
+    stored = value ? 1 : 0;
   } else {
     stored = String(value);
   }
@@ -926,6 +1033,32 @@ export function setForWallet(key, value, chatId, walletAddress) {
  * Reset a per-wallet setting (removes the wallet_settings row, falls back
  * to per-user / env / default). Returns true if a row was deleted.
  */
+export function setForWalletById(key, value, wid) {
+  if (wid == null) throw new Error('setForWalletById: wid is required');
+  const setting = BY_KEY[key];
+  if (!setting) throw new Error(`Unknown setting: ${key}`);
+  const d = getDb();
+  if (value == null) {
+    d.prepare('DELETE FROM wallet_settings WHERE watched_wallet_id = ? AND key = ?').run(wid, key);
+    return;
+  }
+  let stored = value;
+  if (setting.type === 'number') {
+    const n = Number(value);
+    if (!Number.isFinite(n)) throw new Error(`Setting ${key} expects a number, got ${value}`);
+    stored = n;
+  } else if (setting.type === 'bool') {
+    stored = value ? 1 : 0;
+  } else {
+    stored = String(value);
+  }
+  d.prepare(`
+    INSERT INTO wallet_settings (watched_wallet_id, key, value, updated_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(watched_wallet_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+    `).run(wid, key, stored, Date.now());
+}
+
 export function resetForWallet(key, chatId, walletAddress) {
   if (chatId == null) throw new Error(`settings.resetForWallet('${key}'): chatId is required`);
   if (walletAddress == null) throw new Error(`settings.resetForWallet('${key}'): walletAddress is required`);

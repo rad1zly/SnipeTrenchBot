@@ -483,6 +483,15 @@ export const walletsDb = {
       .prepare(`SELECT * FROM watched_wallets WHERE chat_id = ? ORDER BY added_at DESC`)
       .all(chatId);
   },
+  /** v0.8.8 M9: fetch one wallet by its integer row-id. Used by callback
+   *  routers to avoid passing 43-char base58 addresses in button data
+   *  (Telegram inline button callback_data is capped at 64 bytes). */
+  getById(chatId, id) {
+    if (chatId == null) throw new Error('walletsDb.getById: chatId is required');
+    return getDb()
+      .prepare(`SELECT * FROM watched_wallets WHERE id = ? AND chat_id = ? LIMIT 1`)
+      .get(id, chatId);
+  },
   /** Union of all unique addresses across all users — for the Helius monitor. */
   listAll() {
     return getDb()

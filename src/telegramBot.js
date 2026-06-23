@@ -306,7 +306,7 @@ const walletsMenu = (chatId) => {
       const icon = mode === 'mirror' ? '🟢' : mode === 'reverse' ? '🟠' : '⚪';
       const short = `${w.address.slice(0, 4)}…${w.address.slice(-4)}`;
       const label = w.label ? `${w.label} (${short})` : short;
-      rows.push([Markup.button.callback(`${icon} ${label} · ${mode}`, `wallet:copy:${w.address}`)]);
+      rows.push([Markup.button.callback(`${icon} ${label} · ${mode}`, `wallet:copy:${w.id}`)]);
     }
   }
   rows.push([Markup.button.callback('➕ Add Wallet', 'cmd:wallet_add')]);
@@ -314,45 +314,214 @@ const walletsMenu = (chatId) => {
   return Markup.inlineKeyboard(rows);
 };
 
-function walletCopyMenu(chatId, address) {
-  // v0.8.8 (experimental) M3.1b + M6.1: per-wallet copy config sub-menu.
-  // Shows current mode and lets the user flip mode. M6.1 removed the
-  // "Set ratio" button (ratio is hardcoded 100, see executor.js).
-  // v0.8.8 M7: added "⚙️ Per-wallet settings" button so users can tune
-  // trade-decision settings (filters, sizing, slippage, exit plan) for
-  // THIS specific wallet without affecting other watched wallets.
-  const w = walletsDb.getCopyConfig({ chatId, address });
-  if (!w) {
-    return Markup.inlineKeyboard([[Markup.button.callback('« Back', 'cmd:wallets')]]);
-  }
-  const mode = w.copy_mode || 'reverse';
-  const short = `${address.slice(0, 4)}…${address.slice(-4)}`;
-  return Markup.inlineKeyboard([
-    [
-      Markup.button.callback(`${mode === 'reverse' ? '🟠' : '⚪'} Reverse`, `wallet:mode:${address}:reverse`),
-      Markup.button.callback(`${mode === 'mirror' ? '🟢' : '⚪'} Mirror`, `wallet:mode:${address}:mirror`),
-      Markup.button.callback(`${mode === 'off' ? '⚫' : '⚪'} Off`, `wallet:mode:${address}:off`),
-    ],
-    [Markup.button.callback('⚙️ Per-wallet settings', `wset:open:${address}`)],
-    [Markup.button.callback('« Back to Wallets', 'cmd:wallets')],
-  ]);
+// Helper: format TP/SL JSON value for display on a single button label.
+// fmtTpSl needs access to wsm to read standalone sl_pct — called from walletCopyMenu
+// which already has wsm in scope. Pass slRaw as second arg so we read it directly.
+function fmtTpSl(raw, slRaw) {
+  if (!raw && slRaw == null) return '—';
+  let obj;
+  try { obj = JSON.parse(raw || '{}'); } catch { obj = {}; }
+  const fmt = (n) => (n > 0 ? `+${n}%` : `${n}%`);
+  const parts = [];
+  if (obj.tiers?.length) obj.tiers.forEach(t => { if (t?.tp_pct != null) parts.push(`TP ${fmt(t.tp_pct)}`); });
+  // Prefer standalone sl_pct over tp_sl_plan.sl_pct (they may differ during migration)
+  const slVal = slRaw ?? obj.sl_pct;
+  if (slVal != null) parts.push(`SL ${fmt(slVal)}`);
+  return parts.join(' | ') || '—';
+}
+function fmtTP(raw) {
+  if (!raw) return '—';
+  let obj;
+  try { obj = JSON.parse(raw); } catch { return '—'; }
+  if (!obj?.tiers?.length) return '—';
+  return `+${obj.tiers[0].tp_pct}%`;
+}
+function fmtSL(raw) {
+  if (!raw) return '—';
+  let obj;
+  try { obj = JSON.parse(raw); } catch { return '—'; }
+  if (obj?.sl_pct == null) return '—';
+  return `${obj.sl_pct}%`;
+}
+function fmtTrailing(raw) {
+  if (!raw) return '—';
+  let obj;
+  try { obj = JSON.parse(raw); } catch { return '—'; }
+  if (!obj || typeof obj !== 'object') return '—';
+  const fmt = (n) => (n > 0 ? `+${n}%` : `${n}%`);
+  const parts = [];
+  if (obj.act_pct != null) parts.push(`act ${fmt(obj.act_pct)}`);
+  if (obj.trail_pct != null) parts.push(`trail ${fmt(obj.trail_pct)}`);
+  return parts.join(' | ') || '—';
+}
+function fmtTime(raw) {
+  if (!raw) return '—';
+  let obj;
+  try { obj = JSON.parse(raw); } catch { return '—'; }
+  if (!obj?.tiers?.length) return '—';
+  return obj.tiers.map(t => `${t.after_s}s:${t.sell_pct}%`).join(' ');
 }
 
-function walletCopyText(chatId, address) {
-  // v0.8.8 (experimental) M3.1b + M6.1: per-wallet config text. Shows the
-  // current copy mode and a one-liner explainer of what each mode does.
-  // M6.1 removed the ratio line (hardcoded 100, mirror = 1:1).
+function walletCopyMenu(chatId, wid) {
+  // v0.8.8 M12: per-wallet menu.
+  // Mirror → Buy Min/Max. Reverse → Sell Min/Max. Dedicated TP/SL/Trail/Time buttons.
+  const wallet = walletsDb.getById(chatId, wid);
+  if (!wallet) {
+    return Markup.inlineKeyboard([[Markup.button.callback('« Back', 'cmd:wallets')]]);
+  }
+  const address = wallet.address;
+  const w = walletsDb.getCopyConfig({ chatId, address });
+  const mode = w?.copy_mode || 'reverse';
+  const overrides = wsm.listWalletOverrides(chatId, address);
+  const overrideKeys = new Set(overrides.map(o => o.key));
+  const flag = (key) => overrideKeys.has(key) ? '🟢' : '⚪';
+
+  const tpRaw = wsm.getForWallet('tp_sl_plan',     chatId, address);
+  const slRaw = wsm.getForWallet('sl_pct',             chatId, address);
+  const tsRaw = wsm.getForWallet('trailing_stop',  chatId, address);
+  const tmRaw = wsm.getForWallet('time_sell_plan', chatId, address);
+
+  const slipRaw = wsm.getForWallet('slippage_bps', chatId, address);
+  const slipFmt = slipRaw != null ? `${(slipRaw / 100).toFixed(1)}%` : '—';
+
+  const rows = [];
+
+  // ── Row 1: Copy mode
+  rows.push([
+    Markup.button.callback(`${mode === 'reverse' ? '🟠' : '⚪'} Reverse`, `wallet:mode:${wid}:reverse`),
+    Markup.button.callback(`${mode === 'mirror'  ? '🟢' : '⚪'} Mirror`,  `wallet:mode:${wid}:mirror`),
+    Markup.button.callback(`${mode === 'off'     ? '⚫' : '⚪'} Off`,     `wallet:mode:${wid}:off`),
+  ]);
+
+  // ── Row 1b: Dev Only toggle
+  const devOnly = wsm.getForWallet('dev_only', chatId, address) === true;
+  rows.push([
+    Markup.button.callback(`${devOnly ? '🔵' : '⚪'} Dev Only: ${devOnly ? 'ON' : 'OFF'}`, `wset:toggle:${wid}:dev_only`),
+  ]);
+
+  // ── Row 2: TP / SL
+  rows.push([
+    Markup.button.callback(`📈 TP: ${fmtTpSl(tpRaw, slRaw)}`, `wallet:tp:${wid}`),
+    Markup.button.callback(`📉 SL: ${slRaw != null ? slRaw + '%' : '—'}`, `wallet:sl:${wid}`),
+  ]);
+
+  // ── Row 3: Trailing / Time
+  rows.push([
+    Markup.button.callback(`🔄 Trail: ${fmtTrailing(tsRaw)}`, `wallet:trail:${wid}`),
+    Markup.button.callback(`⏱ Time: ${fmtTime(tmRaw)}`,     `wallet:time:${wid}`),
+  ]);
+
+  // ── Row 4: Limit filters — label changes per mode
+  if (mode === 'mirror') {
+    rows.push([
+      Markup.button.callback(`${flag('trader_buy_limit_min')} Buy Min: ${wsm.getForWallet('trader_buy_limit_min', chatId, address) ?? '—'} SOL`, `wset:edit:${wid}:trader_buy_limit_min`),
+      Markup.button.callback(`${flag('trader_buy_limit_max')} Buy Max: ${wsm.getForWallet('trader_buy_limit_max', chatId, address) ?? '—'} SOL`, `wset:edit:${wid}:trader_buy_limit_max`),
+    ]);
+  } else if (mode === 'reverse') {
+    rows.push([
+      Markup.button.callback(`${flag('trader_sell_limit_min')} Sell Min: ${wsm.getForWallet('trader_sell_limit_min', chatId, address) ?? '—'} SOL`, `wset:edit:${wid}:trader_sell_limit_min`),
+      Markup.button.callback(`${flag('trader_sell_limit_max')} Sell Max: ${wsm.getForWallet('trader_sell_limit_max', chatId, address) ?? '—'} SOL`, `wset:edit:${wid}:trader_sell_limit_max`),
+    ]);
+  }
+
+  // ── Row 5: Fixed buy + Priority fee + Slippage
+  rows.push([
+    Markup.button.callback(`${flag('fixed_buy_sol')} Buy SOL: ${wsm.getForWallet('fixed_buy_sol', chatId, address) ?? '—'} SOL`, `wset:edit:${wid}:fixed_buy_sol`),
+    Markup.button.callback(`${flag('buy_priority_fee_sol')} Prio Fee: ${wsm.getForWallet('buy_priority_fee_sol', chatId, address) ?? '—'} SOL`, `wset:edit:${wid}:buy_priority_fee_sol`),
+    Markup.button.callback(`${flag('slippage_bps')} Slip: ${slipFmt}`, `wset:edit:${wid}:slippage_bps`),
+  ]);
+
+  // ── Row 6: MC filters
+  rows.push([
+    Markup.button.callback(`${flag('min_mc_usd')} Min MC: ${(wsm.getCatalogEntry('min_mc_usd')?.formatValue?.(wsm.getForWallet('min_mc_usd', chatId, address)) ?? '—')}`, `wset:edit:${wid}:min_mc_usd`),
+    Markup.button.callback(`${flag('max_mc_usd')} Max MC: ${(wsm.getCatalogEntry('max_mc_usd')?.formatValue?.(wsm.getForWallet('max_mc_usd', chatId, address)) ?? '—')}`, `wset:edit:${wid}:max_mc_usd`),
+  ]);
+
+  // ── Row 6b: Age + Hold
+  const holdRaw = wsm.getForWallet('hold_ms', chatId, address);
+  const holdEntry = wsm.getCatalogEntry('hold_ms');
+  const holdFmt = holdEntry?.formatValue ? holdEntry.formatValue(holdRaw) : (holdRaw ?? '—');
+  rows.push([
+    Markup.button.callback(`${flag('min_token_age_min')} Min Age: ${wsm.getForWallet('min_token_age_min', chatId, address) ?? '—'}m`, `wset:edit:${wid}:min_token_age_min`),
+    Markup.button.callback(`${flag('hold_ms')} Hold: ${holdFmt}`, `wset:edit:${wid}:hold_ms`),
+  ]);
+
+  // ── Row 7: No dup
+  rows.push([
+    Markup.button.callback(`${flag('no_duplicate_buys')} No Dup: ${wsm.getForWallet('no_duplicate_buys', chatId, address) ? '✓' : '—'}`, `wset:edit:${wid}:no_duplicate_buys`),
+  ]);
+
+  // ── Row 8: Back
+  rows.push([Markup.button.callback('« Back to Wallets', 'cmd:wallets')]);
+
+  return Markup.inlineKeyboard(rows);
+}
+
+// v0.8.8 M9: wallet picker shown when user taps "Copy Trade" or "Reverse"
+// in the main menu — they choose WHICH wallet to configure before seeing
+// the per-wallet copy + settings menu.
+function buildWalletPickerText(mode, chatId) {
+  const list = walletsDb.list(chatId);
+  const modeIcon = mode === 'mirror' ? '🪞' : mode === 'reverse' ? '🔁' : '⚙️';
+  const modeLabel = mode === 'mirror' ? 'Mirror' : mode === 'reverse' ? 'Reverse Copy' : 'Copy Trade';
+  const lines = [
+    `${modeIcon} <b>${modeLabel} — select wallet</b>`,
+    '',
+    '<i>Tap a wallet below to configure its copy mode & settings.</i>',
+    '',
+  ];
+  if (list.length === 0) {
+    lines.push('⚠️ <b>No wallets added yet.</b>');
+    lines.push('Use /addwallet or tap "➕ Add" below.');
+  } else {
+    for (const w of list) {
+      const short = `${w.address.slice(0, 4)}…${w.address.slice(-4)}`;
+      const label = w.label ? ` (${w.label})` : '';
+      lines.push(`• <code>${short}</code>${label}`);
+    }
+  }
+  return lines.join('\n');
+}
+
+function walletPickerKeyboard(mode, chatId) {
+  const list = walletsDb.list(chatId);
+  const buttons = [];
+  for (const w of list) {
+    const short = `${w.address.slice(0, 4)}…${w.address.slice(-4)}`;
+    const label = w.label ? ` ${w.label}` : '';
+    const copyMode = walletsDb.getCopyConfig({ chatId, address: w.address });
+    const icon = (copyMode?.copy_mode || 'reverse') === 'mirror' ? '🟢' :
+                 (copyMode?.copy_mode || 'reverse') === 'reverse' ? '🟠' : '⚫';
+    buttons.push([Markup.button.callback(
+      `${icon} ${short}${label}`,
+      `wallet:pick:${mode}:${w.id}`
+    )]);
+  }
+  buttons.push([Markup.button.callback('➕ Add new wallet', 'cmd:wallet_add')]);
+  const backBtn = mode === 'mirror' ? 'cmd:copytrade_mirror' :
+                  mode === 'reverse' ? 'cmd:copytrade_reverse' : 'menu:main';
+  buttons.push([Markup.button.callback('« Back', backBtn)]);
+  return Markup.inlineKeyboard(buttons);
+}
+
+function walletCopyText(chatId, wid) {
+  // v0.8.8 M11: minimal — just wallet short address + mode explainer.
+  const wallet = walletsDb.getById(chatId, wid);
+  if (!wallet) return 'Wallet not found.';
+  const address = wallet.address;
   const w = walletsDb.getCopyConfig({ chatId, address });
   if (!w) return 'Wallet not found.';
   const mode = w.copy_mode || 'reverse';
+  const devOnly = settings.getForWallet('dev_only', chatId, address) === true;
+  const devOnlyTag = devOnly ? ' | 🔵 Dev Only ON' : '';
   const explain = {
-    reverse: '🟠 <b>Reverse</b> — buy when this dev SELLS (front-run exit).',
-    mirror:  '🟢 <b>Mirror</b> — buy when this dev BUYS (follow entry, 1:1 size).',
+    reverse: `🟠 <b>Reverse</b> — buy when this dev SELLS (front-run exit).${devOnlyTag}`,
+    mirror:  `🟢 <b>Mirror</b> — buy when this dev BUYS (your SOL size).${devOnlyTag}`,
     off:     '⚪ <b>Off</b> — track signals but don\u2019t auto-trade this wallet.',
   };
+  const short = `${address.slice(0, 4)}…${address.slice(-4)}`;
   return [
-    `🎯 <b>Wallet copy config</b>`,
-    `<code>${address}</code>`,
+    `🎯 <b>Wallet:</b> <code>${short}</code>`,
     '',
     explain[mode],
   ].join('\n');
@@ -768,17 +937,67 @@ function startSingleBot(token, { onPause: pauseCb, onResume: resumeCb } = {}) {
         const text = await buildMainText(ctx.chat.id);
         await renderScreen(ctx, text, mainMenu(ctx.chat.id));
       } else if (data === 'cmd:copytrade_mirror') {
-        // v0.8.8 (experimental) M3.9: Copy Trade menu (mirror mode).
-        // Shows settings with mode='mirror' or mode='both' in the
-        // catalog — the Buy Ratio, Copy Sell, Trader Buy Limit, and
-        // other mirror-only TradeWiz features. Tap a setting to edit.
-        await sm.renderFlat(ctx, 'mirror');
+        // v0.8.8 M9: show wallet picker first — user picks which wallet
+        // to configure for Mirror mode. When only 1 wallet, skip picker.
+        const list = walletsDb.list(ctx.chat.id);
+        if (list.length === 0) {
+          await ctx.answerCbQuery('No wallets — add one first');
+          await ctx.replyWithHTML(
+            '⚠️ <b>No wallets to configure.</b>\nAdd a wallet first:\n' +
+            '• /addwallet — paste a Solana address\n' +
+            '• or tap "➕ Add new wallet" below.',
+            Markup.inlineKeyboard([[Markup.button.callback('➕ Add new wallet', 'cmd:wallet_add')]])
+          );
+          return;
+        }
+        if (list.length === 1) {
+          // Skip picker — go straight to that wallet's copy menu
+          await ctx.answerCbQuery().catch(() => {});
+          walletsDb.setCopyConfig({ chatId: ctx.chat.id, address: list[0].address, copyMode: 'mirror' });
+          try {
+            await ctx.replyWithHTML(walletCopyText(ctx.chat.id, list[0].id), walletCopyMenu(ctx.chat.id, list[0].id));
+          } catch (e) {
+            console.error('[telegramBot] copytrade_mirror reply error:', e.message);
+          }
+          return;
+        }
+        await ctx.answerCbQuery().catch(() => {});
+        try {
+          await ctx.replyWithHTML(buildWalletPickerText('mirror', ctx.chat.id), walletPickerKeyboard('mirror', ctx.chat.id));
+        } catch (e) {
+          console.error('[telegramBot] copytrade_mirror picker reply error:', e.message);
+        }
       } else if (data === 'cmd:copytrade_reverse') {
-        // v0.8.8 (experimental) M3.9: Reverse Copy menu (counter-trade).
-        // Shows settings with mode='reverse' or mode='both' — focused on
-        // the counter-trade entry signal + structured exit (TP/SL,
-        // Trailing, Dev Sell, Time). No Buy Ratio (we use fixed_buy_sol).
-        await sm.renderFlat(ctx, 'reverse');
+        // v0.8.8 M9: show wallet picker first — user picks which wallet
+        // to configure for Reverse mode. When only 1 wallet, skip picker.
+        const list = walletsDb.list(ctx.chat.id);
+        if (list.length === 0) {
+          await ctx.answerCbQuery('No wallets — add one first');
+          await ctx.replyWithHTML(
+            '⚠️ <b>No wallets to configure.</b>\nAdd a wallet first:\n' +
+            '• /addwallet — paste a Solana address\n' +
+            '• or tap "➕ Add new wallet" below.',
+            Markup.inlineKeyboard([[Markup.button.callback('➕ Add new wallet', 'cmd:wallet_add')]])
+          );
+          return;
+        }
+        if (list.length === 1) {
+          // Skip picker — go straight to that wallet's copy menu
+          await ctx.answerCbQuery().catch(() => {});
+          walletsDb.setCopyConfig({ chatId: ctx.chat.id, address: list[0].address, copyMode: 'reverse' });
+          try {
+            await ctx.replyWithHTML(walletCopyText(ctx.chat.id, list[0].id), walletCopyMenu(ctx.chat.id, list[0].id));
+          } catch (e) {
+            console.error('[telegramBot] copytrade_reverse reply error:', e.message);
+          }
+          return;
+        }
+        await ctx.answerCbQuery().catch(() => {});
+        try {
+          await ctx.replyWithHTML(buildWalletPickerText('reverse', ctx.chat.id), walletPickerKeyboard('reverse', ctx.chat.id));
+        } catch (e) {
+          console.error('[telegramBot] copytrade_reverse picker reply error:', e.message);
+        }
       } else if (data === 'cmd:copytrade' || data === 'menu:settings') {
         // Back-compat: legacy single-menu button. v0.8.8 M3.9 split
         // this into cmd:copytrade_mirror and cmd:copytrade_reverse.
@@ -875,48 +1094,107 @@ function startSingleBot(token, { onPause: pauseCb, onResume: resumeCb } = {}) {
       } else if (data === 'cmd:wallets' || data === 'cmd:watchlist') {
         await renderScreen(ctx, buildWalletsText(ctx.chat.id), walletsMenu(ctx.chat.id));
       } else if (data.startsWith('wallet:copy:')) {
-        // v0.8.8 (experimental) M3.1b: per-wallet copy config sub-menu.
-        const addr = data.slice('wallet:copy:'.length);
-        const w = walletsDb.getCopyConfig({ chatId: ctx.chat.id, address: addr });
-        if (!w) {
-          await ctx.answerCbQuery('Wallet not found');
-          return;
-        }
+        // v0.8.8 M9: wid in callback (was address — too long for Telegram limit).
+        const wid = Number(data.slice('wallet:copy:'.length));
+        if (!wid) { await ctx.answerCbQuery('Bad wallet id'); return; }
+        const wallet = walletsDb.getById(ctx.chat.id, wid);
+        if (!wallet) { await ctx.answerCbQuery('Wallet not found'); return; }
         await ctx.answerCbQuery();
-        await ctx.replyWithHTML(walletCopyText(ctx.chat.id, addr), walletCopyMenu(ctx.chat.id, addr));
+        await ctx.replyWithHTML(walletCopyText(ctx.chat.id, wid), walletCopyMenu(ctx.chat.id, wid));
       } else if (data.startsWith('wallet:open:')) {
-        // v0.8.8 M7: back button from per-wallet settings → wallet
-        // copy menu. Format: 'wallet:open:<address>'.
-        const addr = data.slice('wallet:open:'.length);
+        // v0.8.8 M9: wid in callback.
+        const wid = Number(data.slice('wallet:open:'.length));
+        if (!wid) { await ctx.answerCbQuery('Bad wallet id'); return; }
         await ctx.answerCbQuery();
-        await ctx.replyWithHTML(walletCopyText(ctx.chat.id, addr), walletCopyMenu(ctx.chat.id, addr));
+        await ctx.replyWithHTML(walletCopyText(ctx.chat.id, wid), walletCopyMenu(ctx.chat.id, wid));
       } else if (data.startsWith('wset:open:')) {
-        // v0.8.8 M7: open the per-wallet settings screen for a wallet.
-        const addr = data.slice('wset:open:'.length);
+        // v0.8.8 M9: wid in callback.
+        const wid = Number(data.slice('wset:open:'.length));
+        if (!wid) { await ctx.answerCbQuery('Bad wallet id'); return; }
         await ctx.answerCbQuery();
-        await wsm.renderWalletSettings(ctx, addr);
+        await wsm.renderWalletSettings(ctx, wid);
       } else if (data.startsWith('wset:')) {
-        // v0.8.8 M7: route all other wset:* callbacks to walletSettingsMenu.
+        // v0.8.8 M9: all wset:* callbacks now carry wid; route to handler.
         const handled = await wsm.handleCallback(ctx, data);
         if (handled) return;
       } else if (data.startsWith('wallet:mode:')) {
-        // v0.8.8 M3.1b: switch this wallet's copy mode. Format:
-        //   wallet:mode:<address>:<reverse|mirror|off>
+        // v0.8.8 M9: format wallet:mode:<wid>:<mode>
         const rest = data.slice('wallet:mode:'.length);
         const lastColon = rest.lastIndexOf(':');
-        if (lastColon < 0) {
-          await ctx.answerCbQuery('Bad request');
-          return;
-        }
-        const addr = rest.slice(0, lastColon);
+        if (lastColon < 0) { await ctx.answerCbQuery('Bad request'); return; }
+        const wid = Number(rest.slice(0, lastColon));
         const mode = rest.slice(lastColon + 1);
-        if (!['off', 'reverse', 'mirror'].includes(mode)) {
-          await ctx.answerCbQuery('Bad mode');
-          return;
+        if (!wid || !['off', 'reverse', 'mirror'].includes(mode)) {
+          await ctx.answerCbQuery('Bad request'); return;
         }
-        walletsDb.setCopyConfig({ chatId: ctx.chat.id, address: addr, copyMode: mode });
+        const wallet = walletsDb.getById(ctx.chat.id, wid);
+        if (!wallet) { await ctx.answerCbQuery('Wallet not found'); return; }
+        walletsDb.setCopyConfig({ chatId: ctx.chat.id, address: wallet.address, copyMode: mode });
         await ctx.answerCbQuery(`Set to ${mode}`);
-        await ctx.replyWithHTML(walletCopyText(ctx.chat.id, addr), walletCopyMenu(ctx.chat.id, addr));
+        await ctx.replyWithHTML(walletCopyText(ctx.chat.id, wid), walletCopyMenu(ctx.chat.id, wid));
+      } else if (data.startsWith('wallet:pick:')) {
+        // v0.8.8 M9: format wallet:pick:<mode>:<wid>
+        const rest = data.slice('wallet:pick:'.length);
+        const lastColon = rest.lastIndexOf(':');
+        if (lastColon < 0) { await ctx.answerCbQuery('Bad request'); return; }
+        const mode = rest.slice(0, lastColon);
+        const wid = Number(rest.slice(lastColon + 1));
+        if (!wid || !['mirror', 'reverse'].includes(mode)) {
+          await ctx.answerCbQuery('Bad request'); return;
+        }
+        const wallet = walletsDb.getById(ctx.chat.id, wid);
+        if (!wallet) { await ctx.answerCbQuery('Wallet not found — re-add it'); return; }
+        if (wallet.copy_mode !== mode) {
+          walletsDb.setCopyConfig({ chatId: ctx.chat.id, address: wallet.address, copyMode: mode });
+        }
+        await ctx.answerCbQuery();
+        await ctx.replyWithHTML(walletCopyText(ctx.chat.id, wid), walletCopyMenu(ctx.chat.id, wid));
+      } else if (data.startsWith('wallet:tp:')) {
+        // v0.8.8 M11: dedicated TP button → set tp_sl_plan TP tier
+        const wid = Number(data.slice('wallet:tp:'.length));
+        if (!wid) { await ctx.answerCbQuery('Bad wallet id'); return; }
+        const wallet = walletsDb.getById(ctx.chat.id, wid);
+        if (!wallet) { await ctx.answerCbQuery('Wallet not found'); return; }
+        wsm.setPending(ctx.chat.id, wallet.address, 'tp_sl_plan', 'edit', wallet.id);
+        await ctx.answerCbQuery();
+        await ctx.reply(
+          '📈 <b>Set Take Profit</b>\n\nSend the TP percentage (e.g. <code>50</code> for +50%).\nSells 100% at TP.',
+          { parse_mode: 'HTML', reply_markup: { force_reply: true, selective: true, input_field_placeholder: 'e.g. 50' } }
+        ).catch(() => {});
+      } else if (data.startsWith('wallet:sl:')) {
+        // v0.8.8 M11: dedicated SL button → set sl_pct directly (separate DB key)
+        const wid = Number(data.slice('wallet:sl:'.length));
+        if (!wid) { await ctx.answerCbQuery('Bad wallet id'); return; }
+        const wallet = walletsDb.getById(ctx.chat.id, wid);
+        if (!wallet) { await ctx.answerCbQuery('Wallet not found'); return; }
+        wsm.setPending(ctx.chat.id, wallet.address, 'sl_pct', 'edit', wallet.id);
+        await ctx.answerCbQuery();
+        await ctx.reply(
+          '📉 <b>Set Stop Loss</b>\n\nSend the SL percentage as a negative number (e.g. <code>-30</code> for -30%).',
+          { parse_mode: 'HTML', reply_markup: { force_reply: true, selective: true, input_field_placeholder: 'e.g. -30' } }
+        ).catch(() => {});
+      } else if (data.startsWith('wallet:trail:')) {
+        const wid = Number(data.slice('wallet:trail:'.length));
+        if (!wid) { await ctx.answerCbQuery('Bad wallet id'); return; }
+        const wallet = walletsDb.getById(ctx.chat.id, wid);
+        if (!wallet) { await ctx.answerCbQuery('Wallet not found'); return; }
+        wsm.setPending(ctx.chat.id, wallet.address, 'trailing_stop', 'edit', wallet.id);
+        await ctx.answerCbQuery();
+        await ctx.reply(
+          '🔄 <b>Set Trailing Stop</b>\n\nSend in format: <code>act:50 trail:10</code>\n(activate at +50%, trail 10% below peak).',
+          { parse_mode: 'HTML', reply_markup: { force_reply: true, selective: true, input_field_placeholder: 'act:50 trail:10' } }
+        ).catch(() => {});
+      } else if (data.startsWith('wallet:time:')) {
+        const wid = Number(data.slice('wallet:time:'.length));
+        if (!wid) { await ctx.answerCbQuery('Bad wallet id'); return; }
+        const wallet = walletsDb.getById(ctx.chat.id, wid);
+        if (!wallet) { await ctx.answerCbQuery('Wallet not found'); return; }
+        wsm.setPending(ctx.chat.id, wallet.address, 'time_sell_plan', 'edit', wallet.id);
+        await ctx.answerCbQuery();
+        await ctx.reply(
+          '⏱ <b>Set Time-based Exit</b>\n\nSend in format: <code>30s:50 60s:100</code>\n(sell 50% after 30s, 100% after 60s).',
+          { parse_mode: 'HTML', reply_markup: { force_reply: true, selective: true, input_field_placeholder: '30s:50 60s:100' } }
+        ).catch(() => {});
       } else if (data === 'cmd:wallet_add') {
         // Enter pending-add mode. Next text message from this chat will be
         // parsed as: <address> [label]. 5-minute TTL.

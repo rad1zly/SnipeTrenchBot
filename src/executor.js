@@ -31,6 +31,7 @@ import { positionsDb, signalsDb, walletsDb } from './db.js';
 // when pump.fun direct swap was added (commit 159a770) — the new module was
 // created but the executor import wasn't updated.
 import { getBuyQuote, getSellQuote, buildSwapTransaction } from './swapRouter.js';
+import { getBondingCurveState } from './pumpfun.js';
 import { effectiveJupiterUrl } from './jupiterMetis.js';
 import notifier from './notifier.js';
 import * as settings from './settings.js';
@@ -114,6 +115,28 @@ function isRecentToken({ dev, mint, maxAgeMs = 24 * 3600 * 1000 }) {
   const m = tokenMintByDev.get(dev)?.get(mint);
   if (!m) return false;
   return Date.now() - m < maxAgeMs;
+}
+
+// v0.8.8 M13: cache creator checks per mint (same mint checked multiple times).
+const _creatorCache = new Map(); // mint → { creator: string, ts: number }
+const _CREATOR_CACHE_TTL_MS = 30_000; // 30s
+
+// Returns true if `dev` is the mint-authority of `mint` (pump.fun token).
+// Uses cached value if fresh. Falls back to on-chain lookup via getBondingCurveState.
+async function isDevTokenCreator(dev, mint) {
+  const now = Date.now();
+  const cached = _creatorCache.get(mint);
+  if (cached && (now - cached.ts) < _CREATOR_CACHE_TTL_MS) {
+    return cached.creator === dev;
+  }
+  try {
+    const state = await getBondingCurveState(mint);
+    const creator = state?.creator;
+    _creatorCache.set(mint, { creator: creator || '', ts: now });
+    return creator === dev;
+  } catch {
+    return false;
+  }
 }
 
 function logStep(label, data) {
@@ -275,48 +298,36 @@ export async function executeSignal(event) {
   const copyRatio = 100;
 
   if (event.type === 'BUY_DETECTED') {
-    if (copyMode === 'mirror') {
-      // v0.8.8 (experimental) M5: trader_buy_limit_min/max filter.
-      // Only mirror-buy if target's solSpent falls within configured range.
-      // Default null/0 = no filter (backward compat with pre-M5 installs).
-      // v0.8.8 M7: per-wallet override available via wallet_settings.
-      const buyMin = settings.getForWallet('trader_buy_limit_min', chatId, dev);
-      const buyMax = settings.getForWallet('trader_buy_limit_max', chatId, dev);
-      const targetSol = event.solSpent;
-      if (targetSol != null && targetSol > 0) {
-        if (buyMin != null && targetSol < buyMin) {
-          logStep('SIGNAL_IGNORED', {
-            dev, mint, type: 'BUY_DETECTED',
-            reason: `below trader_buy_limit_min (target ${targetSol} SOL < min ${buyMin} SOL)`,
-          });
-          return;
-        }
-        if (buyMax != null && targetSol > buyMax) {
-          logStep('SIGNAL_IGNORED', {
-            dev, mint, type: 'BUY_DETECTED',
-            reason: `above trader_buy_limit_max (target ${targetSol} SOL > max ${buyMax} SOL)`,
-          });
-          return;
-        }
-      }
-      // v0.8.8 M3.1b: mirror mode — fall through to the same BUY
-      // execution path used by reverse-copy's SELL_DETECTED branch,
-      // but flag the trigger type in the log.
-      logStep('SIGNAL_ACCEPTED', {
-        dev, mint,
-        mode: 'MIRROR_BUY',
-        copyMode,
-        copyRatio,
-      });
-      return _executeBuy(event, { copyMode, copyRatio });
+    if (copyMode !== 'mirror') {
+      // reverse/off: BUY_DETECTED doesn't trigger.
+      logStep('SIGNAL_IGNORED', { dev, mint, type: 'BUY_DETECTED', reason: `copy_mode=${copyMode} — only mirror buys are followed` });
+      return;
     }
-    // 'off' or 'reverse': BUY_DETECTED is logged but doesn't trade.
-    logStep('SIGNAL_IGNORED', {
-      dev, mint,
-      type: 'BUY_DETECTED',
-      reason: `wallet.copy_mode=${copyMode} — only ${copyMode === 'reverse' ? 'SELL_DETECTED' : 'nothing'} triggers a trade`,
-    });
-    return;
+    // v0.8.8 M13: dev_only per-wallet toggle — if enabled, only act if dev is token creator.
+    const devOnlyBuy = settings.getForWallet('dev_only', chatId, dev) === true;
+    if (devOnlyBuy) {
+      const isCreator = await isDevTokenCreator(dev, mint);
+      if (!isCreator) {
+        logStep('SIGNAL_IGNORED', { dev, mint, type: 'BUY_DETECTED', reason: 'dev_only: dev is not token creator — ignored' });
+        return;
+      }
+    }
+    // v0.8.8 M5: trader_buy_limit_min/max filter for mirror mode.
+    const buyMin = settings.getForWallet('trader_buy_limit_min', chatId, dev);
+    const buyMax = settings.getForWallet('trader_buy_limit_max', chatId, dev);
+    const targetSol = event.solSpent;
+    if (targetSol != null && targetSol > 0) {
+      if (buyMin != null && targetSol < buyMin) {
+        logStep('SIGNAL_IGNORED', { dev, mint, type: 'BUY_DETECTED', reason: `below trader_buy_limit_min (target ${targetSol} SOL < min ${buyMin} SOL)` });
+        return;
+      }
+      if (buyMax != null && targetSol > buyMax) {
+        logStep('SIGNAL_IGNORED', { dev, mint, type: 'BUY_DETECTED', reason: `above trader_buy_limit_max (target ${targetSol} SOL > max ${buyMax} SOL)` });
+        return;
+      }
+    }
+    logStep('SIGNAL_ACCEPTED', { dev, mint, mode: 'MIRROR_BUY', copyMode, copyRatio });
+    return _executeBuy(event, { copyMode, copyRatio });
   }
   if (event.type !== 'SELL_DETECTED') return;
 
@@ -325,14 +336,24 @@ export async function executeSignal(event) {
   // mode is 'reverse' (default) or 'mirror' (SELL_DETECTED is
   // informational in mirror mode but doesn't fire a buy — mirror mode
   // only buys on BUY_DETECTED, see above).
+  // v0.8.8 M13: dev_reverse = reverse but only if dev is mint creator.
   if (copyMode === 'off') {
     logStep('SIGNAL_IGNORED', { dev, mint, type: 'SELL_DETECTED', reason: 'wallet.copy_mode=off' });
     return;
   }
-  if (copyMode === 'mirror') {
-    // Mirror mode: dev SELL is informational only.
-    logStep('SIGNAL_IGNORED', { dev, mint, type: 'SELL_DETECTED', reason: 'wallet.copy_mode=mirror — only BUY_DETECTED triggers' });
+  if (copyMode === 'mirror' || copyMode === 'dev_mirror') {
+    // Mirror/dev_mirror mode: dev SELL is informational only.
+    logStep('SIGNAL_IGNORED', { dev, mint, type: 'SELL_DETECTED', reason: `wallet.copy_mode=${copyMode} — only BUY triggers` });
     return;
+  }
+  // v0.8.8 M13: dev_only per-wallet toggle — if enabled, only act if dev is token creator.
+  const devOnly = settings.getForWallet('dev_only', chatId, dev) === true;
+  if (devOnly) {
+    const isCreator = await isDevTokenCreator(dev, mint);
+    if (!isCreator) {
+      logStep('SIGNAL_IGNORED', { dev, mint, type: 'SELL_DETECTED', reason: 'dev_only: dev is not token creator — ignored' });
+      return;
+    }
   }
   // v0.8.8 (experimental) M5: trader_sell_limit_min/max filter (reverse mode).
   // Only counter-buy if target's solReceived falls within configured range.
@@ -359,6 +380,7 @@ export async function executeSignal(event) {
   }
   logStep('SIGNAL_ACCEPTED', { dev, mint, mode: 'COUNTER_BUY', copyMode, copyRatio });
 
+  // v0.8.8 M12: no pre-trade notification — trade executes immediately after filters.
   return _executeBuy(event, { copyMode, copyRatio });
 }
 

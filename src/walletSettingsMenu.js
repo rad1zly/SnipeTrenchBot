@@ -25,17 +25,26 @@
 // =============================================================================
 
 import { Markup } from 'telegraf';
+import { walletsDb } from './db.js';  // v0.8.8 M9: for getById lookup
 import {
-  getCatalogEntry, get, getForWallet, setForWallet, resetForWallet,
+  getCatalogEntry, get, getForWallet, setForWallet, getForWalletById, setForWalletById, resetForWallet,
   listWalletOverrides,
 } from './settings.js';
 
-// Trade-decision keys that can be overridden per-wallet. Keep this list
+// v0.8.8 M10: per-wallet keys shown inline in the wallet copy-menu.
+// Just pump_slippage_bps — other settings stay global.
+// v0.8.8 M12: QUICK_KEYS unused — per-wallet settings are inline in walletCopyMenu.
+const QUICK_KEYS = [];
+
+// Full trade-decision keys that can be overridden per-wallet. Keep this list
 // in sync with what's actually used in executor.js / filters.js / safety.js.
-// Network-level keys (buy_priority_fee_sol, jito_*, _pause) are NOT here.
+// Network-level keys (jito_*, _pause) are NOT here.
+// buy_priority_fee_sol IS per-wallet (v0.8.8 M12).
 const PER_WALLET_KEYS = [
   // Trade sizing & filters
+  'dev_only',
   'fixed_buy_sol',
+  'buy_priority_fee_sol',
   'trader_sell_limit_min',
   'trader_sell_limit_max',
   'trader_buy_limit_min',
@@ -44,8 +53,6 @@ const PER_WALLET_KEYS = [
   'no_duplicate_buys',
   // Slippage
   'slippage_bps',
-  'pump_slippage_bps',
-  'pump_sell_slippage_bps',
   // Exit engine
   'hold_ms',
   'auto_sell',
@@ -63,15 +70,18 @@ const PER_WALLET_KEYS = [
 ];
 
 /**
- * In-memory map of pending edits. Key: `wset:pending:<chatId>:<address>`
- * Value: { chatId, address, key, mode: 'edit'|'reset' }
+ * In-memory map of pending edits. Key: `wset:pending:<chatId>:<wid>`
+ * Value: { chatId, wid, address, key, action: 'edit' }
+ * address is stored for use in setForWallet after value is received.
  * Cleared after the user sends the new value (or the timeout).
  */
 const PENDING = new Map();
 
-function pendingKey(chatId, address) {
-  return `${chatId}:${address}`;
+// v0.8.8 M11: exported so telegramBot.js can set pending for dedicated TP/SL/Trail/Time buttons.
+export function setPending(chatId, address, key, action = 'edit', wid = null) {
+  PENDING.set(`${chatId}:${wid ?? address}`, { chatId, wid, address, key, action });
 }
+
 
 // -----------------------------------------------------------------------------
 // Render
@@ -82,9 +92,14 @@ function pendingKey(chatId, address) {
  * list of trade-decision keys with their effective value (per-wallet
  * override if set, otherwise global). An emoji flag indicates whether
  * the row is using an override (🟢) or the global value (⚪).
+ *
+ * v0.8.8 M9: wid (integer row-id) replaces address string in all callbacks.
+ * address is resolved here for DB lookups and display only.
  */
-function buildWalletSettingsText(chatId, address) {
-  const wid = require_db('resolve wid');
+function buildWalletSettingsText(chatId, wid) {
+  const wallet = require_db_wallet(chatId, wid);
+  if (!wallet) return 'Wallet not found.';
+  const address = wallet.address;
   const overrides = listWalletOverrides(chatId, address);
   const overrideKeys = new Set(overrides.map(o => o.key));
 
@@ -131,8 +146,14 @@ function buildWalletSettingsText(chatId, address) {
  * Build the inline keyboard. Each key gets its own row with "Edit" and
  * "Reset" buttons (Reset only if an override is set). Footer: Back to
  * wallet menu.
+ *
+ * v0.8.8 M9: uses wid (integer) in all callbacks to stay under
+ * Telegram's 64-byte inline-button limit.
  */
-function buildWalletSettingsKeyboard(chatId, address) {
+function buildWalletSettingsKeyboard(chatId, wid) {
+  const wallet = require_db_wallet(chatId, wid);
+  if (!wallet) return Markup.inlineKeyboard([[Markup.button.callback('« Back', 'cmd:wallets')]]);
+  const address = wallet.address;
   const buttons = [];
   const overrides = listWalletOverrides(chatId, address);
   const overrideKeys = new Set(overrides.map(o => o.key));
@@ -141,17 +162,17 @@ function buildWalletSettingsKeyboard(chatId, address) {
     if (!setting) continue;
     const row = [];
     if (setting.type === 'bool') {
-      row.push(Markup.button.callback(`${setting.label} (toggle)`, `wset:toggle:${address}:${key}`));
+      row.push(Markup.button.callback(`${setting.label} (toggle)`, `wset:toggle:${wid}:${key}`));
     } else {
-      row.push(Markup.button.callback(`✏️ ${setting.label}`, `wset:edit:${address}:${key}`));
+      row.push(Markup.button.callback(`✏️ ${setting.label}`, `wset:edit:${wid}:${key}`));
     }
     if (overrideKeys.has(key)) {
-      row.push(Markup.button.callback(`↩ Reset`, `wset:reset:${address}:${key}`));
+      row.push(Markup.button.callback(`↩ Reset`, `wset:reset:${wid}:${key}`));
     }
     buttons.push(row);
   }
   buttons.push([
-    Markup.button.callback('« Wallet menu', `wallet:open:${address}`),
+    Markup.button.callback('« Wallet menu', `wallet:open:${wid}`),
     Markup.button.callback('« Wallets list', 'cmd:wallets'),
   ]);
   return Markup.inlineKeyboard(buttons);
@@ -163,17 +184,16 @@ function buildWalletSettingsKeyboard(chatId, address) {
 
 /**
  * Render the per-wallet settings screen for a watched wallet.
- * Called from telegramBot.js when user taps "⚙️ Per-wallet settings"
- * in the walletCopyMenu.
+ * v0.8.8 M9: accepts wid (integer row-id) instead of address string.
  */
-export async function renderWalletSettings(ctx, address) {
+export async function renderWalletSettings(ctx, wid) {
   const chatId = ctx.chat?.id;
   if (chatId == null) {
     await ctx.answerCbQuery('No chat context');
     return;
   }
-  const text = buildWalletSettingsText(chatId, address);
-  const kb = buildWalletSettingsKeyboard(chatId, address);
+  const text = buildWalletSettingsText(chatId, wid);
+  const kb = buildWalletSettingsKeyboard(chatId, wid);
   try {
     await ctx.editMessageText(text, {
       parse_mode: 'HTML',
@@ -203,19 +223,37 @@ export async function handleCallback(ctx, data) {
     await ctx.answerCbQuery('No chat context');
     return true;
   }
-  // wset:ACTION:ADDRESS:KEY
-  // (address is base58, no colons; key can have colons? — current keys
-  // don't, so split into 4 parts is safe. Defensively allow more parts.)
+  // v0.8.8 M9: wset:ACTION:WID[:KEY]  (wid is integer row-id)
+  // KEY is optional (e.g. cancel action doesn't need it)
   const rest = data.slice('wset:'.length);
   const parts = rest.split(':');
   const action = parts[0];
-  const address = parts[1];
+  const wid = Number(parts[1]);
   const key = parts.slice(2).join(':');
 
-  if (!address || !key) {
+  if (!wid || isNaN(wid)) {
     await ctx.answerCbQuery('Bad callback');
     return true;
   }
+
+  // Cancel: no key needed
+  if (action === 'cancel') {
+    PENDING.delete(`${chatId}:${wid}`);
+    await ctx.answerCbQuery('Cancelled');
+    await ctx.reply('↩ Cancelled.').catch(() => {});
+    return true;
+  }
+
+  if (!key) {
+    await ctx.answerCbQuery('Bad callback');
+    return true;
+  }
+  const wallet = require_db_wallet(chatId, wid);
+  if (!wallet) {
+    await ctx.answerCbQuery('Wallet not found');
+    return true;
+  }
+  const address = wallet.address;
   const setting = getCatalogEntry(key);
   if (!setting) {
     await ctx.answerCbQuery('Unknown setting');
@@ -231,7 +269,6 @@ export async function handleCallback(ctx, data) {
       await ctx.answerCbQuery('Not a toggle');
       return true;
     }
-    // Flip current effective value
     const current = getForWallet(key, chatId, address);
     const newVal = !current;
     try {
@@ -241,12 +278,11 @@ export async function handleCallback(ctx, data) {
       return true;
     }
     await ctx.answerCbQuery(`${setting.label}: ${newVal ? 'ON' : 'OFF'}`);
-    await renderWalletSettings(ctx, address);
+    await renderWalletSettings(ctx, wid);
     return true;
   }
 
   if (action === 'edit') {
-    // Prompt for new value
     const current = getForWallet(key, chatId, address);
     const globalVal = get(key, chatId);
     const unit = setting.unit ? ` (${setting.unit})` : '';
@@ -263,23 +299,22 @@ export async function handleCallback(ctx, data) {
       `<b>Send the new value</b> as a reply to this message. Send /cancel to abort.`,
       '',
       setting.label === 'TP/SL Plan'
-        ? 'Format: <code>tp1:50/30 tp2:100/40 sl:-40/100</code>  (tp_pct/sell_pct, sl_pct/sl_sell_pct)'
+        ? 'Format: <code>tp:50</code> or <code>tp:50 sl:-30</code>  (takes profit at 50%, stop loss at -30%)'
         : setting.label === 'Trailing Stop'
-        ? 'Format: <code>act:50 trail:-10</code>  (activate_at_pct, trail_pct)'
-        : setting.label === 'Time Sell Plan'
-        ? 'Format: <code>5m:50 30m:100</code>  (time_sold_pct)'
+        ? 'Format: <code>act:50 trail:10</code>  (activate at 50%, trail 10%)'
+        : setting.label === 'Time-based Exit'
+        ? 'Format: <code>30s:50 60s:100</code>  (sell 50% after 30s, 100% after 60s)'
         : setting.min != null && setting.max != null
         ? `Range: ${setting.min} — ${setting.max}${unit}`
         : '',
     ].join('\n');
-    // Store pending state
-    PENDING.set(pendingKey(chatId, address), { chatId, address, key, action: 'edit' });
+    PENDING.set(`${chatId}:${wid ?? address}`, { chatId, wid, address, key, action: 'edit' });
     try {
       await ctx.editMessageText(promptText, {
         parse_mode: 'HTML',
         disable_web_page_preview: true,
         ...Markup.inlineKeyboard([
-          [Markup.button.callback('↩ Cancel', `wset:cancel:${address}`)],
+          [Markup.button.callback('↩ Cancel', `wset:cancel:${wid}`)],
         ]),
       });
     } catch (err) {
@@ -299,13 +334,13 @@ export async function handleCallback(ctx, data) {
     } catch (e) {
       await ctx.answerCbQuery(`Reset failed: ${e.message}`);
     }
-    await renderWalletSettings(ctx, address);
+    await renderWalletSettings(ctx, wid);
     return true;
   }
 
   if (action === 'cancel') {
-    PENDING.delete(pendingKey(chatId, address));
-    await renderWalletSettings(ctx, address);
+    PENDING.delete(`${chatId}:${wid ?? address}`);
+    await renderWalletSettings(ctx, wid);
     return true;
   }
 
@@ -347,7 +382,33 @@ export async function handlePendingText(ctx) {
   // Parse the value. Use the catalog's parseUserInput if available,
   // else coerce by type.
   let value = text;
-  if (setting.parseUserInput) {
+
+  // v0.8.8 M11: tp_sl_plan shortcut — plain positive number = TP tier.
+  if (found.key === 'tp_sl_plan') {
+    const n = parseFloat(text);
+    if (!isNaN(n) && String(n) === text.trim() && n > 0) {
+      // Read existing tp_sl_plan — also pull sl_pct from standalone field so
+      // we don't lose it if user set SL via the dedicated SL button first.
+      let existing = {};
+      try { existing = JSON.parse(getForWalletById('tp_sl_plan', found.wid) || '{}'); } catch {}
+      const tiers = existing.tiers || [];
+      if (tiers.length === 0) tiers.push({ tp_pct: n, sell_pct: 100 });
+      else { tiers[0] = { tp_pct: n, sell_pct: 100 }; }
+      // Preserve sl_pct from standalone field if set (don't regress to old tp_sl_plan.sl_pct)
+      const standaloneSl = getForWalletById('sl_pct', found.wid);
+      const sl_pct = standaloneSl != null ? standaloneSl : existing.sl_pct;
+      const sl_sell_pct = existing.sl_sell_pct || 100;
+      value = JSON.stringify({ tiers, sl_pct, sl_sell_pct });
+    } else {
+      // Fall through to parseUserInput for full "tp:50 sl:-30" syntax
+      const parsed = setting.parseUserInput(text);
+      if (parsed == null) {
+        await ctx.reply('❌ Invalid. Send a positive number for TP (e.g. <code>50</code> for +50%).');
+        return true;
+      }
+      value = parsed;
+    }
+  } else if (setting.parseUserInput) {
     const parsed = setting.parseUserInput(text);
     if (parsed == null) {
       await ctx.reply(
@@ -374,15 +435,48 @@ export async function handlePendingText(ctx) {
     value = String(text);
   }
 
+  // Resolve wallet: prefer wid (row-id), fall back to address lookup
+  let wallet = null;
+  if (found.wid != null) {
+    wallet = walletsDb.getById(found.chatId, found.wid);
+  }
+  if (!wallet && found.address) {
+    wallet = walletsDb.getById(found.chatId, found.address);
+  }
+  if (!wallet) {
+    PENDING.delete(found.key);
+    await ctx.reply('❌ Wallet not found. Please try editing the setting again.');
+    return true;
+  }
+  // Resolve wid if not in PENDING (e.g. legacy entry from before wid was stored)
+  let saveWid = found.wid;
+  if (saveWid == null && wallet) {
+    const resolved = walletsDb.getById(found.chatId, wallet.id);
+    if (resolved) saveWid = resolved.id;
+  }
   try {
-    setForWallet(found.key, value, found.chatId, found.address);
+    if (saveWid != null) {
+      setForWalletById(found.key, value, saveWid);
+    } else {
+      // Fall back to address-based set (uses resolveWatchedWalletId internally)
+      setForWallet(found.key, value, found.chatId, found.address);
+    }
   } catch (e) {
     await ctx.reply(`❌ Save failed: ${e.message}`);
     return true;
   }
+  // v0.8.8 M13: sync sl_pct into tp_sl_plan so the TP handler doesn't regress it.
+  if (found.key === 'sl_pct' && value != null) {
+    let existing = {};
+    try { existing = JSON.parse(getForWalletById('tp_sl_plan', saveWid) || '{}'); } catch {}
+    const sl_sell_pct = existing.sl_sell_pct || 100;
+    const merged = { ...existing, sl_pct: value, sl_sell_pct };
+    setForWalletById('tp_sl_plan', JSON.stringify(merged), saveWid);
+  }
   PENDING.delete(found.key);
+  const shortAddr = (found.address || '').slice(0, 4) + '…' + (found.address || '').slice(-4);
   await ctx.reply(
-    `✅ ${setting.label} = <b>${setting.formatValue ? setting.formatValue(value) : value}</b>  (override for <code>${found.address.slice(0, 4)}…${found.address.slice(-4)}</code>)`,
+    `✅ ${setting.label} = <b>${setting.formatValue ? setting.formatValue(value) : value}</b>  (override for <code>${shortAddr}</code>)`,
     { parse_mode: 'HTML' }
   );
   // Re-render the wallet settings menu (in the chat where they came from)
@@ -396,13 +490,22 @@ export async function handlePendingText(ctx) {
 // -----------------------------------------------------------------------------
 
 /**
- * Marker export so the require import above doesn't get tree-shaken in
- * test harnesses. Not used at runtime.
+ * Resolve a wallet row from its integer row-id.
+ * Returns null if not found or not owned by this chat — callers should
+ * handle that as "wallet not found".
+ * v0.8.8 M9: replaces the old require_db stub.
  */
-function require_db(label) {
-  // Used to ensure the resolver runs and throws if user isn't watching
-  // the wallet. Throw a synthetic error if address is bad.
-  return null;
+function require_db_wallet(chatId, wid) {
+  return walletsDb.getById(chatId, wid);
 }
 
-export { PER_WALLET_KEYS };
+export {
+  PER_WALLET_KEYS,
+  QUICK_KEYS,
+  getCatalogEntry,
+  get,
+  getForWallet,
+  setForWallet,
+  resetForWallet,
+  listWalletOverrides,
+};
