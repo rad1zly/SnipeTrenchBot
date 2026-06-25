@@ -663,12 +663,16 @@ export async function buildSwapTransaction({ quoteResponse, userPublicKey, side,
   //   → microLamports = priority_fee_sol × 1e6 / CU
   // Default CU = 250_000. We pin the CU for the math to be exact.
   // Fall back to 0 (no priority) if no setting is provided.
+  // v0.8.8 (experimental) M16: use sell_priority_fee_sol for SELL side.
+  // Previously reused buy_priority_fee_sol for both buy and sell sides.
   const COMPUTE_UNITS = 250_000;
   const pfSolLamports = (() => {
     if (chatId == null) return 0;
     try {
-      const v = settings.get('buy_priority_fee_sol', chatId);
-      return Math.floor(Number(v) * 1e9);
+      // SELL side → sell_priority_fee_sol; BUY side → buy_priority_fee_sol
+      const key = side === 'sell' ? 'sell_priority_fee_sol' : 'buy_priority_fee_sol';
+      const v = settings.get(key, chatId);
+      return Math.floor(Number(v || 0) * 1e9);
     } catch {
       return 0;
     }
