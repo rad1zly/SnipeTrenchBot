@@ -112,6 +112,21 @@ const CATALOG = [
       return n;
     },
   },
+  {
+    // v0.8.8 (experimental) M14: sell priority fee — separate from buy priority fee.
+    // Previously buildAmmSwapTransaction (SELL path) reused buy_priority_fee_sol.
+    key: 'sell_priority_fee_sol', type: 'number', category: 'trade', mode: 'both',
+    label: 'Sell Priority Fee',
+    default: 0.0,
+    min: 0,             // no upper bound
+    parseUserInput: (t) => {
+      const s = t.trim().toLowerCase();
+      if (['none', 'unlimited', 'off', '0', ''].includes(s)) return 0;
+      const n = parseFloat(t);
+      if (Number.isNaN(n) || n < 0) return null;
+      return n;
+    },
+  },
   // Jito tip entries REMOVED in v0.8.8 (experimental) M1.20. Jito tip is now
   // a fixed admin config (env: JITO_BUY_TIP_SOL / JITO_SELL_TIP_SOL) in
   // config.js — not a per-user setting. Reference bot ships with a fixed

@@ -936,10 +936,10 @@ export async function buildAmmSwapTransaction({ quoteResponse, userPublicKey, ch
   const mint = new PublicKey(mintStr);
   const minSolOutput = quoteResponse._minSolOutput;
   const tokenAmount = quoteResponse.inAmount;
-  // v0.8.7.16: per-user priority fee. Use buy_priority_fee_sol as a
-  // baseline for SELL too (AMM is sell-only in M6.2 step 2).
+  // v0.8.8 (experimental) M14: sell priority fee is SEPARATE from buy priority fee.
+  // Previously reused buy_priority_fee_sol for SELL. Now uses sell_priority_fee_sol.
   const priorityFeeSol = chatId != null
-    ? settings.get('buy_priority_fee_sol', chatId)
+    ? settings.get('sell_priority_fee_sol', chatId)
     : 0.00001;
   const lamports = await conn.getMinimumBalanceForRentExemption(165);
   const mainIx = await buildAmmSellInstruction({

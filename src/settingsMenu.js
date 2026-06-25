@@ -48,6 +48,7 @@ const PAIR_GROUPS = [
   ['max_mc_usd',           'min_mc_usd'],
   ['max_token_age_min',    'min_token_age_min'],
   ['buy_priority_fee_sol', 'jito_buy_tip_sol'],
+  ['sell_priority_fee_sol'],
   ['slippage_bps',         'pump_slippage_bps'],
   ['jito_sell_tip_sol',    'pump_sell_slippage_bps'],
   ['unrenounced_only',     'unburned_only'],

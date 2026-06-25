@@ -45,6 +45,7 @@ const PER_WALLET_KEYS = [
   'dev_only',
   'fixed_buy_sol',
   'buy_priority_fee_sol',
+  'sell_priority_fee_sol',
   'trader_sell_limit_min',
   'trader_sell_limit_max',
   'trader_buy_limit_min',
