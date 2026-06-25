@@ -403,29 +403,29 @@ const CATALOG = [
     formatValue: (v) => (v == null ? '—' : `${v.toLocaleString()} USD`),
   },
   {
-    key: 'min_token_age_min', type: 'number', nullable: true,  // v0.8.0: '0'/'none' sets to null (disabled)
+    key: 'min_token_age_min', type: 'number', nullable: true,
     category: 'filters', mode: 'both',
-    label: 'Min Token Age',  // v0.8.0: unit changed to seconds
+    label: 'Min Token Age (s)',
     default: null,
-    min: 0,        // no upper bound
+    min: 0,
     parseUserInput: (t) => {
       const s = t.trim().toLowerCase();
       if (['none', 'unlimited', 'off', '0', ''].includes(s)) return null;
-      const n = parseInt(t, 10);
+      const n = parseFloat(t);
       if (Number.isNaN(n) || n < 0) return null;
       return n;
     },
   },
   {
-    key: 'max_token_age_min', type: 'number', nullable: true,  // v0.8.0: '0'/'none' sets to null (disabled)
+    key: 'max_token_age_min', type: 'number', nullable: true,
     category: 'filters', mode: 'both',
-    label: 'Max Token Age',  // v0.8.0: unit changed to seconds
+    label: 'Max Token Age (s)',
     default: null,
-    min: 0,        // no upper bound
+    min: 0,
     parseUserInput: (t) => {
       const s = t.trim().toLowerCase();
       if (['none', 'unlimited', 'off', '0', ''].includes(s)) return null;
-      const n = parseInt(t, 10);
+      const n = parseFloat(t);
       if (Number.isNaN(n) || n < 0) return null;
       return n;
     },

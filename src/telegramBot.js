@@ -450,13 +450,13 @@ function walletCopyMenu(chatId, wid) {
   const holdEntry = wsm.getCatalogEntry('hold_ms');
   const holdFmt = holdEntry?.formatValue ? holdEntry.formatValue(holdRaw) : (holdRaw ?? '—');
   rows.push([
-    Markup.button.callback(`${flag('min_token_age_min')} Min Age: ${wsm.getForWallet('min_token_age_min', chatId, address) ?? '—'}m`, `wset:edit:${wid}:min_token_age_min`),
+    Markup.button.callback(`${flag('min_token_age_min')} Min Age: ${wsm.getForWallet('min_token_age_min', chatId, address) ?? '—'}s`, `wset:edit:${wid}:min_token_age_min`),
     Markup.button.callback(`${flag('hold_ms')} Hold: ${holdFmt}`, `wset:edit:${wid}:hold_ms`),
   ]);
 
   // ── Row 7: Max Token Age
   rows.push([
-    Markup.button.callback(`${flag('max_token_age_min')} Max Age: ${wsm.getForWallet('max_token_age_min', chatId, address) ?? '—'}m`, `wset:edit:${wid}:max_token_age_min`),
+    Markup.button.callback(`${flag('max_token_age_min')} Max Age: ${wsm.getForWallet('max_token_age_min', chatId, address) ?? '—'}s`, `wset:edit:${wid}:max_token_age_min`),
   ]);
 
   // ── Row 8: No dup
