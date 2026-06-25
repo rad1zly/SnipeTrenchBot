@@ -424,11 +424,19 @@ function walletCopyMenu(chatId, wid) {
     ]);
   }
 
-  // ── Row 5: Fixed buy + Priority fee + Slippage
+  // ── Row 5: Fixed buy + Priority fee + Sell fee
   rows.push([
     Markup.button.callback(`${flag('fixed_buy_sol')} Buy SOL: ${wsm.getForWallet('fixed_buy_sol', chatId, address) ?? '—'} SOL`, `wset:edit:${wid}:fixed_buy_sol`),
     Markup.button.callback(`${flag('buy_priority_fee_sol')} Prio Fee: ${wsm.getForWallet('buy_priority_fee_sol', chatId, address) ?? '—'} SOL`, `wset:edit:${wid}:buy_priority_fee_sol`),
+    Markup.button.callback(`${flag('sell_priority_fee_sol')} Sell Fee: ${wsm.getForWallet('sell_priority_fee_sol', chatId, address) ?? '—'} SOL`, `wset:edit:${wid}:sell_priority_fee_sol`),
+  ]);
+
+  // ── Row 5b: Slippage (buy + sell)
+  const sellSlipRaw = wsm.getForWallet('pump_sell_slippage_bps', chatId, address);
+  const sellSlipFmt = sellSlipRaw != null ? `${(sellSlipRaw / 100).toFixed(1)}%` : '—';
+  rows.push([
     Markup.button.callback(`${flag('slippage_bps')} Slip: ${slipFmt}`, `wset:edit:${wid}:slippage_bps`),
+    Markup.button.callback(`${flag('pump_sell_slippage_bps')} SellSlip: ${sellSlipFmt}`, `wset:edit:${wid}:pump_sell_slippage_bps`),
   ]);
 
   // ── Row 6: MC filters
@@ -446,12 +454,17 @@ function walletCopyMenu(chatId, wid) {
     Markup.button.callback(`${flag('hold_ms')} Hold: ${holdFmt}`, `wset:edit:${wid}:hold_ms`),
   ]);
 
-  // ── Row 7: No dup
+  // ── Row 7: Max Token Age
+  rows.push([
+    Markup.button.callback(`${flag('max_token_age_min')} Max Age: ${wsm.getForWallet('max_token_age_min', chatId, address) ?? '—'}m`, `wset:edit:${wid}:max_token_age_min`),
+  ]);
+
+  // ── Row 8: No dup
   rows.push([
     Markup.button.callback(`${flag('no_duplicate_buys')} No Dup: ${wsm.getForWallet('no_duplicate_buys', chatId, address) ? '✓' : '—'}`, `wset:edit:${wid}:no_duplicate_buys`),
   ]);
 
-  // ── Row 8: Back
+  // ── Row 9: Back
   rows.push([Markup.button.callback('« Back to Wallets', 'cmd:wallets')]);
 
   return Markup.inlineKeyboard(rows);
