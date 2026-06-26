@@ -439,6 +439,14 @@ function walletCopyMenu(chatId, wid) {
     Markup.button.callback(`${flag('pump_sell_slippage_bps')} SellSlip: ${sellSlipFmt}`, `wset:edit:${wid}:pump_sell_slippage_bps`),
   ]);
 
+  // ── Row 5c: Jito tips (per-wallet, v0.8.8 M18)
+  const jitoBuyTip  = wsm.getForWallet('jito_buy_tip_sol',  chatId, address);
+  const jitoSellTip = wsm.getForWallet('jito_sell_tip_sol', chatId, address);
+  rows.push([
+    Markup.button.callback(`${flag('jito_buy_tip_sol')} Jito Buy: ${jitoBuyTip  != null ? jitoBuyTip  + ' SOL' : '—'}`, `wset:edit:${wid}:jito_buy_tip_sol`),
+    Markup.button.callback(`${flag('jito_sell_tip_sol')} Jito Sell: ${jitoSellTip != null ? jitoSellTip + ' SOL' : '—'}`, `wset:edit:${wid}:jito_sell_tip_sol`),
+  ]);
+
   // ── Row 6: MC filters
   rows.push([
     Markup.button.callback(`${flag('min_mc_usd')} Min MC: ${(wsm.getCatalogEntry('min_mc_usd')?.formatValue?.(wsm.getForWallet('min_mc_usd', chatId, address)) ?? '—')}`, `wset:edit:${wid}:min_mc_usd`),
