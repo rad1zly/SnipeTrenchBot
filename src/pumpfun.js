@@ -720,9 +720,8 @@ export async function buildSwapTransaction({ quoteResponse, userPublicKey, side,
   // sends a SOL transfer from the user to a Jito tip account. Picks a
   // different tip account each call to spread across Jito's 3 verified
   // active accounts.
-  // v0.8.8 (experimental) M1.20: Jito tip is now a fixed admin config, not
-  // a per-user setting. The chatId argument is still accepted for
-  // back-compat with the old API but is no longer used.
+  // v0.8.8 M18: Jito tip is now a per-user per-wallet setting
+  // (jito_buy_tip_sol / jito_sell_tip_sol). chatId is required.
   if (chatId != null) {
     try {
       const { appendTipIfEnabled } = await import('./jitoTip.js');
