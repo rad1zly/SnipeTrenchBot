@@ -536,7 +536,7 @@ function classifyTx(tx, wallet) {
       solReceived: sell.solReceived,
       tokenSent: sell.tokenSent,
       signature: tx.signature,
-      timestamp: tx.timestamp || Math.floor(Date.now() / 1000),
+      timestamp: tx.timestamp ? tx.timestamp * 1000 : Date.now(),
     };
   }
   // TOKEN_CREATED: pump.fun source + wallet is fee payer + creates new mint
@@ -548,7 +548,8 @@ function classifyTx(tx, wallet) {
         wallet,
         mint: mintCreate.mint,
         signature: tx.signature,
-        timestamp: tx.timestamp || Math.floor(Date.now() / 1000),
+        // v0.8.8 M18: fall back to ms (Date.now()), NOT seconds — matches heliusMonitor.js
+        timestamp: tx.timestamp ? tx.timestamp * 1000 : Date.now(),
       };
     }
   }
@@ -562,7 +563,7 @@ function classifyTx(tx, wallet) {
       solSpent: buy.solSpent,
       tokenReceived: buy.tokenReceived,
       signature: tx.signature,
-      timestamp: tx.timestamp || Math.floor(Date.now() / 1000),
+      timestamp: tx.timestamp ? tx.timestamp * 1000 : Date.now(),
     };
   }
   return null;

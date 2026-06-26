@@ -46,6 +46,8 @@ const PER_WALLET_KEYS = [
   'fixed_buy_sol',
   'buy_priority_fee_sol',
   'sell_priority_fee_sol',
+  'jito_buy_tip_sol',
+  'jito_sell_tip_sol',
   'trader_sell_limit_min',
   'trader_sell_limit_max',
   'trader_buy_limit_min',

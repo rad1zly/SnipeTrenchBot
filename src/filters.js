@@ -203,7 +203,15 @@ async function checkMarketCap(mint, chatId) {
 function checkTokenAge({ createdAt }, chatId) {
   const minSec = settings.get('min_token_age_min', chatId);
   const maxSec = settings.get('max_token_age_min', chatId);
-  if (!createdAt) return { passed: true, reason: 'no createdAt, skipping age check' };
+  // v0.8.8 M18: if createdAt is unknown AND a max age is set, fail-closed
+  // (block the trade) — we cannot verify the token's age. Only skip if neither
+  // min nor max age is configured (backward compat).
+  if (!createdAt) {
+    if (maxSec !== null || minSec !== null) {
+      return { passed: false, reason: 'no createdAt record — cannot verify token age, blocking for safety' };
+    }
+    return { passed: true, reason: 'no createdAt, skipping age check (no limits set)' };
+  }
   const ageSec = (Date.now() - createdAt) / 1000;
   if (minSec !== null && ageSec < minSec) {
     return { passed: false, reason: `token age ${ageSec.toFixed(1)}s < min ${minSec}s` };
