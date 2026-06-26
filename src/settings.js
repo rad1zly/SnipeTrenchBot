@@ -127,15 +127,25 @@ const CATALOG = [
       return n;
     },
   },
-  // Jito tip entries REMOVED in v0.8.8 (experimental) M1.20. Jito tip is now
-  // a fixed admin config (env: JITO_BUY_TIP_SOL / JITO_SELL_TIP_SOL) in
-  // config.js — not a per-user setting. Reference bot ships with a fixed
-  // tip amount, so users don't need to tune it.
+  // Jito tip entries: restored in v0.8.8 M18 per-user per-wallet control.
+  // Network-level tips (jito/helius/0slot/astralane) are charged on top of
+  // priority fees. Users can now tune these per wallet via the ⚙️ menu.
   {
-    // v0.8.8 (experimental): Jito tip for SELL. Default 0 (no tip).
+    key: 'jito_buy_tip_sol', type: 'number', category: 'trade', mode: 'both',
+    label: 'Jito Buy Tip 🚀',
+    default: 0.0,
+    min: 0,
+    parseUserInput: (t) => {
+      const s = t.trim().toLowerCase();
+      if (['none', 'unlimited', 'off', '0', ''].includes(s)) return 0;
+      const n = parseFloat(t);
+      if (Number.isNaN(n) || n < 0) return null;
+      return n;
+    },
+  },
+  {
     key: 'jito_sell_tip_sol', type: 'number', category: 'trade', mode: 'both',
     label: 'Jito Sell Tip 🚀',
-    hidden: true, // M1.20: moved to config (admin env). Kept here for back-compat reads; not in menu.
     default: 0.0,
     min: 0,
     parseUserInput: (t) => {

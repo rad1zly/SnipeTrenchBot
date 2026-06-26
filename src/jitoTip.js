@@ -16,6 +16,10 @@
 //   TIP_LANE_FALLBACKS=helius,0slot,astralane
 //   JITO_BUY_TIP_SOL=0.001   JITO_SELL_TIP_SOL=0.001
 //
+// v0.8.8 M18: Per-user settings (jito_buy_tip_sol / jito_sell_tip_sol) from
+// the DB catalog are honored per-wallet. If not set (null), falls back to
+// the admin env config (JITO_BUY_TIP_SOL / JITO_SELL_TIP_SOL).
+//
 // Reference: https://docs.jito.wtf/lowlatencytxnsend/
 // =============================================================================
 
@@ -74,12 +78,24 @@ export function buildJitoTipIx(payer, tipSol) {
  * fallback is at the SUBMISSION level (tipLanes.submitFastTrack), not
  * the tip account level.
  */
+// Lazy-load settings to avoid circular deps at module init.
+function getSettings() {
+  // eslint-disable-next-line global-require
+  return require('./settings.js');
+}
+
 export function getTipAmount(side, chatId) {
-  // chatId is unused now but kept in the signature so callers / tests
-  // don't break.
-  void chatId;
-  if (side === 'buy') return Number(config.JITO_BUY_TIP_SOL || 0);
-  if (side === 'sell') return Number(config.JITO_SELL_TIP_SOL || 0);
+  const { get } = getSettings();
+  // Per-user per-wallet tip amount. chatId is required (per-user isolation).
+  // Falls back to admin env config if no per-user value is set.
+  if (side === 'buy') {
+    const userTip = get('jito_buy_tip_sol', chatId);
+    return userTip ?? Number(config.JITO_BUY_TIP_SOL || 0);
+  }
+  if (side === 'sell') {
+    const userTip = get('jito_sell_tip_sol', chatId);
+    return userTip ?? Number(config.JITO_SELL_TIP_SOL || 0);
+  }
   return 0;
 }
 
