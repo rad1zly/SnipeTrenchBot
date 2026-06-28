@@ -248,5 +248,5 @@ export async function notifyHicarusResult(summary, chatId) {
     );
   }
 
-  await notifier.send(chatId, lines.join('\n'));
+  await notifier.notifyOne(chatId, lines.join('\n'));
 }
