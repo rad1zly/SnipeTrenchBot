@@ -40,6 +40,7 @@ const BOT_COMMANDS = [
   { command: 'removewallet',description: 'Remove wallet — /removewallet <addr>' },
   { command: 'wallet',      description: 'Set / replace / remove the bot trading wallet' },
   { command: 'status',      description: 'Bot + executor + safety snapshot' },
+  { command: 'hicarus',    description: 'Run Hicarus wallet discovery + auto-add mirror wallets' },
   { command: 'stats',       description: 'Win rate, PnL, best/worst trades' },
   { command: 'balance',     description: 'Wallet SOL + SPL token balances' },
   { command: 'positions',   description: 'List open positions' },
@@ -64,6 +65,7 @@ import * as sm from './settingsMenu.js';
 import * as settings from './settings.js';
 import * as wsm from './walletSettingsMenu.js';  // v0.8.8 M7: per-wallet settings UI
 import * as wm from './walletMenu.js';
+import { runHicarusScan, notifyHicarusResult } from './hicarusSim.js';
 
 let bots = []; // M1.5: array of Telegraf instances (one per TELEGRAM_BOT_TOKEN)
 let onPause = null; // callback set by index.js so we can stop the monitor if needed
@@ -1422,6 +1424,24 @@ function startSingleBot(token, { onPause: pauseCb, onResume: resumeCb } = {}) {
   // bot the user is cloning uses `/copystats` so we add it for parity.
   inst.command('copystats', (ctx) => {
     ctx.reply(buildStatsText(ctx.chat.id), { parse_mode: 'HTML' });
+  });
+
+  // ---- /hicarus — Jun 2026: wallet discovery + auto-add mirror wallets ----
+  // Per-user request: find wallets with buy→hold 2-3s→sell pattern (10-25% gain),
+  // evaluate via sim engine, auto-add WR≥55% wallets with copy_mode='mirror'.
+  inst.command('hicarus', async (ctx) => {
+    await ctx.reply('🔍 <b>Hicarus Scan running…</b>\nScanning GMGN for pump.fun flipper wallets, evaluating, auto-adding qualifying wallets as mirror…', { parse_mode: 'HTML' });
+    try {
+      const summary = await runHicarusScan({
+        seedWallets: ['8inTY66csRNgKNtGhqGhd4odAV2VeJBDcRVuF7UE3Eeh'],
+        dryRun: false,
+        autoAdd: true,
+      });
+      await notifyHicarusResult(summary, ctx.chat.id);
+    } catch(e) {
+      console.error('[hicarus] scan error:', e);
+      await ctx.reply(`❌ <b>Scan failed</b>: ${e.message}`, { parse_mode: 'HTML' });
+    }
   });
 
   // ---- /balance — v0.8.0: wallet SOL + SPL token balances ----
